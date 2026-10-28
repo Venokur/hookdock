@@ -196,6 +196,28 @@ Assert-True ($legacyBody.room -eq "default") "legacy /hook/{endpoint} lands in t
 $list = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=5" -Headers $auth
 Assert-True ($list.data.Count -ge 1) "requests list returns data"
 Assert-True ($list.meta.total -ge 3) "requests list exposes pagination meta"
+Assert-True ($null -eq ($list.data[0].PSObject.Properties['body'])) "lean request list omits the body column"
+
+# The workflow editor builds condition paths from a real payload, so it asks
+# for the body explicitly; jsonb must arrive decoded, not as a JSON string.
+$sampleList = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=5&include=body" -Headers $auth
+Assert-True ($sampleList.data.Count -ge 1) "request samples with body return data"
+$jsonSample = @($sampleList.data | Where-Object { $_.body -and $_.body.customer.name -eq "Ada" })[0]
+Assert-True ($null -ne $jsonSample) "request sample for the endpoint is listed"
+Assert-True ($jsonSample.body -isnot [string]) "include=body returns decoded jsonb"
+Assert-True ($jsonSample.body.event.type -eq "payment") "include=body keeps nested values"
+Assert-True ($jsonSample.body.event.amount -eq 42) "include=body keeps numeric values"
+Assert-True ($null -ne $jsonSample.PSObject.Properties['raw_body']) "include=body exposes the raw body"
+
+$plainSample = @((Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&endpoint=$forwardEndpoint&include=body" -Headers $auth).data)[0]
+Assert-True ($null -ne $plainSample) "non-JSON sample is listed"
+Assert-True ($null -eq $plainSample.body) "include=body keeps non-JSON body null"
+Assert-True ($plainSample.raw_body -eq "ping") "include=body keeps non-JSON raw body"
+
+$sampleByEndpoint = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&endpoint=$endpoint&include=body" -Headers $auth
+Assert-True (@($sampleByEndpoint.data | Where-Object { $_.endpoint -ne $endpoint }).Count -eq 0) "include=body respects the endpoint filter"
+$ignoredInclude = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=1&include=nope" -Headers $auth
+Assert-True ($null -eq $ignoredInclude.data[0].PSObject.Properties['body']) "unknown include values are ignored"
 
 $stats = Invoke-RestMethod -Uri "$BaseUrl/api/stats?room=$roomSlug" -Headers $auth
 Assert-True ($stats.data.requests_total -ge 3) "stats endpoint aggregates requests"

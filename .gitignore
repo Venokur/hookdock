@@ -7,3 +7,6 @@
 node_modules/
 frontend/dist/
 backend/vendor/
+
+# Артефакты проверки UI в браузере (Playwright MCP)
+.playwright-mcp/

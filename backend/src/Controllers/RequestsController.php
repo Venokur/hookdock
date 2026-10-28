@@ -63,6 +63,10 @@ final class RequestsController
         }
 
         $clause = $where === [] ? '' : ' WHERE ' . implode(' AND ', $where);
+        $include = $this->includeFields($request);
+        // The workflow editor builds condition paths from a real payload, so it
+        // asks for the heavy columns explicitly; the plain list stays lean.
+        $extraColumns = in_array('body', $include, true) ? ', r.body, r.raw_body' : '';
 
         $pdo = Database::pdo();
 
@@ -72,7 +76,7 @@ final class RequestsController
 
         $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
                        COALESCE(stats.runs, 0)::int AS run_count,
-                       COALESCE(stats.failed, 0)::int AS failed_runs
+                       COALESCE(stats.failed, 0)::int AS failed_runs" . $extraColumns . "
                 FROM incoming_requests r
                 LEFT JOIN LATERAL (
                     SELECT count(*) AS runs, count(*) FILTER (WHERE wr.status = 'failed') AS failed
@@ -90,8 +94,14 @@ final class RequestsController
         $stmt->bindValue(':offset', ($page - 1) * $perPage, \PDO::PARAM_INT);
         $stmt->execute();
 
+        $rows = $stmt->fetchAll();
+        if (in_array('body', $include, true)) {
+            // Only `body` is jsonb; `raw_body` is text and must stay a string.
+            $rows = JsonColumns::decodeMany($rows, ['body']);
+        }
+
         Response::json([
-            'data' => $stmt->fetchAll(),
+            'data' => $rows,
             'meta' => [
                 'page' => $page,
                 'per_page' => $perPage,
@@ -228,6 +238,29 @@ final class RequestsController
         }
 
         return $room['id'];
+    }
+
+    /**
+     * `?include=body` lets the workflow editor load a sample payload alongside
+     * the list (one round trip instead of list → detail). Unknown values are
+     * ignored so a stale client cannot break the query.
+     *
+     * @return list<string>
+     */
+    private function includeFields(Request $request): array
+    {
+        $raw = (string) ($request->query['include'] ?? '');
+        if ($raw === '') {
+            return [];
+        }
+
+        $allowed = ['body'];
+        $requested = array_map(
+            static fn (string $value): string => strtolower(trim($value)),
+            explode(',', $raw),
+        );
+
+        return array_values(array_intersect($allowed, $requested));
     }
 
     private function parseDate(string $value): ?string

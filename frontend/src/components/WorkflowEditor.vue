@@ -4,6 +4,7 @@ import AppCheckbox from './ui/AppCheckbox.vue'
 import AppInput from './ui/AppInput.vue'
 import AppSelect from './ui/AppSelect.vue'
 import AppTextarea from './ui/AppTextarea.vue'
+import JsonPathPicker from './JsonPathPicker.vue'
 import { api } from '../api/client'
 
 const props = defineProps({
@@ -46,6 +47,7 @@ function toForm(workflow) {
 const form = reactive(toForm(props.workflow))
 const saving = ref(false)
 const error = ref('')
+const pickerIndex = ref(null)
 
 const operators = [
   ['equals', 'равно'],
@@ -94,6 +96,47 @@ function removeAction(index) {
 
 function needsValue(operator) {
   return !['exists', 'not_exists'].includes(operator)
+}
+
+function openPicker(index) {
+  pickerIndex.value = index
+}
+
+function closePicker() {
+  pickerIndex.value = null
+}
+
+/**
+ * Picking a scalar pre-fills the comparison so the common case (compare this
+ * exact field) needs no typing. Objects and arrays of objects stay path-only:
+ * `equals` on them would need a hand-written JSON literal.
+ */
+function applyPick(result) {
+  const condition = form.conditions[pickerIndex.value]
+  if (!condition) {
+    closePicker()
+    return
+  }
+
+  condition.path = result.path
+
+  if (result.pathOnly || result.value === undefined || result.value === null) {
+    closePicker()
+    return
+  }
+
+  if (result.type === 'boolean') {
+    condition.operator = 'equals'
+    condition.value = result.value ? 'true' : 'false'
+  } else if (result.type === 'array') {
+    condition.operator = 'contains'
+    condition.value = String(result.value)
+  } else {
+    condition.operator = 'equals'
+    condition.value = String(result.value)
+  }
+
+  closePicker()
 }
 
 async function save() {
@@ -237,12 +280,24 @@ async function save() {
               :key="index"
               class="grid grid-cols-1 gap-2 rounded-xl border border-line bg-surface-2 p-3 sm:grid-cols-[1.4fr_1fr_1fr_auto]"
             >
-              <AppInput
-                v-model="condition.path"
-                size="sm"
-                placeholder="body.event.type"
-                class="font-mono"
-              />
+              <div class="flex items-center gap-1">
+                <AppInput
+                  v-model="condition.path"
+                  size="sm"
+                  placeholder="body.event.type"
+                  aria-label="Путь к полю"
+                  class="font-mono"
+                />
+                <button
+                  type="button"
+                  class="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-surface font-mono text-[11px] text-ink-soft transition hover:bg-surface-2 hover:text-ink"
+                  aria-label="Выбрать путь из запроса"
+                  title="Выбрать путь из запроса"
+                  @click="openPicker(index)"
+                >
+                  { }
+                </button>
+              </div>
               <AppSelect v-model="condition.operator" :options="operatorOptions" size="sm" />
               <AppInput
                 v-if="needsValue(condition.operator)"
@@ -353,5 +408,13 @@ async function save() {
         </button>
       </footer>
     </div>
+
+    <JsonPathPicker
+      v-if="pickerIndex !== null"
+      :room="room"
+      :endpoint="form.endpoint"
+      @close="closePicker"
+      @pick="applyPick"
+    />
   </div>
 </template>
