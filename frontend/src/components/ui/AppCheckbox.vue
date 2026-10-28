@@ -9,7 +9,10 @@ const props = defineProps({
 </script>
 
 <template>
-  <label class="inline-flex cursor-pointer select-none items-start gap-2 text-left">
+  <!-- align-middle keeps the box off the text baseline: an inline-flex label
+       aligns by its own baseline, which changes when the checkmark svg appears,
+       making the whole control jump 2px on every toggle. -->
+  <label class="inline-flex cursor-pointer select-none items-start gap-2 text-left align-middle">
     <input
       v-model="model"
       type="checkbox"
