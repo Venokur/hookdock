@@ -1,10 +1,19 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
 import AppToggle from '../components/ui/AppToggle.vue'
 import WorkflowEditor from '../components/WorkflowEditor.vue'
 import { api } from '../api/client'
+import { retain, subscribe } from '../composables/realtime'
+import { useRoomsStore } from '../stores/rooms'
 import { timeAgo } from '../utils/format'
+
+const route = useRoute()
+const rooms = useRoomsStore()
+
+const slug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
+const room = computed(() => (slug.value ? rooms.find(slug.value) : null))
 
 const workflows = ref([])
 const loading = ref(false)
@@ -12,6 +21,10 @@ const error = ref('')
 const editorOpen = ref(false)
 const editorWorkflow = ref(null)
 const copiedId = ref(null)
+
+let releaseLive = null
+let offRealtime = null
+let reloadTimer = null
 
 const operatorLabels = {
   equals: '=',
@@ -35,18 +48,33 @@ const statusLabels = {
 
 const activeCount = computed(() => workflows.value.filter((workflow) => workflow.enabled).length)
 
-async function load() {
-  loading.value = true
+async function load({ silent = false } = {}) {
+  if (!silent) {
+    loading.value = true
+  }
 
   try {
-    const data = await api.workflows()
+    const data = await api.workflows({ room: slug.value })
     workflows.value = data.data
     error.value = ''
   } catch (e) {
     error.value = e.message
   } finally {
-    loading.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
+}
+
+/**
+ * Realtime events carry only the affected id; a debounced reload keeps list
+ * counts, pause state and last-run timestamps consistent without polling.
+ */
+function refreshSoon() {
+  clearTimeout(reloadTimer)
+  reloadTimer = setTimeout(() => {
+    load({ silent: true })
+  }, 300)
 }
 
 function createWorkflow() {
@@ -92,9 +120,18 @@ async function removeWorkflow(workflow) {
 }
 
 function webhookUrl(workflow) {
-  const slug = workflow.endpoint === '*' ? 'my-endpoint' : workflow.endpoint
+  const endpoint = workflow.endpoint === '*' ? 'my-endpoint' : workflow.endpoint
+  const prefix = slug.value ? `/${slug.value}` : ''
 
-  return `${window.location.origin}/api/webhook/${slug}`
+  return `${window.location.origin}/api/webhook${prefix}/${endpoint}`
+}
+
+function triggerLabel(workflow) {
+  const prefix = slug.value ? `/${slug.value}` : ''
+
+  return workflow.endpoint === '*'
+    ? `любой эндпоинт комнаты, например /api/webhook${prefix}/my-endpoint`
+    : `/api/webhook${prefix}/${workflow.endpoint}`
 }
 
 function conditionSummary(condition) {
@@ -141,7 +178,44 @@ async function copyUrl(workflow) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+
+  const offChanged = subscribe('workflow.changed', onWorkflowChanged)
+  const offResync = subscribe('resync', refreshSoon)
+
+  releaseLive = retain()
+
+  offRealtime = () => {
+    offChanged()
+    offResync()
+  }
+})
+
+/**
+ * Events are room-scoped: a workflow edited in another room must not reload this
+ * list, otherwise every open tab would flicker on unrelated changes.
+ */
+function onWorkflowChanged(payload) {
+  if (payload?.room_id && room.value && payload.room_id !== room.value.id) {
+    return
+  }
+
+  refreshSoon()
+}
+
+watch(slug, () => {
+  closeEditor()
+  workflows.value = []
+  load()
+})
+
+onUnmounted(() => {
+  offRealtime?.()
+  releaseLive?.()
+  releaseLive = null
+  clearTimeout(reloadTimer)
+})
 </script>
 
 <template>
@@ -150,9 +224,9 @@ onMounted(load)
       <header class="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-300">Автоматизация</p>
-          <h1 class="mt-1 text-2xl font-semibold text-ink">Сценарии</h1>
+          <h1 class="mt-1 text-2xl font-semibold text-ink">Сценарии · {{ room?.name || 'комната' }}</h1>
           <p class="mt-1 text-sm text-ink-soft">
-            Активных: {{ activeCount }} · маршрутизируйте пойманные запросы в другие сервисы по условиям и действиям.
+            Активных: {{ activeCount }} · сценарии срабатывают только на запросы этой комнаты.
           </p>
         </div>
 
@@ -219,7 +293,7 @@ onMounted(load)
             <p class="text-[10px] uppercase tracking-wider text-ink-mute">Триггер</p>
             <div class="mt-1 flex items-center gap-2">
               <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-soft">
-                {{ workflow.endpoint === '*' ? 'любой эндпоинт (например, /api/webhook/my-endpoint)' : `/api/webhook/${workflow.endpoint}` }}
+                {{ triggerLabel(workflow) }}
               </code>
               <button
                 type="button"
@@ -303,6 +377,7 @@ onMounted(load)
     <WorkflowEditor
       v-if="editorOpen"
       :workflow="editorWorkflow"
+      :room="room"
       @close="closeEditor"
       @saved="onSaved"
     />

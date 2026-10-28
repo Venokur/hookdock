@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Controllers;
 
 use App\Auth\Jwt;
+use App\Config;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
@@ -68,5 +69,25 @@ final class AuthController
     {
         // Tokens are stateless; the client discards it. Kept for API symmetry.
         Response::json(['ok' => true]);
+    }
+
+    /**
+     * Short-lived ticket for the websocket handshake.
+     *
+     * Browsers cannot send an Authorization header on WebSocket(), and putting the
+     * 12h JWT in the query string would leak it into access logs. The ticket is a
+     * 60s JWT with scope=ws and is accepted only by the ws container.
+     */
+    public function wsTicket(Request $request): void
+    {
+        $user = \App\Auth\Auth::requireUser($request);
+        $ttl = max(10, Config::int('WS_TICKET_TTL', 60));
+
+        Response::json([
+            'data' => [
+                'ticket' => Jwt::issue(['sub' => (int) $user['id'], 'scope' => 'ws'], $ttl),
+                'expires_in' => $ttl,
+            ],
+        ]);
     }
 }

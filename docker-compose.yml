@@ -29,6 +29,33 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
       JWT_TTL: ${JWT_TTL:-43200}
       APP_DEBUG: ${APP_DEBUG:-0}
+      WS_CHANNEL: ${WS_CHANNEL:-hookdock_events}
+      WS_TICKET_TTL: ${WS_TICKET_TTL:-60}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Realtime websocket daemon: same image as `api`, different command. It LISTENs
+  # on Postgres and broadcasts to browsers; nginx reaches it at ws:8081.
+  ws:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    command: ["php", "/var/www/backend/bin/ws-server.php"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-webhooks}
+      DB_USER: ${DB_USER:-webhooks}
+      DB_PASSWORD: ${DB_PASSWORD:-webhooks}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      WS_CHANNEL: ${WS_CHANNEL:-hookdock_events}
+      WS_HOST: 0.0.0.0
+      WS_PORT: "8081"
+      RUN_MIGRATIONS: "0"
+    expose:
+      - "8081"
     depends_on:
       db:
         condition: service_healthy
@@ -42,6 +69,7 @@ services:
       - "${APP_PORT:-8080}:80"
     depends_on:
       - api
+      - ws
     restart: unless-stopped
 
 volumes:

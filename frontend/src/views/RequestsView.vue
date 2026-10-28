@@ -1,13 +1,21 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
 import MethodBadge from '../components/MethodBadge.vue'
 import RequestDetail from '../components/RequestDetail.vue'
-import AppCheckbox from '../components/ui/AppCheckbox.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import { api } from '../api/client'
+import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
+import { useRoomsStore } from '../stores/rooms'
 import { formatBytes, formatTime } from '../utils/format'
+
+const route = useRoute()
+const rooms = useRoomsStore()
+
+const slug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
+const room = computed(() => (slug.value ? rooms.find(slug.value) : null))
 
 const items = ref([])
 const meta = reactive({ page: 1, per_page: 25, total: 0, pages: 1 })
@@ -16,7 +24,6 @@ const filters = reactive({ method: 'ALL', q: '', endpoint: '' })
 
 const loading = ref(false)
 const error = ref('')
-const autoRefresh = ref(true)
 const copied = ref(false)
 
 const showDetail = ref(false)
@@ -24,8 +31,10 @@ const detailLoading = ref(false)
 const detail = ref(null)
 const runs = ref([])
 
-let refreshTimer = null
+let releaseLive = null
+let offRealtime = null
 let filterTimer = null
+let reloadTimer = null
 
 const methods = ['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 const methodOptions = methods.map((method) => ({
@@ -34,9 +43,27 @@ const methodOptions = methods.map((method) => ({
 }))
 
 const webhookUrl = computed(() => {
-  const slug = filters.endpoint.trim() || 'my-endpoint'
+  const prefix = slug.value ? `/${slug.value}` : ''
+  const endpoint = filters.endpoint.trim() || 'my-endpoint'
 
-  return `${window.location.origin}/api/webhook/${slug}`
+  return `${window.location.origin}/api/webhook${prefix}/${endpoint}`
+})
+
+// Connection state only — updates are always on, so there is nothing to toggle.
+const realtimeLabel = computed(() => {
+  if (realtimeStatus.value === 'open') {
+    return { label: 'в сети', tone: 'ok' }
+  }
+
+  if (realtimeStatus.value === 'idle' || realtimeStatus.value === 'connecting') {
+    return { label: 'подключение…', tone: 'warn' }
+  }
+
+  if (realtimeStatus.value === 'retrying') {
+    return { label: 'переподключение…', tone: 'warn' }
+  }
+
+  return { label: 'нет соединения', tone: 'bad' }
 })
 
 const cards = computed(() => [
@@ -63,13 +90,14 @@ async function load({ silent = false } = {}) {
   try {
     const [list, summary] = await Promise.all([
       api.requests({
+        room: slug.value,
         page: meta.page,
         per_page: meta.per_page,
         method: filters.method,
         q: filters.q.trim(),
         endpoint: filters.endpoint.trim(),
       }),
-      api.stats(),
+      api.stats({ room: slug.value }),
     ])
 
     items.value = list.data
@@ -88,6 +116,87 @@ async function load({ silent = false } = {}) {
 function reload() {
   load()
 }
+
+/**
+ * Realtime events are thin, so any of them just means "re-read what I show".
+ * Debounced to collapse bursts (a webhook fans out into created + updated).
+ */
+function refreshSoon() {
+  clearTimeout(reloadTimer)
+  reloadTimer = setTimeout(() => {
+    load({ silent: true })
+  }, 300)
+}
+
+async function refreshDetail() {
+  const id = detail.value?.id
+  if (!showDetail.value || !id) {
+    return
+  }
+
+  try {
+    const data = await api.request(id)
+
+    if (!showDetail.value || detail.value?.id !== id) {
+      return
+    }
+
+    detail.value = data.data.request
+    runs.value = data.data.runs
+  } catch {
+    // Keep the currently rendered copy; the next event retries.
+  }
+}
+
+function onRequestEvent(payload) {
+  // Events carry room_id: another room's webhook must not disturb this list.
+  if (payload?.room_id && room.value && payload.room_id !== room.value.id) {
+    return
+  }
+
+  if (detail.value?.id && payload?.id === detail.value.id) {
+    refreshDetail()
+  }
+
+  refreshSoon()
+}
+
+/**
+ * After a reconnect (or returning to the tab) events may have been missed, so the
+ * open card is re-read even though the payload carries no id.
+ */
+function onResync() {
+  refreshDetail()
+  refreshSoon()
+}
+
+function onRequestDeleted(payload) {
+  if (payload?.room_id && room.value && payload.room_id !== room.value.id) {
+    return
+  }
+
+  // Another tab removed the row we are looking at.
+  if (detail.value?.id && payload?.id === detail.value.id) {
+    showDetail.value = false
+    detail.value = null
+    runs.value = []
+  }
+
+  refreshSoon()
+}
+
+// Switching rooms is a different data set: reset filters/paging and drop the
+// open card so no request from the previous room stays on screen.
+watch(slug, () => {
+  meta.page = 1
+  filters.method = 'ALL'
+  filters.q = ''
+  filters.endpoint = ''
+  showDetail.value = false
+  detail.value = null
+  runs.value = []
+  load()
+})
 
 watch(
   filters,
@@ -164,16 +273,28 @@ function resetFilters() {
 
 onMounted(() => {
   load()
-  refreshTimer = setInterval(() => {
-    if (autoRefresh.value && !document.hidden && !showDetail.value) {
-      load({ silent: true })
-    }
-  }, 5000)
+
+  const offCreated = subscribe('request.created', onRequestEvent)
+  const offUpdated = subscribe('request.updated', onRequestEvent)
+  const offDeleted = subscribe('request.deleted', onRequestDeleted)
+  const offResync = subscribe('resync', onResync)
+
+  releaseLive = retain()
+
+  offRealtime = () => {
+    offCreated()
+    offUpdated()
+    offDeleted()
+    offResync()
+  }
 })
 
 onUnmounted(() => {
-  clearInterval(refreshTimer)
+  offRealtime?.()
+  releaseLive?.()
+  releaseLive = null
   clearTimeout(filterTimer)
+  clearTimeout(reloadTimer)
 })
 </script>
 
@@ -183,12 +304,22 @@ onUnmounted(() => {
       <header class="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-300">Входящие</p>
-          <h1 class="mt-1 text-2xl font-semibold text-ink">Входящие запросы</h1>
-          <p class="mt-1 text-sm text-ink-soft">Каждый запрос сохраняется до маршрутизации — независимо от метода и пути.</p>
+          <h1 class="mt-1 text-2xl font-semibold text-ink">{{ room?.name || 'Комната' }}</h1>
+          <p class="mt-1 text-sm text-ink-soft">
+            Каждый запрос сохраняется до маршрутизации — независимо от метода и пути.
+            <span v-if="room" class="text-ink-mute">Slug: <code class="font-mono">{{ room.slug }}</code></span>
+          </p>
         </div>
 
-        <div class="flex items-center gap-2">
-          <AppCheckbox v-model="autoRefresh" label="Автообновление" />
+        <div class="flex items-center gap-3">
+          <span class="flex items-center gap-1.5 text-[11px]" :class="{
+            'text-emerald-700 dark:text-emerald-300': realtimeLabel.tone === 'ok',
+            'text-amber-700 dark:text-amber-300': realtimeLabel.tone === 'warn',
+            'text-rose-600 dark:text-rose-300': realtimeLabel.tone === 'bad',
+          }">
+            <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+            {{ realtimeLabel.label }}
+          </span>
           <button type="button" class="btn" @click="reload">Обновить</button>
         </div>
       </header>

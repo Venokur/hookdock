@@ -71,12 +71,17 @@ function query(params) {
 
 export const api = {
   login: (email, password) => request('/api/auth/login', { method: 'POST', body: { email, password } }),
+  wsTicket: () => request('/api/ws/ticket', { method: 'POST' }),
   me: () => request('/api/auth/me'),
-  stats: () => request('/api/stats'),
+  rooms: () => request('/api/rooms'),
+  createRoom: (room) => request('/api/rooms', { method: 'POST', body: room }),
+  updateRoom: (id, room) => request(`/api/rooms/${id}`, { method: 'PUT', body: room }),
+  deleteRoom: (id) => request(`/api/rooms/${id}`, { method: 'DELETE' }),
+  stats: (params = {}) => request(`/api/stats${query(params)}`),
   requests: (params = {}) => request(`/api/requests${query(params)}`),
   request: (id) => request(`/api/requests/${id}`),
   deleteRequest: (id) => request(`/api/requests/${id}`, { method: 'DELETE' }),
-  workflows: () => request('/api/workflows'),
+  workflows: (params = {}) => request(`/api/workflows${query(params)}`),
   saveWorkflow: (workflow) =>
     workflow.id
       ? request(`/api/workflows/${workflow.id}`, { method: 'PUT', body: workflow })

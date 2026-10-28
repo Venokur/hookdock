@@ -20,7 +20,7 @@ async function submit() {
   try {
     await auth.login(form.email.trim(), form.password)
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : null
-    router.push(redirect || { name: 'requests' })
+    router.push(redirect || { name: 'home' })
   } catch (e) {
     error.value = e.message
   } finally {

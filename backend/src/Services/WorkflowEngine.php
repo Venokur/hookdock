@@ -25,7 +25,10 @@ final class WorkflowEngine
         $pdo = Database::pdo();
         $context = self::context($request);
 
-        $workflows = $pdo->query('SELECT * FROM workflows WHERE enabled ORDER BY id')->fetchAll();
+        // Room isolation: a workflow can only fire for requests of its own room.
+        $stmt = $pdo->prepare('SELECT * FROM workflows WHERE enabled AND room_id = :room_id ORDER BY id');
+        $stmt->execute(['room_id' => (int) ($request['room_id'] ?? 0)]);
+        $workflows = $stmt->fetchAll();
 
         $runs = [];
         foreach ($workflows as $workflow) {

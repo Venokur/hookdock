@@ -8,6 +8,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // Websocket upgrade for the realtime channel (must come before '/api').
+      '/api/ws': { target: 'http://localhost:8080', ws: true },
       '/api': 'http://localhost:8080',
       '/hook': 'http://localhost:8080',
     },

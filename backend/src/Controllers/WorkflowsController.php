@@ -8,6 +8,8 @@ use App\Auth\Auth;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Realtime;
+use App\Services\RoomResolver;
 use App\Support\JsonColumns;
 
 final class WorkflowsController
@@ -23,17 +25,21 @@ final class WorkflowsController
     {
         Auth::requireUser($request);
 
-        $rows = Database::pdo()->query(
+        $roomId = $this->optionalRoomId($request);
+        $where = $roomId === null ? '' : ' WHERE w.room_id = :room_id';
+
+        $stmt = Database::pdo()->prepare(
             'SELECT w.*, lr.created_at AS last_run_at, lr.status AS last_run_status
              FROM workflows w
              LEFT JOIN LATERAL (
                  SELECT created_at, status FROM workflow_runs
                  WHERE workflow_id = w.id ORDER BY id DESC LIMIT 1
-             ) lr ON TRUE
+             ) lr ON TRUE' . $where . '
              ORDER BY w.id DESC'
-        )->fetchAll();
+        );
+        $stmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
 
-        Response::json(['data' => JsonColumns::decodeMany($rows, ['conditions', 'actions'])]);
+        Response::json(['data' => JsonColumns::decodeMany($stmt->fetchAll(), ['conditions', 'actions'])]);
     }
 
     public function show(Request $request, array $params): void
@@ -57,11 +63,12 @@ final class WorkflowsController
         $workflow = $this->validated($request);
 
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflows (name, endpoint, enabled, conditions, actions)
-             VALUES (:name, :endpoint, :enabled, :conditions, :actions)
+            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions)
+             VALUES (:room_id, :name, :endpoint, :enabled, :conditions, :actions)
              RETURNING *'
         );
         $stmt->execute([
+            'room_id' => $workflow['room_id'],
             'name' => $workflow['name'],
             'endpoint' => $workflow['endpoint'],
             'enabled' => $workflow['enabled'] ? 'true' : 'false',
@@ -69,14 +76,34 @@ final class WorkflowsController
             'actions' => $this->encode($workflow['actions']),
         ]);
 
-        Response::json(['data' => JsonColumns::decode($stmt->fetch(), ['conditions', 'actions'])], 201);
+        $row = JsonColumns::decode($stmt->fetch(), ['conditions', 'actions']);
+        Realtime::publish('workflow.changed', [
+            'id' => (int) $row['id'],
+            'room_id' => (int) $row['room_id'],
+            'action' => 'created',
+        ]);
+
+        Response::json(['data' => $row], 201);
     }
 
     public function update(Request $request, array $params): void
     {
         Auth::requireUser($request);
-        $workflow = $this->validated($request);
         $id = (int) ($params['id'] ?? 0);
+
+        $existing = $this->find($id);
+        if ($existing === null) {
+            Response::error('Сценарий не найден', 404);
+        }
+
+        $workflow = $this->validated($request);
+
+        // Moving a workflow between rooms would silently change which webhooks it
+        // reacts to, so it needs its own explicit action rather than a side effect
+        // of editing a name.
+        if ($workflow['room_id'] !== (int) $existing['room_id']) {
+            Response::error('Сценарий нельзя перенести в другую комнату', 422);
+        }
 
         $stmt = Database::pdo()->prepare(
             'UPDATE workflows
@@ -99,7 +126,14 @@ final class WorkflowsController
             Response::error('Сценарий не найден', 404);
         }
 
-        Response::json(['data' => JsonColumns::decode($row, ['conditions', 'actions'])]);
+        $decoded = JsonColumns::decode($row, ['conditions', 'actions']);
+        Realtime::publish('workflow.changed', [
+            'id' => (int) $decoded['id'],
+            'room_id' => (int) $decoded['room_id'],
+            'action' => 'updated',
+        ]);
+
+        Response::json(['data' => $decoded]);
     }
 
     public function toggle(Request $request, array $params): void
@@ -108,7 +142,7 @@ final class WorkflowsController
 
         $stmt = Database::pdo()->prepare(
             'UPDATE workflows SET enabled = NOT enabled, updated_at = now()
-             WHERE id = :id RETURNING id, enabled'
+             WHERE id = :id RETURNING id, enabled, room_id'
         );
         $stmt->execute(['id' => (int) ($params['id'] ?? 0)]);
         $row = $stmt->fetch();
@@ -117,25 +151,103 @@ final class WorkflowsController
             Response::error('Сценарий не найден', 404);
         }
 
-        Response::json(['data' => $row]);
+        Realtime::publish('workflow.changed', [
+            'id' => (int) $row['id'],
+            'room_id' => (int) $row['room_id'],
+            'action' => 'toggled',
+        ]);
+
+        Response::json(['data' => ['id' => (int) $row['id'], 'enabled' => $row['enabled']]]);
     }
 
     public function destroy(Request $request, array $params): void
     {
         Auth::requireUser($request);
 
-        $stmt = Database::pdo()->prepare('DELETE FROM workflows WHERE id = :id');
-        $stmt->execute(['id' => (int) ($params['id'] ?? 0)]);
+        $id = (int) ($params['id'] ?? 0);
+        $stmt = Database::pdo()->prepare('DELETE FROM workflows WHERE id = :id RETURNING room_id');
+        $stmt->execute(['id' => $id]);
 
-        Response::json(['ok' => true, 'deleted' => $stmt->rowCount() > 0]);
+        $deleted = $stmt->fetch();
+        if ($deleted !== false) {
+            Realtime::publish('workflow.changed', [
+                'id' => $id,
+                'room_id' => (int) $deleted['room_id'],
+                'action' => 'deleted',
+            ]);
+        }
+
+        Response::json(['ok' => true, 'deleted' => $deleted !== false]);
     }
 
     /**
-     * @return array{name: string, endpoint: string, enabled: bool, conditions: list<array<string, mixed>>, actions: list<array<string, mixed>>}
+     * @return array<string, mixed>|null
+     */
+    private function find(int $id): ?array
+    {
+        if ($id <= 0) {
+            return null;
+        }
+
+        $stmt = Database::pdo()->prepare('SELECT id, room_id FROM workflows WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $row = $stmt->fetch();
+
+        return $row === false ? null : $row;
+    }
+
+    /**
+     * @return int|null null when the client asks for every room
+     */
+    private function optionalRoomId(Request $request): ?int
+    {
+        $slug = trim((string) ($request->query['room'] ?? ''));
+        if ($slug === '') {
+            return null;
+        }
+
+        return $this->requireRoomId(['room' => $slug]);
+    }
+
+    /**
+     * Resolves the target room from `room_id` or `room` (slug) and fails loudly
+     * when it does not exist.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function requireRoomId(array $payload): int
+    {
+        $id = (int) ($payload['room_id'] ?? 0);
+        if ($id > 0) {
+            $room = RoomResolver::findById($id);
+            if ($room === null) {
+                Response::error('Комната не найдена', 422);
+            }
+
+            return $room['id'];
+        }
+
+        $slug = trim((string) ($payload['room'] ?? ''));
+        if ($slug !== '') {
+            $room = RoomResolver::findBySlug($slug);
+            if ($room === null) {
+                Response::error('Комната не найдена: ' . $slug, 422);
+            }
+
+            return $room['id'];
+        }
+
+        Response::error('Укажите комнату для сценария', 422);
+    }
+
+    /**
+     * @return array{room_id: int, name: string, endpoint: string, enabled: bool, conditions: list<array<string, mixed>>, actions: list<array<string, mixed>>}
      */
     private function validated(Request $request): array
     {
         $payload = $request->json() ?? [];
+
+        $roomId = $this->requireRoomId($payload);
 
         $name = trim((string) ($payload['name'] ?? ''));
         if ($name === '') {
@@ -243,6 +355,7 @@ final class WorkflowsController
         }
 
         return [
+            'room_id' => $roomId,
             'name' => $name,
             'endpoint' => $endpoint,
             'enabled' => (bool) ($payload['enabled'] ?? true),

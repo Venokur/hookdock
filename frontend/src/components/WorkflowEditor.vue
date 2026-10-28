@@ -8,6 +8,7 @@ import { api } from '../api/client'
 
 const props = defineProps({
   workflow: { type: Object, default: null },
+  room: { type: Object, default: null },
 })
 
 const emit = defineEmits(['close', 'saved'])
@@ -137,6 +138,7 @@ async function save() {
 
   const payload = {
     id: form.id,
+    room_id: props.room?.id,
     name: form.name.trim(),
     endpoint: form.endpoint.trim() || '*',
     enabled: form.enabled,
@@ -172,6 +174,10 @@ async function save() {
             {{ form.id ? 'Редактирование сценария' : 'Новый сценарий' }}
           </p>
           <h2 class="mt-1 text-lg font-semibold text-ink">Триггер → Условия → Действия</h2>
+          <p v-if="room" class="mt-1 text-[11px] text-ink-mute">
+            Комната: <span class="font-medium text-ink-soft">{{ room.name }}</span>
+            · <code class="font-mono">{{ room.slug }}</code>
+          </p>
         </div>
         <button
           type="button"
@@ -205,9 +211,9 @@ async function save() {
           </div>
 
           <p class="mt-2 pl-8 text-[11px] text-ink-mute">
-            Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты, или slug,
-            например <code class="font-mono text-ink-soft">stripe</code> для
-            <code class="font-mono text-ink-soft">/api/webhook/stripe</code>.
+            Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты комнаты,
+            или slug, например <code class="font-mono text-ink-soft">stripe</code> для
+            <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/stripe</code>.
           </p>
         </section>
 

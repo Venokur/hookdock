@@ -8,6 +8,8 @@ use App\Auth\Auth;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Realtime;
+use App\Services\RoomResolver;
 use App\Support\JsonColumns;
 
 final class RequestsController
@@ -21,6 +23,12 @@ final class RequestsController
 
         $where = [];
         $params = [];
+
+        $roomId = $this->roomId($request);
+        if ($roomId !== null) {
+            $where[] = 'r.room_id = :room_id';
+            $params['room_id'] = $roomId;
+        }
 
         $method = strtoupper(trim((string) ($request->query['method'] ?? '')));
         if ($method !== '' && $method !== 'ALL') {
@@ -62,7 +70,7 @@ final class RequestsController
         $countStmt->execute($params);
         $total = (int) $countStmt->fetchColumn();
 
-        $sql = "SELECT r.id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
+        $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
                        COALESCE(stats.runs, 0)::int AS run_count,
                        COALESCE(stats.failed, 0)::int AS failed_runs
                 FROM incoming_requests r
@@ -130,10 +138,18 @@ final class RequestsController
         Auth::requireUser($request);
         $id = (int) ($params['id'] ?? 0);
 
-        $stmt = Database::pdo()->prepare('DELETE FROM incoming_requests WHERE id = :id');
+        $stmt = Database::pdo()->prepare('DELETE FROM incoming_requests WHERE id = :id RETURNING room_id');
         $stmt->execute(['id' => $id]);
 
-        Response::json(['ok' => true, 'deleted' => $stmt->rowCount() > 0]);
+        $deleted = $stmt->fetch();
+        if ($deleted !== false) {
+            Realtime::publish('request.deleted', [
+                'id' => $id,
+                'room_id' => (int) $deleted['room_id'],
+            ]);
+        }
+
+        Response::json(['ok' => true, 'deleted' => $deleted !== false]);
     }
 
     public function stats(Request $request): void
@@ -141,26 +157,46 @@ final class RequestsController
         Auth::requireUser($request);
         $pdo = Database::pdo();
 
-        $requests = $pdo->query(
+        $roomId = $this->roomId($request);
+
+        // `room` narrows every counter to one room; without it the totals stay
+        // installation-wide (the SPA always sends a room).
+        $requestWhere = $roomId === null ? '' : ' WHERE room_id = :room_id';
+        $runWhere = $roomId === null
+            ? " WHERE status = 'failed' AND created_at >= now() - interval '24 hours'"
+            : " WHERE status = 'failed' AND created_at >= now() - interval '24 hours'
+                AND request_id IN (SELECT id FROM incoming_requests WHERE room_id = :room_id)";
+
+        $requestsStmt = $pdo->prepare(
             "SELECT count(*)::int AS total,
                     count(*) FILTER (WHERE received_at >= now() - interval '1 hour')::int AS last_hour,
                     count(*) FILTER (WHERE received_at >= now() - interval '24 hours')::int AS last_24h
-             FROM incoming_requests"
-        )->fetch();
+             FROM incoming_requests" . $requestWhere
+        );
+        $requestsStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
 
-        $workflows = $pdo->query('SELECT count(*)::int AS active FROM workflows WHERE enabled')->fetch();
-        $failed = $pdo->query(
-            "SELECT count(*)::int AS failed FROM workflow_runs
-             WHERE status = 'failed' AND created_at >= now() - interval '24 hours'"
-        )->fetch();
+        $workflowsStmt = $pdo->prepare(
+            'SELECT count(*)::int AS active FROM workflows WHERE enabled'
+            . ($roomId === null ? '' : ' AND room_id = :room_id')
+        );
+        $workflowsStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
 
-        $endpoints = $pdo->query(
+        $failedStmt = $pdo->prepare('SELECT count(*)::int AS failed FROM workflow_runs' . $runWhere);
+        $failedStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
+
+        $endpointsStmt = $pdo->prepare(
             'SELECT endpoint, count(*)::int AS total
-             FROM incoming_requests
-             GROUP BY endpoint
-             ORDER BY total DESC
-             LIMIT 20'
-        )->fetchAll();
+             FROM incoming_requests'
+            . $requestWhere
+            . ' GROUP BY endpoint
+                ORDER BY total DESC
+                LIMIT 20'
+        );
+        $endpointsStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
+
+        $requests = $requestsStmt->fetch();
+        $workflows = $workflowsStmt->fetch();
+        $failed = $failedStmt->fetch();
 
         Response::json([
             'data' => [
@@ -169,9 +205,29 @@ final class RequestsController
                 'requests_last_24h' => (int) ($requests['last_24h'] ?? 0),
                 'workflows_active' => (int) ($workflows['active'] ?? 0),
                 'failed_runs_24h' => (int) ($failed['failed'] ?? 0),
-                'endpoints' => $endpoints,
+                'endpoints' => $endpointsStmt->fetchAll(),
             ],
         ]);
+    }
+
+    /**
+     * `?room=<slug>` narrows the result set to one room. An unknown slug is a
+     * client bug, not an empty room: answer 404 instead of silently returning
+     * data from nowhere.
+     */
+    private function roomId(Request $request): ?int
+    {
+        $slug = trim((string) ($request->query['room'] ?? ''));
+        if ($slug === '') {
+            return null;
+        }
+
+        $room = RoomResolver::findBySlug($slug);
+        if ($room === null) {
+            Response::error('Комната не найдена: ' . $slug, 404);
+        }
+
+        return $room['id'];
     }
 
     private function parseDate(string $value): ?string

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use App\Controllers\AuthController;
 use App\Controllers\RequestsController;
+use App\Controllers\RoomsController;
 use App\Controllers\WebhookController;
 use App\Controllers\WorkflowsController;
 use App\Http\Request;
@@ -16,6 +17,7 @@ $router = new Router();
 
 $auth = new AuthController();
 $requests = new RequestsController();
+$rooms = new RoomsController();
 $workflows = new WorkflowsController();
 $webhook = new WebhookController();
 
@@ -24,6 +26,13 @@ $router->add('GET', '/api/health', static fn (): never => Response::json(['statu
 $router->add('POST', '/api/auth/login', fn (Request $r) => $auth->login($r));
 $router->add('GET', '/api/auth/me', fn (Request $r) => $auth->me($r));
 $router->add('POST', '/api/auth/logout', fn () => $auth->logout());
+$router->add('POST', '/api/ws/ticket', fn (Request $r) => $auth->wsTicket($r));
+
+$router->add('GET', '/api/rooms', fn (Request $r) => $rooms->index($r));
+$router->add('POST', '/api/rooms', fn (Request $r) => $rooms->store($r));
+$router->add('GET', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->show($r, $p));
+$router->add('PUT', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->update($r, $p));
+$router->add('DELETE', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->destroy($r, $p));
 
 $router->add('GET', '/api/stats', fn (Request $r) => $requests->stats($r));
 $router->add('GET', '/api/requests', fn (Request $r) => $requests->index($r));
@@ -37,11 +46,17 @@ $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflo
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
 
-// Public catcher: every HTTP method, any endpoint slug, no auth.
+// Public catcher: every HTTP method, no auth. {room} and {endpoint} are optional
+// and validated in the controller, because /hook/{x} is ambiguous on its own.
 foreach (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as $method) {
-    $router->add($method, '/api/webhook', fn (Request $r) => $webhook->receive($r, ['endpoint' => 'default']));
-    $router->add($method, '/api/webhook/{endpoint}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/hook/{endpoint}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/api/webhook', fn (Request $r) => $webhook->receive($r));
+    $router->add($method, '/api/webhook/{a}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/api/webhook/{a}/{b}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/api/webhook/{a}/{b}/{rest}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/hook', fn (Request $r) => $webhook->receive($r));
+    $router->add($method, '/hook/{a}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/hook/{a}/{b}', fn (Request $r, array $p) => $webhook->receive($r, $p));
+    $router->add($method, '/hook/{a}/{b}/{rest}', fn (Request $r, array $p) => $webhook->receive($r, $p));
 }
 
 $request = Request::capture();

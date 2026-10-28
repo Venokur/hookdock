@@ -38,6 +38,7 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
     ready.value = true
     setToken('')
+    window.dispatchEvent(new Event('auth:logout'))
   }
 
   return { token, user, ready, isAuthenticated, login, fetchMe, logout }

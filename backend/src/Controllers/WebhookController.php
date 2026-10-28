@@ -7,25 +7,26 @@ namespace App\Controllers;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Realtime;
+use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
 
 final class WebhookController
 {
     /**
-     * Catch-all receiver: stores every method/path, then runs matching workflows.
+     * Catch-all receiver: resolves the room, stores the request, then runs that
+     * room's matching workflows. Requests and workflows of other rooms are never
+     * touched.
      */
     public function receive(Request $request, array $params = []): void
     {
-        $endpoint = (string) ($params['endpoint'] ?? $this->endpointFromPath($request->path));
-        $endpoint = mb_substr(trim($endpoint, '/'), 0, 160);
-        if ($endpoint === '') {
-            $endpoint = 'default';
-        }
+        [$room, $endpoint] = $this->resolveTarget($request, $params);
 
         $raw = $request->rawBody;
         $decoded = $raw !== '' ? json_decode($raw, true) : null;
 
         $row = [
+            'room_id' => $room['id'],
             'endpoint' => $endpoint,
             'method' => $request->method,
             'path' => $request->path,
@@ -40,12 +41,13 @@ final class WebhookController
 
         $stmt = Database::pdo()->prepare(
             'INSERT INTO incoming_requests
-                (endpoint, method, path, query, headers, body, raw_body, content_type, body_bytes, ip)
+                (room_id, endpoint, method, path, query, headers, body, raw_body, content_type, body_bytes, ip)
              VALUES
-                (:endpoint, :method, :path, :query, :headers, :body, :raw_body, :content_type, :body_bytes, :ip)
+                (:room_id, :endpoint, :method, :path, :query, :headers, :body, :raw_body, :content_type, :body_bytes, :ip)
              RETURNING id, received_at'
         );
         $stmt->execute([
+            'room_id' => $row['room_id'],
             'endpoint' => $row['endpoint'],
             'method' => $row['method'],
             'path' => $row['path'],
@@ -62,26 +64,123 @@ final class WebhookController
         $row['id'] = (int) $saved['id'];
         $row['received_at'] = $saved['received_at'];
 
+        // Realtime first: the list can show the row while routing is still running.
+        Realtime::publish('request.created', [
+            'id' => $row['id'],
+            'room_id' => $row['room_id'],
+            'endpoint' => $row['endpoint'],
+            'method' => $row['method'],
+        ]);
+
         $runs = WorkflowEngine::process($row);
+
+        if ($runs !== []) {
+            $failed = count(array_filter($runs, static fn (array $run): bool => ($run['status'] ?? '') === 'failed'));
+
+            Realtime::publish('request.updated', [
+                'id' => $row['id'],
+                'room_id' => $row['room_id'],
+                'run_count' => count($runs),
+                'failed_runs' => $failed,
+            ]);
+        }
 
         Response::json([
             'ok' => true,
             'id' => $row['id'],
+            'room' => $room['slug'],
             'endpoint' => $row['endpoint'],
             'received_at' => $row['received_at'],
             'workflow_runs' => count($runs),
         ], 202);
     }
 
-    private function endpointFromPath(string $path): string
+    /**
+     * Resolves the room and the endpoint slug out of the request path.
+     *
+     * Supported shapes:
+     *   /api/webhook/{room}/{endpoint}   /hook/{room}/{endpoint}
+     *   /api/webhook/{room}              /hook/{room}          (endpoint = default)
+     *   /api/webhook/{endpoint}          /hook/{endpoint}      (room = default)
+     *
+     * @param array<string, mixed> $params
+     * @return array{0: array{id: int, slug: string}, 1: string}
+     */
+    private function resolveTarget(Request $request, array $params): array
+    {
+        $roomSlug = isset($params['room']) ? (string) $params['room'] : '';
+        $endpoint = isset($params['endpoint']) ? (string) $params['endpoint'] : '';
+
+        if ($roomSlug !== '') {
+            $room = RoomResolver::findBySlug($roomSlug);
+            if ($room === null) {
+                Response::error('Комната не найдена: ' . $roomSlug, 404);
+            }
+
+            return [$room, $this->normalizeEndpoint($endpoint)];
+        }
+
+        $segments = $this->segments($request->path);
+
+        // Two segments after the prefix: the first one must be a known room.
+        if (count($segments) >= 2) {
+            $room = RoomResolver::findBySlug($segments[0]);
+            if ($room !== null) {
+                return [$room, $this->normalizeEndpoint(implode('/', array_slice($segments, 1)))];
+            }
+
+            Response::error('Комната не найдена: ' . $segments[0], 404);
+        }
+
+        // One segment: either a room (endpoint = default) or an endpoint of the
+        // default room. A known slug wins so /hook/default keeps working both ways.
+        if (count($segments) === 1) {
+            $room = RoomResolver::findBySlug($segments[0]);
+            if ($room !== null) {
+                return [$room, $endpoint !== '' ? $this->normalizeEndpoint($endpoint) : 'default'];
+            }
+
+            return [$this->requireDefaultRoom(), $this->normalizeEndpoint($segments[0])];
+        }
+
+        return [$this->requireDefaultRoom(), $this->normalizeEndpoint($endpoint)];
+    }
+
+    /**
+     * @return array{id: int, slug: string}
+     */
+    private function requireDefaultRoom(): array
+    {
+        $room = RoomResolver::default();
+
+        if ($room === null) {
+            Response::error('Комната по умолчанию не настроена', 500);
+        }
+
+        return $room;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function segments(string $path): array
     {
         foreach (['/api/webhook/', '/hook/'] as $prefix) {
             if (str_starts_with($path, $prefix)) {
-                return substr($path, strlen($prefix));
+                $rest = substr($path, strlen($prefix));
+
+                return array_values(array_filter(explode('/', trim($rest, '/')), static fn (string $part): bool => $part !== ''));
             }
         }
 
-        return trim($path, '/');
+        return array_values(array_filter(explode('/', trim($path, '/')), static fn (string $part): bool => $part !== ''));
+    }
+
+    private function normalizeEndpoint(string $endpoint): string
+    {
+        $value = mb_substr(trim($endpoint, '/'), 0, 160);
+
+        return $value === '' ? 'default' : $value;
     }
 
     /**

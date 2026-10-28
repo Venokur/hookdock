@@ -11,12 +11,12 @@ final class Jwt
     /**
      * @param array<string, mixed> $claims
      */
-    public static function issue(array $claims): string
+    public static function issue(array $claims, ?int $ttl = null): string
     {
         $now = time();
         $payload = array_merge($claims, [
             'iat' => $now,
-            'exp' => $now + Config::int('JWT_TTL', 43200),
+            'exp' => $now + ($ttl ?? Config::int('JWT_TTL', 43200)),
         ]);
 
         $header = self::encode(['alg' => 'HS256', 'typ' => 'JWT']);

@@ -12,6 +12,20 @@ function Assert-True {
     Write-Host "ok - $Message" -ForegroundColor Green
 }
 
+function Assert-Status {
+    param([scriptblock]$Call, [int]$Expected, [string]$Message)
+    $actual = 0
+    try {
+        & $Call | Out-Null
+    } catch {
+        $actual = [int]$_.Exception.Response.StatusCode.value__
+    }
+    if ($actual -ne $Expected) {
+        throw "FAIL: $Message (expected $Expected, got $actual)"
+    }
+    Write-Host "ok - $Message" -ForegroundColor Green
+}
+
 Write-Host "Smoke testing $BaseUrl" -ForegroundColor Cyan
 
 $health = Invoke-RestMethod -Uri "$BaseUrl/api/health"
@@ -32,19 +46,52 @@ try {
 }
 Assert-True $unauthorized "requests API rejects anonymous access"
 
-$endpoint = "smoke-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+# --- Rooms --------------------------------------------------------------------
+$rooms = Invoke-RestMethod -Uri "$BaseUrl/api/rooms" -Headers $auth
+Assert-True ($rooms.data.Count -ge 1) "rooms list is seeded"
+$defaultRoom = @($rooms.data | Where-Object { $_.slug -eq "default" })[0]
+Assert-True ($null -ne $defaultRoom) "default room exists"
+
+$suffix = [guid]::NewGuid().ToString("N").Substring(0, 8)
+$roomSlug = "smoke-$suffix"
+$room = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Smoke room $suffix"; slug = $roomSlug } | ConvertTo-Json)
+$roomId = $room.data.id
+Assert-True ($roomId -gt 0) "room can be created"
+Assert-True ($room.data.slug -eq $roomSlug) "room keeps the requested slug"
+
+Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+        -Body (@{ name = "Dup $suffix"; slug = $roomSlug } | ConvertTo-Json) } 422 "duplicate room slug is rejected"
+Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+        -Body (@{ name = "Bad $suffix"; slug = "Bad Slug!" } | ConvertTo-Json) } 422 "invalid room slug is rejected"
+
+$renamed = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Smoke room renamed $suffix" } | ConvertTo-Json)
+Assert-True ($renamed.data.slug -eq $roomSlug) "renaming a room keeps its slug unless one is sent"
+
+# --- Ingestion into a specific room -------------------------------------------
+$endpoint = "smoke-$suffix"
 $payload = @{
     event    = @{ type = "payment"; amount = 42 }
     customer = @{ name = "Ada" }
 } | ConvertTo-Json -Depth 6
 
-$response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$endpoint" `
+$response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$roomSlug/$endpoint" `
     -ContentType "application/json" -Body $payload
 Assert-True ($response.StatusCode -eq 202) "webhook receiver accepts POST and returns 202"
-$requestId = ($response.Content | ConvertFrom-Json).id
+$accepted = $response.Content | ConvertFrom-Json
+$requestId = $accepted.id
 Assert-True ($requestId -gt 0) "webhook is persisted with an id"
+Assert-True ($accepted.room -eq $roomSlug) "webhook response names the room"
 
+$roomScoped = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug" -Headers $auth
+Assert-True ($roomScoped.meta.total -eq 1) "request is stored only in its room"
+$otherRoom = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=default" -Headers $auth
+Assert-True (-not ($otherRoom.data | Where-Object { $_.id -eq $requestId })) "request does not leak into another room"
+
+# --- Workflows are scoped to the room -----------------------------------------
 $workflow = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room       = $roomSlug
     name       = "Smoke workflow"
     endpoint   = $endpoint
     enabled    = $true
@@ -52,21 +99,57 @@ $workflow = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Header
     actions    = @(@{ type = "log"; message = "paid by {{ body.customer.name }}" })
 } | ConvertTo-Json -Depth 8)
 Assert-True ($workflow.data.id -gt 0) "workflow can be created"
+Assert-True ($workflow.data.room_id -eq $roomId) "workflow is bound to the room"
 Assert-True ($workflow.data.conditions -is [System.Array] -and $workflow.data.conditions.Count -eq 1) "workflow conditions return as an array"
 Assert-True ($workflow.data.actions -is [System.Array] -and $workflow.data.actions.Count -eq 1) "workflow actions return as an array"
 
-$match = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$endpoint" `
+$roomWorkflows = Invoke-RestMethod -Uri "$BaseUrl/api/workflows?room=$roomSlug" -Headers $auth
+Assert-True ($roomWorkflows.data.Count -eq 1 -and $roomWorkflows.data[0].id -eq $workflow.data.id) "workflow list is filtered by room"
+
+Assert-Status { Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/workflows/$($workflow.data.id)" -Headers $auth `
+        -ContentType "application/json" -Body (@{
+            room_id = $defaultRoom.id
+            name    = "Smoke moved"
+            endpoint = $endpoint
+            actions = @(@{ type = "log"; message = "moved" })
+        } | ConvertTo-Json -Depth 8) } 422 "workflow cannot move to another room"
+
+# The slug is what external integrations point at, so an explicit change must
+# take effect and the old address must stop resolving.
+$renamedSlug = "$roomSlug-renamed"
+$slugChange = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Smoke room $suffix"; slug = $renamedSlug } | ConvertTo-Json)
+Assert-True ($slugChange.data.slug -eq $renamedSlug) "explicit slug change is applied"
+Assert-Status { Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$endpoint" `
+        -ContentType "application/json" -Body '{"x":1}' } 404 "old room slug stops resolving"
+$newSlugHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$renamedSlug/$endpoint" `
+    -ContentType "application/json" -Body $payload
+Assert-True ($newSlugHit.StatusCode -eq 202) "new room slug accepts webhooks"
+$roomSlug = $renamedSlug
+
+# Same endpoint in another room: it must not fire for this room's webhook.
+$decoy = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room     = "default"
+    name     = "Smoke decoy"
+    endpoint = $endpoint
+    enabled  = $true
+    actions  = @(@{ type = "log"; message = "wrong room" })
+} | ConvertTo-Json -Depth 8)
+Assert-True ($decoy.data.room_id -eq $defaultRoom.id) "same endpoint can exist in another room"
+
+$match = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$endpoint" `
     -ContentType "application/json" -Body $payload
 $matchId = ($match.Content | ConvertFrom-Json).id
 
 $detail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$matchId" -Headers $auth
-Assert-True ($detail.data.runs.Count -eq 1) "matching request records one workflow run"
+Assert-True ($detail.data.runs.Count -eq 1) "only the room's own workflow fires"
+Assert-True ($detail.data.runs[0].workflow_id -eq $workflow.data.id) "run belongs to the room workflow"
 Assert-True ($detail.data.request.headers -isnot [string] -and $detail.data.request.query -isnot [string]) "request JSON columns return as objects"
 Assert-True ($detail.data.runs[0].status -eq "success") "log action succeeds"
 Assert-True ($detail.data.runs[0].message -like "*Ada*") "template placeholders resolve"
 
 $skipPayload = @{ event = @{ type = "refund" } } | ConvertTo-Json -Depth 4
-$skip = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$endpoint" `
+$skip = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$endpoint" `
     -ContentType "application/json" -Body $skipPayload
 $skipId = ($skip.Content | ConvertFrom-Json).id
 $skipDetail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$skipId" -Headers $auth
@@ -74,6 +157,7 @@ Assert-True ($skipDetail.data.runs[0].status -eq "skipped") "non-matching condit
 
 $forwardEndpoint = "$endpoint-forward"
 $forward = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room     = $roomSlug
     name     = "Smoke forward"
     endpoint = $forwardEndpoint
     enabled  = $true
@@ -81,6 +165,7 @@ $forward = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers
 } | ConvertTo-Json -Depth 8)
 
 $paused = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room     = $roomSlug
     name     = "Smoke paused"
     endpoint = "$forwardEndpoint-paused"
     enabled  = $false
@@ -88,7 +173,7 @@ $paused = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers 
 } | ConvertTo-Json -Depth 8)
 Assert-True ($paused.data.enabled -eq $false) "workflow can be created paused"
 
-$forwardHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$forwardEndpoint" -ContentType "text/plain" -Body "ping"
+$forwardHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$forwardEndpoint" -ContentType "text/plain" -Body "ping"
 $forwardId = ($forwardHit.Content | ConvertFrom-Json).id
 $forwardDetail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$forwardId" -Headers $auth
 Assert-True ($forwardDetail.data.request.body -eq $null) "non-JSON payload keeps body null"
@@ -96,19 +181,118 @@ Assert-True ($forwardDetail.data.request.raw_body -eq "ping") "non-JSON payload 
 Assert-True ($forwardDetail.data.runs[0].status -eq "success") "forward action reaches target"
 Assert-True ($forwardDetail.data.runs[0].message -like "*200*") "forward action records HTTP status"
 
-$list = Invoke-RestMethod -Uri "$BaseUrl/api/requests?per_page=5" -Headers $auth
+# --- Address resolution -------------------------------------------------------
+$roomOnly = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug" -ContentType "application/json" -Body '{"x":1}'
+$roomOnlyBody = $roomOnly.Content | ConvertFrom-Json
+Assert-True ($roomOnlyBody.endpoint -eq "default") "/hook/{room} stores endpoint 'default'"
+
+Assert-Status { Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug-unknown/thing" `
+        -ContentType "application/json" -Body '{"x":1}' } 404 "webhook to an unknown room is rejected"
+
+$legacy = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$endpoint-legacy" -ContentType "application/json" -Body '{"x":1}'
+$legacyBody = $legacy.Content | ConvertFrom-Json
+Assert-True ($legacyBody.room -eq "default") "legacy /hook/{endpoint} lands in the default room"
+
+$list = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=5" -Headers $auth
 Assert-True ($list.data.Count -ge 1) "requests list returns data"
 Assert-True ($list.meta.total -ge 3) "requests list exposes pagination meta"
 
-$stats = Invoke-RestMethod -Uri "$BaseUrl/api/stats" -Headers $auth
+$stats = Invoke-RestMethod -Uri "$BaseUrl/api/stats?room=$roomSlug" -Headers $auth
 Assert-True ($stats.data.requests_total -ge 3) "stats endpoint aggregates requests"
+Assert-True ($stats.data.workflows_active -ge 1) "stats endpoint counts the room's workflows"
 
+Assert-Status { Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug-nope" -Headers $auth } 404 "unknown room filter is rejected"
+
+# --- Realtime websocket -------------------------------------------------------
+$ticketRejected = $false
+try {
+    Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/ws/ticket" | Out-Null
+} catch {
+    $ticketRejected = $true
+}
+Assert-True $ticketRejected "ws ticket requires authorization"
+
+$ticket = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/ws/ticket" -Headers $auth
+Assert-True (-not [string]::IsNullOrWhiteSpace($ticket.data.ticket)) "ws ticket is issued for a signed-in user"
+Assert-True ($ticket.data.expires_in -gt 0 -and $ticket.data.expires_in -le 300) "ws ticket is short-lived"
+
+$liveRequestId = $null
+try {
+    $wsUri = [Uri]($BaseUrl.Replace("http", "ws") + "/api/ws?ticket=" + [Uri]::EscapeDataString($ticket.data.ticket))
+    $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+    $ct = [System.Threading.CancellationToken]::None
+    $buffer = [byte[]]::new(65536)
+
+    $ws.ConnectAsync($wsUri, $ct).Wait(10000) | Out-Null
+    Assert-True ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) "websocket upgrade succeeds through nginx"
+
+    $hello = $ws.ReceiveAsync([System.ArraySegment[byte]]::new($buffer), $ct)
+    $hello.Wait(5000) | Out-Null
+    $helloText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $hello.Result.Count)
+    Assert-True ($helloText -like '*"hello"*') "websocket sends hello on connect"
+
+    $liveEndpoint = "smoke-live-$suffix"
+    $liveResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$roomSlug/$liveEndpoint" `
+        -ContentType "application/json" -Body '{"event":{"type":"live"}}'
+    $liveRequestId = ($liveResponse.Content | ConvertFrom-Json).id
+
+    $eventText = ''
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $frame = $ws.ReceiveAsync([System.ArraySegment[byte]]::new($buffer), $ct)
+        if (-not $frame.Wait(3000)) { continue }
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $frame.Result.Count)
+        if ($text -like '*request.created*') {
+            $eventText = $text
+            break
+        }
+    }
+    Assert-True ($eventText -like "*`"id`":$liveRequestId*") "webhook delivery pushes request.created over websocket"
+    Assert-True ($eventText -like "*`"room_id`":$roomId*") "realtime event carries the room id"
+
+    # Renaming a room must reach open tabs so they can follow the new slug.
+    Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
+        -Body (@{ name = "Smoke room live $suffix" } | ConvertTo-Json) | Out-Null
+
+    $roomEventText = ''
+    $roomDeadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $roomDeadline) {
+        $frame = $ws.ReceiveAsync([System.ArraySegment[byte]]::new($buffer), $ct)
+        if (-not $frame.Wait(3000)) { continue }
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $frame.Result.Count)
+        if ($text -like '*room.changed*') {
+            $roomEventText = $text
+            break
+        }
+    }
+    Assert-True ($roomEventText -like "*`"id`":$roomId*") "room update is pushed over websocket"
+    Assert-True ($roomEventText -like "*`"slug`":`"$roomSlug`"*") "room event carries the slug"
+
+    $ws.Dispose()
+} catch {
+    if ($ws) { $ws.Dispose() }
+    Write-Host "skip - realtime websocket checks ($($_.Exception.Message))" -ForegroundColor Yellow
+}
+
+# --- Cleanup ------------------------------------------------------------------
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($workflow.data.id)" -Headers $auth | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($forward.data.id)" -Headers $auth | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($paused.data.id)" -Headers $auth | Out-Null
-foreach ($id in @($requestId, $matchId, $skipId, $forwardId)) {
-    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$id" -Headers $auth | Out-Null
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($decoy.data.id)" -Headers $auth | Out-Null
+
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth | Out-Null
+Assert-Status { Invoke-RestMethod -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth } 404 "deleted room is gone"
+
+# Deleting a room cascades to its requests and workflows.
+$goneRequests = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=default&per_page=100" -Headers $auth
+Assert-True (-not ($goneRequests.data | Where-Object { $_.id -eq $requestId })) "deleting a room removes its requests"
+
+if ($liveRequestId) {
+    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$liveRequestId" -Headers $auth | Out-Null
+}
+foreach ($legacyId in @((Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=default&per_page=100" -Headers $auth).data |
+        Where-Object { $_.endpoint -eq "$endpoint-legacy" } | ForEach-Object { $_.id })) {
+    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$legacyId" -Headers $auth | Out-Null
 }
 
 Write-Host "All smoke checks passed." -ForegroundColor Green
-
