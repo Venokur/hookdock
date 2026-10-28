@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+**/node_modules
+**/dist
+**/vendor
+*.log
+.idea
+.vscode
+README.md
+AGENTS.md
+SPEC.md
+scripts
