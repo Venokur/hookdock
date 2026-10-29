@@ -29,6 +29,16 @@ const loading = ref(false)
 const error = ref('')
 const copied = ref(false)
 
+// User-driven reloads (filters, paging, room switch) get their own busy flags so
+// the loader is visible even when a local API answers in a few milliseconds.
+// `filtering` additionally drives the spinner inside the method select.
+const filtering = ref(false)
+const listBusy = ref(false)
+// Whether the list had rows when the current reload started. The overlay dims
+// existing content; a list that is still empty shows its own inline spinner
+// instead, so a fresh result never flashes the overlay on arrival.
+const listHasContent = ref(false)
+
 const showDetail = ref(false)
 const detailLoading = ref(false)
 const detail = ref(null)
@@ -38,6 +48,10 @@ let releaseLive = null
 let offRealtime = null
 let filterTimer = null
 let reloadTimer = null
+let busyToken = 0
+
+const FILTER_DEBOUNCE = 250
+const BUSY_MIN = 350
 
 const methods = ['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 const methodOptions = methods.map((method) => ({
@@ -123,6 +137,46 @@ async function load({ silent = false } = {}) {
 const { busy: refreshing, updatedAt, run: refreshNow } = useRefresh(() => load())
 
 /**
+ * Marks the start of a user-driven reload and returns its token. A newer token
+ * wins, so a stale response cannot hide the loader the user is looking at.
+ */
+function beginBusy({ filter = false } = {}) {
+  const token = ++busyToken
+  // Snapshot the list before the request: an empty list keeps its inline
+  // spinner instead of dimming a table that has nothing to dim.
+  listHasContent.value = items.value.length > 0
+  listBusy.value = true
+
+  if (filter) {
+    filtering.value = true
+  }
+
+  return token
+}
+
+/**
+ * Reloads the list for a user action and keeps the loader up for at least
+ * `BUSY_MIN` ms, counted from `started` (the moment the user acted, not the
+ * moment the request went out, so the debounce is part of the wait).
+ */
+async function loadWithLoader({ filter = false, started = Date.now(), token = beginBusy({ filter }) } = {}) {
+  try {
+    await load()
+  } finally {
+    const rest = BUSY_MIN - (Date.now() - started)
+
+    if (rest > 0) {
+      await new Promise((resolve) => setTimeout(resolve, rest))
+    }
+
+    if (token === busyToken) {
+      listBusy.value = false
+      filtering.value = false
+    }
+  }
+}
+
+/**
  * Realtime events are thin, so any of them just means "re-read what I show".
  * Debounced to collapse bursts (a webhook fans out into created + updated).
  */
@@ -200,17 +254,23 @@ watch(slug, () => {
   showDetail.value = false
   detail.value = null
   runs.value = []
-  load()
+  loadWithLoader()
 })
 
 watch(
   filters,
   () => {
     clearTimeout(filterTimer)
+
+    // Claim the loader before the debounce: a method pick must react at once,
+    // and 250 ms of silence already reads as "the filter did nothing".
+    const token = beginBusy({ filter: true })
+    const started = Date.now()
+
     filterTimer = setTimeout(() => {
       meta.page = 1
-      load()
-    }, 250)
+      loadWithLoader({ filter: true, started, token })
+    }, FILTER_DEBOUNCE)
   },
   { deep: true },
 )
@@ -221,7 +281,7 @@ function goToPage(page) {
   }
 
   meta.page = page
-  load()
+  loadWithLoader()
 }
 
 async function openRequest(row) {
@@ -260,7 +320,7 @@ async function removeRequest(id) {
   try {
     await api.deleteRequest(id)
     showDetail.value = false
-    await load()
+    await loadWithLoader()
   } catch (e) {
     error.value = e.message
   }
@@ -373,6 +433,7 @@ onUnmounted(() => {
         <AppSelect
           v-model="filters.method"
           :options="methodOptions"
+          :loading="filtering"
           size="sm"
           aria-label="Фильтр по методу"
           class="w-36"
@@ -406,12 +467,12 @@ onUnmounted(() => {
       <section class="card relative overflow-hidden">
         <Transition name="fade">
           <div
-            v-if="refreshing || (loading && items.length > 0)"
+            v-if="refreshing || (listBusy && listHasContent)"
             class="absolute inset-0 z-10 grid place-items-center bg-surface/70 backdrop-blur-[1px]"
           >
             <span class="flex items-center gap-2 text-xs font-medium text-ink-soft">
               <AppSpinner size="sm" />
-              Обновляем лог…
+              {{ filtering ? 'Фильтруем…' : 'Обновляем лог…' }}
             </span>
           </div>
         </Transition>
@@ -457,7 +518,7 @@ onUnmounted(() => {
                 <td class="px-4 py-3 text-right text-ink-mute">→</td>
               </tr>
 
-              <tr v-if="!loading && items.length === 0">
+              <tr v-if="!loading && !listBusy && items.length === 0">
                 <td colspan="7" class="px-4 py-16 text-center">
                   <p class="text-sm font-medium text-ink">Пока ничего не поймано</p>
                   <p class="mx-auto mt-1 max-w-md text-xs text-ink-mute">
@@ -467,11 +528,11 @@ onUnmounted(() => {
                 </td>
               </tr>
 
-              <tr v-if="loading && items.length === 0">
+              <tr v-if="(loading || listBusy) && items.length === 0">
                 <td colspan="7" class="px-4 py-16 text-center">
                   <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
                     <AppSpinner size="sm" />
-                    Загружаем лог…
+                    {{ filtering ? 'Фильтруем…' : 'Загружаем лог…' }}
                   </span>
                 </td>
               </tr>

@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
+import AppSpinner from './AppSpinner.vue'
 
 const model = defineModel({ type: [String, Number], default: '' })
 
@@ -9,6 +10,8 @@ const props = defineProps({
   placeholder: { type: String, default: 'Выберите значение' },
   disabled: Boolean,
   invalid: Boolean,
+  /** Swaps the chevron for a spinner while the value is being applied. */
+  loading: Boolean,
   ariaLabel: { type: String, default: '' },
 })
 
@@ -275,6 +278,7 @@ onBeforeUnmount(() => {
       :aria-controls="listId"
       :aria-activedescendant="activeDescendant"
       :aria-label="props.ariaLabel || undefined"
+      :aria-busy="props.loading || undefined"
       :disabled="props.disabled"
       class="flex w-full cursor-pointer items-center justify-between gap-2 border bg-surface text-left text-ink outline-none transition
         disabled:cursor-not-allowed disabled:opacity-60"
@@ -286,17 +290,21 @@ onBeforeUnmount(() => {
         {{ selected ? selected.label : props.placeholder }}
       </span>
 
-      <svg
-        class="h-3.5 w-3.5 shrink-0 text-ink-mute transition-transform duration-150"
-        :class="{ 'rotate-180': open }"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        aria-hidden="true"
-      >
-        <path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6" />
-      </svg>
+      <span class="grid h-3.5 w-3.5 shrink-0 place-items-center text-ink-mute">
+        <AppSpinner v-if="props.loading" size="xs" />
+        <svg
+          v-else
+          class="h-3.5 w-3.5 transition-transform duration-150"
+          :class="{ 'rotate-180': open }"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          aria-hidden="true"
+        >
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6" />
+        </svg>
+      </span>
     </button>
 
     <Teleport to="body">
