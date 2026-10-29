@@ -1,50 +1,26 @@
-const TRANSLIT = {
-  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z',
-  и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r',
-  с: 's', т: 't', у: 'u', ф: 'f', х: 'h', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch',
-  ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+/**
+ * Room slugs are one URL segment of a webhook address, so they use the same
+ * alphabet as endpoint slugs. `RoomsController::validSlug` validates the value
+ * again on the server; this module mirrors the rules for the form.
+ */
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
+const SLUG_BYTES = 6
+
+export function isValidSlug(value) {
+  return SLUG_PATTERN.test(String(value ?? '').trim().toLowerCase())
 }
 
 /**
- * Mirrors RoomsController::slugify on the server so the preview in the room
- * form matches the value that will actually be stored.
+ * Mirrors `RoomsController::generateSlug`: two 12-char hex groups with no
+ * relation to the room name, so renaming a room never changes its address.
  */
-export function slugify(value) {
-  const lower = String(value ?? '').toLowerCase()
-  let out = ''
+export function randomSlug() {
+  const group = () => {
+    const bytes = new Uint8Array(SLUG_BYTES)
+    crypto.getRandomValues(bytes)
 
-  for (const char of lower) {
-    out += TRANSLIT[char] ?? char
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
   }
 
-  return out
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64)
-}
-
-/**
- * Mirrors RoomsController::insertWithGeneratedSlug so the read-only field shows
- * the slug the server is about to assign: the transliterated name, or the next
- * free `-2`, `-3`, … variant when the list already holds that slug.
- */
-export function uniqueSlug(value, takenSlugs = []) {
-  const base = slugify(value) || 'room'
-  const taken = new Set([...takenSlugs].map((slug) => String(slug ?? '').toLowerCase()))
-
-  if (!taken.has(base)) {
-    return base
-  }
-
-  for (let n = 2; n <= 100; n++) {
-    const suffix = `-${n}`
-    const trimmed = base.slice(0, 64 - suffix.length).replace(/-+$/, '')
-    const candidate = `${trimmed || 'room'}${suffix}`
-
-    if (!taken.has(candidate)) {
-      return candidate
-    }
-  }
-
-  return base
+  return `${group()}-${group()}`
 }

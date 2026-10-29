@@ -18,6 +18,10 @@ const rooms = useRoomsStore()
 const slug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
 const room = computed(() => (slug.value ? rooms.find(slug.value) : null))
 
+// Address advertised for a `*` workflow: the room's own endpoint. The receiver
+// still accepts any path, so `*` keeps firing for arbitrary endpoints too.
+const roomEndpoint = computed(() => room.value?.endpoint || 'default')
+
 const workflows = ref([])
 const loading = ref(false)
 const error = ref('')
@@ -132,7 +136,7 @@ async function removeWorkflow(workflow) {
 }
 
 function webhookUrl(workflow) {
-  const endpoint = workflow.endpoint === '*' ? 'my-endpoint' : workflow.endpoint
+  const endpoint = workflow.endpoint === '*' ? roomEndpoint.value : workflow.endpoint
   const prefix = slug.value ? `/${slug.value}` : ''
 
   return `${window.location.origin}/api/webhook${prefix}/${endpoint}`
@@ -142,7 +146,7 @@ function triggerLabel(workflow) {
   const prefix = slug.value ? `/${slug.value}` : ''
 
   return workflow.endpoint === '*'
-    ? `любой эндпоинт комнаты, например /api/webhook${prefix}/my-endpoint`
+    ? `любой эндпоинт комнаты, например /api/webhook${prefix}/${roomEndpoint.value}`
     : `/api/webhook${prefix}/${workflow.endpoint}`
 }
 

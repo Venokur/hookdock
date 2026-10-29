@@ -17,12 +17,14 @@ use App\Services\Realtime;
  */
 final class RoomsController
 {
+    private const SLUG_TAKEN = 'Slug комнаты уже занят, сгенерируйте новый';
+
     public function index(Request $request): void
     {
         Auth::requireUser($request);
 
         $rows = Database::pdo()->query(
-            "SELECT r.id, r.name, r.slug, r.created_at, r.updated_at,
+            "SELECT r.id, r.name, r.slug, r.endpoint, r.created_at, r.updated_at,
                     COALESCE(req.total, 0)::int AS requests_total,
                     COALESCE(req.last_24h, 0)::int AS requests_last_24h,
                     req.last_received_at,
@@ -76,16 +78,27 @@ final class RoomsController
 
         $name = $this->validName((string) ($payload['name'] ?? ''));
 
-        // The SPA never sends a slug: it is derived from the name and made unique
-        // here, because only the server sees every room in the installation.
-        $requested = trim((string) ($payload['slug'] ?? ''));
+        // Empty or missing endpoint: the server assigns a random one. The value is
+        // editable afterwards, because it ends up in URLs already handed out.
+        $endpoint = $this->validEndpoint((string) ($payload['endpoint'] ?? ''));
 
-        if ($requested === '') {
-            $row = $this->insertWithGeneratedSlug($name);
-        } else {
-            $slug = $this->validSlug($requested, $name);
-            $this->assertSlugFree($slug);
-            $row = $this->insert($name, $slug);
+        // The slug is random and unrelated to the name, so renaming a room never
+        // changes its address. The SPA sends one it generated for the preview; a
+        // missing value means the server picks it.
+        $requested = trim((string) ($payload['slug'] ?? ''));
+        $slug = $requested === '' ? $this->generateSlug() : $this->validSlug($requested);
+
+        // A duplicate is never resolved by silently drawing another value: the
+        // client sees 422 and has to generate a new slug explicitly.
+        $this->assertSlugFree($slug);
+
+        try {
+            $row = $this->insert($name, $slug, $endpoint);
+        } catch (\PDOException $e) {
+            if ($e->getCode() === '23505') {
+                Response::error(self::SLUG_TAKEN, 422);
+            }
+            throw $e;
         }
 
         Realtime::publish('room.changed', ['id' => (int) $row['id'], 'slug' => $row['slug'], 'action' => 'created']);
@@ -107,21 +120,40 @@ final class RoomsController
         $name = $this->validName((string) ($payload['name'] ?? $existing['name']));
 
         // Changing the slug breaks webhook URLs already configured elsewhere, so it
-        // only happens when the client sends one explicitly.
+        // only happens when the client sends one explicitly. An explicitly empty
+        // value asks for a fresh random slug, mirroring the endpoint below. A
+        // duplicate is rejected so the client regenerates instead of reusing one.
         $slug = $existing['slug'];
         if (array_key_exists('slug', $payload)) {
-            $slug = $this->validSlug((string) $payload['slug'], $name);
+            $requested = trim((string) $payload['slug']);
+            $slug = $requested === '' ? $this->generateSlug() : $this->validSlug($requested);
             if (strcasecmp($slug, (string) $existing['slug']) !== 0) {
                 $this->assertSlugFree($slug, $id);
             }
         }
 
+        // Same rule for the endpoint: an omitted key keeps what integrations point
+        // at, an explicitly empty value asks for a fresh random one.
+        $endpoint = $existing['endpoint'];
+        if (array_key_exists('endpoint', $payload)) {
+            $endpoint = $this->validEndpoint((string) $payload['endpoint']);
+        }
+
         $stmt = Database::pdo()->prepare(
-            'UPDATE rooms SET name = :name, slug = :slug, updated_at = now()
+            'UPDATE rooms SET name = :name, slug = :slug, endpoint = :endpoint, updated_at = now()
              WHERE id = :id
-             RETURNING id, name, slug, created_at, updated_at'
+             RETURNING id, name, slug, endpoint, created_at, updated_at'
         );
-        $stmt->execute(['id' => $id, 'name' => $name, 'slug' => $slug]);
+
+        try {
+            $stmt->execute(['id' => $id, 'name' => $name, 'slug' => $slug, 'endpoint' => $endpoint]);
+        } catch (\PDOException $e) {
+            // The unique index can still win a race against the check above.
+            if ($e->getCode() === '23505') {
+                Response::error(self::SLUG_TAKEN, 422);
+            }
+            throw $e;
+        }
 
         $row = $stmt->fetch();
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
@@ -157,7 +189,7 @@ final class RoomsController
         }
 
         $stmt = Database::pdo()->prepare(
-            'SELECT id, name, slug, created_at, updated_at FROM rooms WHERE id = :id'
+            'SELECT id, name, slug, endpoint, created_at, updated_at FROM rooms WHERE id = :id'
         );
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
@@ -179,16 +211,13 @@ final class RoomsController
     }
 
     /**
-     * Slugs end up in webhook URLs, so they are restricted to a URL-safe alphabet.
-     * An empty value falls back to a transliterated project name.
+     * Slugs end up in webhook URLs, so they are restricted to a URL-safe
+     * alphabet. They are random rather than derived from the room name, so a
+     * rename cannot silently break an address integrations already point at.
      */
-    private function validSlug(string $value, string $fallbackName): string
+    private function validSlug(string $value): string
     {
         $slug = strtolower(trim($value));
-
-        if ($slug === '') {
-            $slug = $this->slugify($fallbackName);
-        }
 
         if ($slug === '' || preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $slug) !== 1) {
             Response::error('Slug комнаты: латинские буквы, цифры и дефис, до 64 символов', 422);
@@ -198,73 +227,55 @@ final class RoomsController
     }
 
     /**
-     * @return array<string, mixed>
+     * The endpoint slug appears in copied webhook URLs, so it is restricted to a
+     * single URL-safe segment. An empty value asks the server to generate one.
      */
-    private function insert(string $name, string $slug): array
+    private function validEndpoint(string $value): string
     {
-        $stmt = Database::pdo()->prepare(
-            'INSERT INTO rooms (name, slug) VALUES (:name, :slug)
-             RETURNING id, name, slug, created_at, updated_at'
-        );
-        $stmt->execute(['name' => $name, 'slug' => $slug]);
+        $endpoint = strtolower(trim($value));
 
-        return $stmt->fetch();
+        if ($endpoint === '') {
+            return $this->generateEndpoint();
+        }
+
+        if (preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $endpoint) !== 1) {
+            Response::error('Эндпоинт: латинские буквы, цифры и дефис, до 64 символов', 422);
+        }
+
+        return $endpoint;
     }
 
     /**
-     * Derives a slug from the room name and retries with -2, -3, … while the
-     * unique index on lower(slug) rejects the candidate. Relying on the index
-     * instead of a SELECT keeps two concurrent creates from picking the same
-     * slug: the loser simply moves to the next suffix.
-     *
+     * Random and unrelated to the room name, so the address is stable across
+     * renames and two identically named rooms never share a URL. Two 12-char
+     * hex groups (96 bits) make an accidental repeat practically impossible.
+     */
+    private function generateSlug(): string
+    {
+        return bin2hex(random_bytes(6)) . '-' . bin2hex(random_bytes(6));
+    }
+
+    /**
+     * Random tail so links handed out by different rooms never look alike. The
+     * `hook-` prefix keeps it identifiable as a webhook address in logs.
+     */
+    private function generateEndpoint(): string
+    {
+        return 'hook-' . bin2hex(random_bytes(3));
+    }
+
+    /**
      * @return array<string, mixed>
      */
-    private function insertWithGeneratedSlug(string $name): array
+    private function insert(string $name, string $slug, string $endpoint): array
     {
-        $base = $this->slugify($name);
-        if ($base === '') {
-            $base = 'room';
-        }
+        $stmt = Database::pdo()->prepare(
+            'INSERT INTO rooms (name, slug, endpoint) VALUES (:name, :slug, :endpoint)
+             RETURNING id, name, slug, endpoint, created_at, updated_at'
+        );
+        $stmt->execute(['name' => $name, 'slug' => $slug, 'endpoint' => $endpoint]);
 
-        for ($n = 1; $n <= 100; $n++) {
-            $slug = $n === 1 ? $base : $this->withSuffix($base, $n);
-
-            try {
-                return $this->insert($name, $slug);
-            } catch (\PDOException $e) {
-                if ($e->getCode() !== '23505') {
-                    throw $e;
-                }
-            }
-        }
-
-        Response::error('Не удалось подобрать свободный slug для комнаты', 422);
-    }
-
-    /** Keeps the 64-character limit intact when a numeric suffix is appended. */
-    private function withSuffix(string $base, int $n): string
-    {
-        $suffix = '-' . $n;
-        $trimmed = rtrim(mb_substr($base, 0, 64 - mb_strlen($suffix)), '-');
-
-        return ($trimmed === '' ? 'room' : $trimmed) . $suffix;
-    }
-
-    private function slugify(string $value): string
-    {
-        $map = [
-            'а' => 'a', 'б' => 'b', 'в' => 'v', 'г' => 'g', 'д' => 'd', 'е' => 'e',
-            'ё' => 'e', 'ж' => 'zh', 'з' => 'z', 'и' => 'i', 'й' => 'y', 'к' => 'k',
-            'л' => 'l', 'м' => 'm', 'н' => 'n', 'о' => 'o', 'п' => 'p', 'р' => 'r',
-            'с' => 's', 'т' => 't', 'у' => 'u', 'ф' => 'f', 'х' => 'h', 'ц' => 'ts',
-            'ч' => 'ch', 'ш' => 'sh', 'щ' => 'sch', 'ъ' => '', 'ы' => 'y', 'ь' => '',
-            'э' => 'e', 'ю' => 'yu', 'я' => 'ya',
-        ];
-
-        $transliterated = strtr(mb_strtolower($value), $map);
-        $slug = preg_replace('/[^a-z0-9]+/', '-', $transliterated) ?? '';
-
-        return trim(mb_substr($slug, 0, 64), '-');
+        return $stmt->fetch();
     }
 
     private function assertSlugFree(string $slug, ?int $ignoreId = null): void
@@ -281,7 +292,7 @@ final class RoomsController
         $stmt->execute($params);
 
         if ($stmt->fetchColumn() !== false) {
-            Response::error('Комната с таким slug уже существует', 422);
+            Response::error(self::SLUG_TAKEN, 422);
         }
     }
 }

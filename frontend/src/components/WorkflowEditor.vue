@@ -255,8 +255,8 @@ async function save() {
 
           <p class="mt-2 pl-8 text-[11px] text-ink-mute">
             Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты комнаты,
-            или slug, например <code class="font-mono text-ink-soft">stripe</code> для
-            <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/stripe</code>.
+            или конкретный slug. Адрес комнаты по умолчанию:
+            <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/{{ room?.endpoint || 'hook-…' }}</code>.
           </p>
         </section>
 

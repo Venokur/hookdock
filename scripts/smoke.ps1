@@ -59,28 +59,66 @@ $room = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth 
 $roomId = $room.data.id
 Assert-True ($roomId -gt 0) "room can be created"
 Assert-True ($room.data.slug -eq $roomSlug) "room keeps the requested slug"
+Assert-True ($room.data.endpoint -match '^hook-[0-9a-f]{6}$') "room endpoint is generated automatically"
+Assert-True ($defaultRoom.endpoint -match '^hook-[0-9a-f]{6}$') "seeded room has an endpoint"
+
+# The endpoint is a normal room setting: it is kept when sent, regenerated when
+# explicitly emptied, and rejected when it is not a single URL-safe segment.
+$customEndpoint = "custom-$suffix"
+$custom = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Custom endpoint $suffix"; endpoint = $customEndpoint } | ConvertTo-Json)
+Assert-True ($custom.data.endpoint -eq $customEndpoint) "explicit room endpoint is kept"
+Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+        -Body (@{ name = "Bad endpoint $suffix"; endpoint = "Bad Endpoint!" } | ConvertTo-Json) } 422 "invalid room endpoint is rejected"
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$($custom.data.id)" -Headers $auth | Out-Null
 
 Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
         -Body (@{ name = "Dup $suffix"; slug = $roomSlug } | ConvertTo-Json) } 422 "duplicate room slug is rejected"
 Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
         -Body (@{ name = "Bad $suffix"; slug = "Bad Slug!" } | ConvertTo-Json) } 422 "invalid room slug is rejected"
 
-# Without a slug the server derives one from the name and suffixes collisions,
-# so the SPA can leave the field read-only.
+# Without a slug the server draws two random 12-hex groups that are unrelated to the
+# room name, so a rename never changes the address and two identically named
+# rooms stay addressable on their own.
 $autoName = "Auto room $suffix"
 $auto = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
     -Body (@{ name = $autoName } | ConvertTo-Json)
-Assert-True ($auto.data.slug -eq "auto-room-$suffix") "slug is generated from the room name"
+Assert-True ($auto.data.slug -match '^[0-9a-f]{12}-[0-9a-f]{12}$') "slug is two random 12-hex groups"
+Assert-True ($auto.data.slug -notlike "*auto*") "slug does not repeat the room name"
 $autoDup = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
     -Body (@{ name = $autoName } | ConvertTo-Json)
-Assert-True ($autoDup.data.slug -eq "auto-room-$suffix-2") "a taken slug gets a numeric suffix"
 Assert-True ($autoDup.data.id -gt 0) "duplicate room name does not fail creation"
+Assert-True ($autoDup.data.slug -match '^[0-9a-f]{12}-[0-9a-f]{12}$') "a second room with the same name also gets a random slug"
+Assert-True ($autoDup.data.slug -ne $auto.data.slug) "identical room names get different slugs"
+
+# The generated value of one room cannot be reused for another: the server
+# rejects it and the client has to generate a new one.
+Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+        -Body (@{ name = "Reuse $suffix"; slug = $auto.data.slug } | ConvertTo-Json) } 422 "a taken generated slug is rejected"
+
+# An explicitly empty slug asks for a fresh random one, mirroring `endpoint: ""`.
+$autoRegenerated = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$($auto.data.id)" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = $autoName; slug = "" } | ConvertTo-Json)
+Assert-True ($autoRegenerated.data.slug -match '^[0-9a-f]{12}-[0-9a-f]{12}$') "empty slug regenerates a random one"
+Assert-True ($autoRegenerated.data.slug -ne $auto.data.slug) "regenerated slug differs from the previous one"
+
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$($autoDup.data.id)" -Headers $auth | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$($auto.data.id)" -Headers $auth | Out-Null
 
 $renamed = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
     -Body (@{ name = "Smoke room renamed $suffix" } | ConvertTo-Json)
 Assert-True ($renamed.data.slug -eq $roomSlug) "renaming a room keeps its slug unless one is sent"
+Assert-True ($renamed.data.endpoint -eq $room.data.endpoint) "renaming a room keeps its endpoint unless one is sent"
+
+$changedEndpoint = "changed-$suffix"
+$endpointChange = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Smoke room renamed $suffix"; endpoint = $changedEndpoint } | ConvertTo-Json)
+Assert-True ($endpointChange.data.endpoint -eq $changedEndpoint) "explicit endpoint change is applied"
+
+$regenerated = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = "Smoke room renamed $suffix"; endpoint = "" } | ConvertTo-Json)
+Assert-True ($regenerated.data.endpoint -match '^hook-[0-9a-f]{6}$') "empty endpoint regenerates a random one"
+Assert-True ($regenerated.data.endpoint -ne $changedEndpoint) "regenerated endpoint differs from the previous one"
 
 # --- Ingestion into a specific room -------------------------------------------
 $endpoint = "smoke-$suffix"

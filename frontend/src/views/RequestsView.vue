@@ -60,10 +60,12 @@ const methodOptions = methods.map((method) => ({
 }))
 
 const webhookUrl = computed(() => {
+  // The address advertises the room's own endpoint, not the endpoint filter: the
+  // filter narrows the list and must not silently rewrite the copied URL.
   const prefix = slug.value ? `/${slug.value}` : ''
-  const endpoint = filters.endpoint.trim() || 'my-endpoint'
+  const endpoint = room.value?.endpoint ? `/${room.value.endpoint}` : ''
 
-  return `${window.location.origin}/api/webhook${prefix}/${endpoint}`
+  return `${window.location.origin}/api/webhook${prefix}${endpoint}`
 })
 
 // Connection state only — updates are always on, so there is nothing to toggle.
@@ -423,6 +425,10 @@ onUnmounted(() => {
         >
           {{ copied ? 'Скопировано!' : 'Копировать URL' }}
         </button>
+        <p class="w-full text-[11px] text-ink-mute">
+          Эндпоинт комнаты <code class="font-mono text-ink-soft">{{ room?.endpoint }}</code>
+          · меняется в настройках комнаты; любой другой путь тоже принимается.
+        </p>
       </section>
 
       <p v-if="error" class="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-600 dark:text-rose-300">
