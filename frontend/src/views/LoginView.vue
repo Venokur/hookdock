@@ -3,6 +3,7 @@ import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ThemeToggle from '../components/ThemeToggle.vue'
 import AppInput from '../components/ui/AppInput.vue'
+import AppSpinner from '../components/ui/AppSpinner.vue'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
@@ -99,6 +100,7 @@ async function submit() {
             </p>
 
             <button type="submit" :disabled="loading" class="btn-primary w-full py-2.5 text-sm">
+              <AppSpinner v-if="loading" size="xs" />
               {{ loading ? 'Входим…' : 'Войти' }}
             </button>
           </form>

@@ -6,8 +6,8 @@ const TRANSLIT = {
 }
 
 /**
- * Mirrors RoomsController::validSlug on the server so the field shows the value
- * that will actually be stored, instead of failing a round trip later.
+ * Mirrors RoomsController::slugify on the server so the preview in the room
+ * form matches the value that will actually be stored.
  */
 export function slugify(value) {
   const lower = String(value ?? '').toLowerCase()
@@ -23,4 +23,28 @@ export function slugify(value) {
     .slice(0, 64)
 }
 
-export const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
+/**
+ * Mirrors RoomsController::insertWithGeneratedSlug so the read-only field shows
+ * the slug the server is about to assign: the transliterated name, or the next
+ * free `-2`, `-3`, … variant when the list already holds that slug.
+ */
+export function uniqueSlug(value, takenSlugs = []) {
+  const base = slugify(value) || 'room'
+  const taken = new Set([...takenSlugs].map((slug) => String(slug ?? '').toLowerCase()))
+
+  if (!taken.has(base)) {
+    return base
+  }
+
+  for (let n = 2; n <= 100; n++) {
+    const suffix = `-${n}`
+    const trimmed = base.slice(0, 64 - suffix.length).replace(/-+$/, '')
+    const candidate = `${trimmed || 'room'}${suffix}`
+
+    if (!taken.has(candidate)) {
+      return candidate
+    }
+  }
+
+  return base
+}

@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { subscribe } from '../composables/realtime'
+import { confirm, notify } from '../composables/dialog'
 import { useRoomsStore, rememberRoom } from '../stores/rooms'
 import AppInput from './ui/AppInput.vue'
 import RoomFormModal from './RoomFormModal.vue'
@@ -73,11 +74,13 @@ async function onSaved(room) {
 }
 
 async function removeRoom(room) {
-  if (
-    !window.confirm(
-      `Удалить комнату «${room.name}»? Вместе с ней удалятся ${room.requests_total} запросов и ${room.workflows_total} сценариев.`,
-    )
-  ) {
+  const confirmed = await confirm({
+    title: 'Удалить комнату?',
+    message: `«${room.name}» будет удалена вместе с ${room.requests_total} запросами и ${room.workflows_total} сценариями. Отменить это нельзя.`,
+    confirmLabel: 'Удалить комнату',
+  })
+
+  if (!confirmed) {
     return
   }
 
@@ -95,7 +98,7 @@ async function removeRoom(room) {
       }
     }
   } catch (e) {
-    window.alert(e.message)
+    notify(e.message)
   } finally {
     deleting.value = false
   }

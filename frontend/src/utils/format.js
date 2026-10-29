@@ -1,4 +1,10 @@
 export function parseDate(value) {
+  // `formatClock(updatedAt)` passes a live Date; stringifying it produces
+  // "Thu Oct 29 2026 ...", which the normalisation below would corrupt.
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value
+  }
+
   if (!value) {
     return null
   }
@@ -22,6 +28,21 @@ export function formatTime(value) {
   return date.toLocaleString('ru-RU', {
     day: '2-digit',
     month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+/** Time only — used for "обновлено 12:34:56" next to a refresh button. */
+export function formatClock(value) {
+  const date = parseDate(value)
+
+  if (!date) {
+    return '—'
+  }
+
+  return date.toLocaleTimeString('ru-RU', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',

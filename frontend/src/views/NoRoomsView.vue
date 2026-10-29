@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
 import RoomFormModal from '../components/RoomFormModal.vue'
+import AppSpinner from '../components/ui/AppSpinner.vue'
 import { rememberRoom, useRoomsStore } from '../stores/rooms'
 
 const roomsStore = useRoomsStore()
@@ -45,6 +46,7 @@ async function onSaved(room) {
         <h1 class="mt-6 text-2xl font-semibold text-ink">Не удалось загрузить комнаты</h1>
         <p class="mt-2 max-w-md text-sm text-ink-soft">{{ roomsStore.error }}</p>
         <button type="button" class="btn-primary mt-6" :disabled="roomsStore.loading" @click="retry">
+          <AppSpinner v-if="roomsStore.loading" size="xs" />
           {{ roomsStore.loading ? 'Пробуем снова…' : 'Повторить' }}
         </button>
       </template>

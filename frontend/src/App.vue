@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { subscribe } from './composables/realtime'
 import { useAuthStore } from './stores/auth'
 import { useRoomsStore } from './stores/rooms'
+import AppDialog from './components/ui/AppDialog.vue'
+import AppToast from './components/ui/AppToast.vue'
 
 const auth = useAuthStore()
 const rooms = useRoomsStore()
@@ -72,4 +74,9 @@ onUnmounted(() => {
 
 <template>
   <router-view />
+
+  <!-- One instance for the whole app: `notify()` and `confirm()` reach them
+       from the sidebar and from every view without owning markup. -->
+  <AppToast />
+  <AppDialog />
 </template>

@@ -2,12 +2,15 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
+import AppSpinner from '../components/ui/AppSpinner.vue'
 import AppToggle from '../components/ui/AppToggle.vue'
 import WorkflowEditor from '../components/WorkflowEditor.vue'
 import { api } from '../api/client'
+import { confirm } from '../composables/dialog'
 import { retain, subscribe } from '../composables/realtime'
+import { useRefresh } from '../composables/useRefresh'
 import { useRoomsStore } from '../stores/rooms'
-import { timeAgo } from '../utils/format'
+import { formatClock, timeAgo } from '../utils/format'
 
 const route = useRoute()
 const rooms = useRoomsStore()
@@ -77,6 +80,9 @@ function refreshSoon() {
   }, 300)
 }
 
+/** The button triggers `refreshNow`, never `load` directly (it would receive the click event). */
+const { busy: refreshing, updatedAt, run: refreshNow } = useRefresh(() => load())
+
 function createWorkflow() {
   editorWorkflow.value = null
   editorOpen.value = true
@@ -107,7 +113,13 @@ async function toggleWorkflow(workflow) {
 }
 
 async function removeWorkflow(workflow) {
-  if (!window.confirm(`Удалить «${workflow.name}»? История запусков тоже будет удалена.`)) {
+  const confirmed = await confirm({
+    title: 'Удалить сценарий?',
+    message: `«${workflow.name}» и история его запусков будут удалены.`,
+    confirmLabel: 'Удалить сценарий',
+  })
+
+  if (!confirmed) {
     return
   }
 
@@ -231,7 +243,13 @@ onUnmounted(() => {
         </div>
 
         <div class="flex items-center gap-2">
-          <button type="button" class="btn" @click="load">Обновить</button>
+          <span v-if="updatedAt" class="font-mono text-[11px] text-ink-mute">
+            обновлено {{ formatClock(updatedAt) }}
+          </span>
+          <button type="button" class="btn" :disabled="refreshing" @click="refreshNow">
+            <AppSpinner v-if="refreshing" size="xs" />
+            {{ refreshing ? 'Обновляем…' : 'Обновить' }}
+          </button>
           <button type="button" class="btn-primary" @click="createWorkflow">+ Новый сценарий</button>
         </div>
       </header>
@@ -240,130 +258,144 @@ onUnmounted(() => {
         {{ error }}
       </p>
 
-      <section
-        v-if="!loading && workflows.length === 0"
-        class="rounded-2xl border border-dashed border-line bg-surface px-6 py-16 text-center"
-      >
-        <div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-300">
-          <svg class="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M4 7h6l2 3h8M4 17h4l2-3h10" />
-            <circle cx="20" cy="7" r="1.5" />
-            <circle cx="20" cy="17" r="1.5" />
-          </svg>
-        </div>
-        <h2 class="mt-4 text-sm font-semibold text-ink">Сценариев пока нет</h2>
-        <p class="mx-auto mt-1 max-w-sm text-xs text-ink-mute">
-          Сначала поймайте запрос, затем пересылайте его в Slack, CRM или другой API, когда поле JSON совпадёт.
-        </p>
-        <button type="button" class="btn-primary mt-5" @click="createWorkflow">
-          Создать первый сценарий
-        </button>
-      </section>
-
-      <section v-else class="grid gap-4 xl:grid-cols-2" :class="{ 'opacity-60': loading }">
-        <article
-          v-for="workflow in workflows"
-          :key="workflow.id"
-          class="card flex flex-col p-5"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2">
-                <h2 class="truncate text-sm font-semibold text-ink">{{ workflow.name }}</h2>
-                <span
-                  class="rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ring-1 ring-inset"
-                  :class="workflow.enabled
-                    ? 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300'
-                    : 'bg-ink/5 text-ink-mute ring-line'"
-                >
-                  {{ workflow.enabled ? 'активен' : 'на паузе' }}
-                </span>
-              </div>
-              <p class="mt-1 text-[11px] text-ink-mute">Обновлён {{ timeAgo(workflow.updated_at) }}</p>
-            </div>
-
-            <AppToggle
-              :model-value="workflow.enabled"
-              :aria-label="workflow.enabled ? 'Поставить на паузу' : 'Активировать сценарий'"
-              @update:model-value="toggleWorkflow(workflow)"
-            />
-          </div>
-
-          <div class="mt-4 rounded-xl border border-line bg-surface-2 px-3 py-2.5">
-            <p class="text-[10px] uppercase tracking-wider text-ink-mute">Триггер</p>
-            <div class="mt-1 flex items-center gap-2">
-              <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-soft">
-                {{ triggerLabel(workflow) }}
-              </code>
-              <button
-                type="button"
-                class="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-indigo-600 transition hover:bg-indigo-500/10 dark:text-indigo-300"
-                @click="copyUrl(workflow)"
-              >
-                {{ copiedId === workflow.id ? 'Скопировано' : 'Копировать' }}
-              </button>
-            </div>
-          </div>
-
-          <div class="mt-3 space-y-2">
-            <div>
-              <p class="text-[10px] uppercase tracking-wider text-ink-mute">Условия</p>
-              <div v-if="(workflow.conditions ?? []).length" class="mt-1 flex flex-wrap gap-1">
-                <span
-                  v-for="(condition, index) in workflow.conditions"
-                  :key="index"
-                  class="rounded-md bg-ink/5 px-2 py-0.5 font-mono text-[10px] text-ink-soft"
-                >
-                  {{ conditionSummary(condition) }}
-                </span>
-              </div>
-              <p v-else class="mt-1 text-[11px] text-ink-mute">Срабатывает на каждый запрос.</p>
-            </div>
-
-            <div>
-              <p class="text-[10px] uppercase tracking-wider text-ink-mute">Действия</p>
-              <ul class="mt-1 space-y-1">
-                <li
-                  v-for="(action, index) in workflow.actions ?? []"
-                  :key="index"
-                  class="flex items-start gap-2 text-[11px] text-ink-soft"
-                >
-                  <span class="mt-1 h-1 w-1 shrink-0 rounded-full bg-indigo-500"></span>
-                  <span class="break-words">{{ actionSummary(action) }}</span>
-                </li>
-              </ul>
-            </div>
-          </div>
-
-          <footer class="mt-auto flex items-center justify-between gap-2 border-t border-line pt-3 text-[11px] text-ink-mute">
-            <span>
-              <template v-if="workflow.last_run_at">
-                Последний запуск {{ timeAgo(workflow.last_run_at) }} ·
-                <span :class="workflow.last_run_status === 'failed' ? 'text-rose-600 dark:text-rose-300' : 'text-ink-soft'">
-                  {{ statusLabels[workflow.last_run_status] || workflow.last_run_status }}
-                </span>
-              </template>
-              <template v-else>Ещё не запускался</template>
+      <section class="relative">
+        <Transition name="fade">
+          <div
+            v-if="refreshing"
+            class="absolute inset-0 z-10 grid place-items-center rounded-2xl bg-surface/70 backdrop-blur-[1px]"
+          >
+            <span class="flex items-center gap-2 text-xs font-medium text-ink-soft">
+              <AppSpinner size="sm" />
+              Обновляем сценарии…
             </span>
+          </div>
+        </Transition>
 
-            <div class="flex items-center gap-1">
-              <button
-                type="button"
-                class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
-                @click="editWorkflow(workflow)"
-              >
-                Изменить
-              </button>
-              <button
-                type="button"
-                class="rounded-lg px-2 py-1 text-xs text-rose-600/80 transition hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-300/80 dark:hover:text-rose-300"
-                @click="removeWorkflow(workflow)"
-              >
-                Удалить
-              </button>
+        <section
+          v-if="!loading && workflows.length === 0"
+          class="rounded-2xl border border-dashed border-line bg-surface px-6 py-16 text-center"
+        >
+          <div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-300">
+            <svg class="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4 7h6l2 3h8M4 17h4l2-3h10" />
+              <circle cx="20" cy="7" r="1.5" />
+              <circle cx="20" cy="17" r="1.5" />
+            </svg>
+          </div>
+          <h2 class="mt-4 text-sm font-semibold text-ink">Сценариев пока нет</h2>
+          <p class="mx-auto mt-1 max-w-sm text-xs text-ink-mute">
+            Сначала поймайте запрос, затем пересылайте его в Slack, CRM или другой API, когда поле JSON совпадёт.
+          </p>
+          <button type="button" class="btn-primary mt-5" @click="createWorkflow">
+            Создать первый сценарий
+          </button>
+        </section>
+
+        <section v-else class="grid gap-4 xl:grid-cols-2" :class="{ 'opacity-60': loading }">
+          <article
+            v-for="workflow in workflows"
+            :key="workflow.id"
+            class="card flex flex-col p-5"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <div class="flex items-center gap-2">
+                  <h2 class="truncate text-sm font-semibold text-ink">{{ workflow.name }}</h2>
+                  <span
+                    class="rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ring-1 ring-inset"
+                    :class="workflow.enabled
+                      ? 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300'
+                      : 'bg-ink/5 text-ink-mute ring-line'"
+                  >
+                    {{ workflow.enabled ? 'активен' : 'на паузе' }}
+                  </span>
+                </div>
+                <p class="mt-1 text-[11px] text-ink-mute">Обновлён {{ timeAgo(workflow.updated_at) }}</p>
+              </div>
+
+              <AppToggle
+                :model-value="workflow.enabled"
+                :aria-label="workflow.enabled ? 'Поставить на паузу' : 'Активировать сценарий'"
+                @update:model-value="toggleWorkflow(workflow)"
+              />
             </div>
-          </footer>
-        </article>
+
+            <div class="mt-4 rounded-xl border border-line bg-surface-2 px-3 py-2.5">
+              <p class="text-[10px] uppercase tracking-wider text-ink-mute">Триггер</p>
+              <div class="mt-1 flex items-center gap-2">
+                <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-soft">
+                  {{ triggerLabel(workflow) }}
+                </code>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-indigo-600 transition hover:bg-indigo-500/10 dark:text-indigo-300"
+                  @click="copyUrl(workflow)"
+                >
+                  {{ copiedId === workflow.id ? 'Скопировано' : 'Копировать' }}
+                </button>
+              </div>
+            </div>
+
+            <div class="mt-3 space-y-2">
+              <div>
+                <p class="text-[10px] uppercase tracking-wider text-ink-mute">Условия</p>
+                <div v-if="(workflow.conditions ?? []).length" class="mt-1 flex flex-wrap gap-1">
+                  <span
+                    v-for="(condition, index) in workflow.conditions"
+                    :key="index"
+                    class="rounded-md bg-ink/5 px-2 py-0.5 font-mono text-[10px] text-ink-soft"
+                  >
+                    {{ conditionSummary(condition) }}
+                  </span>
+                </div>
+                <p v-else class="mt-1 text-[11px] text-ink-mute">Срабатывает на каждый запрос.</p>
+              </div>
+
+              <div>
+                <p class="text-[10px] uppercase tracking-wider text-ink-mute">Действия</p>
+                <ul class="mt-1 space-y-1">
+                  <li
+                    v-for="(action, index) in workflow.actions ?? []"
+                    :key="index"
+                    class="flex items-start gap-2 text-[11px] text-ink-soft"
+                  >
+                    <span class="mt-1 h-1 w-1 shrink-0 rounded-full bg-indigo-500"></span>
+                    <span class="break-words">{{ actionSummary(action) }}</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            <footer class="mt-auto flex items-center justify-between gap-2 border-t border-line pt-3 text-[11px] text-ink-mute">
+              <span>
+                <template v-if="workflow.last_run_at">
+                  Последний запуск {{ timeAgo(workflow.last_run_at) }} ·
+                  <span :class="workflow.last_run_status === 'failed' ? 'text-rose-600 dark:text-rose-300' : 'text-ink-soft'">
+                    {{ statusLabels[workflow.last_run_status] || workflow.last_run_status }}
+                  </span>
+                </template>
+                <template v-else>Ещё не запускался</template>
+              </span>
+
+              <div class="flex items-center gap-1">
+                <button
+                  type="button"
+                  class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
+                  @click="editWorkflow(workflow)"
+                >
+                  Изменить
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg px-2 py-1 text-xs text-rose-600/80 transition hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-300/80 dark:hover:text-rose-300"
+                  @click="removeWorkflow(workflow)"
+                >
+                  Удалить
+                </button>
+              </div>
+            </footer>
+          </article>
+        </section>
       </section>
 
       <p class="text-[11px] text-ink-mute">

@@ -75,17 +75,19 @@ final class RoomsController
         $payload = $request->json() ?? [];
 
         $name = $this->validName((string) ($payload['name'] ?? ''));
-        $slug = $this->validSlug((string) ($payload['slug'] ?? ''), $name);
 
-        $this->assertSlugFree($slug);
+        // The SPA never sends a slug: it is derived from the name and made unique
+        // here, because only the server sees every room in the installation.
+        $requested = trim((string) ($payload['slug'] ?? ''));
 
-        $stmt = Database::pdo()->prepare(
-            'INSERT INTO rooms (name, slug) VALUES (:name, :slug)
-             RETURNING id, name, slug, created_at, updated_at'
-        );
-        $stmt->execute(['name' => $name, 'slug' => $slug]);
+        if ($requested === '') {
+            $row = $this->insertWithGeneratedSlug($name);
+        } else {
+            $slug = $this->validSlug($requested, $name);
+            $this->assertSlugFree($slug);
+            $row = $this->insert($name, $slug);
+        }
 
-        $row = $stmt->fetch();
         Realtime::publish('room.changed', ['id' => (int) $row['id'], 'slug' => $row['slug'], 'action' => 'created']);
 
         Response::json(['data' => $row], 201);
@@ -193,6 +195,59 @@ final class RoomsController
         }
 
         return $slug;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function insert(string $name, string $slug): array
+    {
+        $stmt = Database::pdo()->prepare(
+            'INSERT INTO rooms (name, slug) VALUES (:name, :slug)
+             RETURNING id, name, slug, created_at, updated_at'
+        );
+        $stmt->execute(['name' => $name, 'slug' => $slug]);
+
+        return $stmt->fetch();
+    }
+
+    /**
+     * Derives a slug from the room name and retries with -2, -3, … while the
+     * unique index on lower(slug) rejects the candidate. Relying on the index
+     * instead of a SELECT keeps two concurrent creates from picking the same
+     * slug: the loser simply moves to the next suffix.
+     *
+     * @return array<string, mixed>
+     */
+    private function insertWithGeneratedSlug(string $name): array
+    {
+        $base = $this->slugify($name);
+        if ($base === '') {
+            $base = 'room';
+        }
+
+        for ($n = 1; $n <= 100; $n++) {
+            $slug = $n === 1 ? $base : $this->withSuffix($base, $n);
+
+            try {
+                return $this->insert($name, $slug);
+            } catch (\PDOException $e) {
+                if ($e->getCode() !== '23505') {
+                    throw $e;
+                }
+            }
+        }
+
+        Response::error('Не удалось подобрать свободный slug для комнаты', 422);
+    }
+
+    /** Keeps the 64-character limit intact when a numeric suffix is appended. */
+    private function withSuffix(string $base, int $n): string
+    {
+        $suffix = '-' . $n;
+        $trimmed = rtrim(mb_substr($base, 0, 64 - mb_strlen($suffix)), '-');
+
+        return ($trimmed === '' ? 'room' : $trimmed) . $suffix;
     }
 
     private function slugify(string $value): string

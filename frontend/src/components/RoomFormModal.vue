@@ -1,8 +1,8 @@
 <script setup>
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useRoomsStore } from '../stores/rooms'
 import AppInput from './ui/AppInput.vue'
-import { SLUG_PATTERN, slugify } from '../utils/slug'
+import { uniqueSlug } from '../utils/slug'
 
 const props = defineProps({
   room: { type: Object, default: null },
@@ -14,40 +14,27 @@ const roomsStore = useRoomsStore()
 
 const form = reactive({
   name: props.room?.name ?? '',
-  slug: props.room?.slug ?? '',
 })
-const slugTouched = ref(Boolean(props.room))
 const saving = ref(false)
 const error = ref('')
 
 const isEdit = computed(() => Boolean(props.room))
 
-const slugHint = computed(() => {
-  if (!form.slug) {
-    return 'Slug нужен для адреса вебхука.'
+/**
+ * The slug is assigned by the server from the room name and never edited here:
+ * it is part of the webhook URL, so changing it would silently break the
+ * integrations already pointing at it. `uniqueSlug` mirrors the server so the
+ * disabled field previews what will be stored.
+ */
+const slugPreview = computed(() => {
+  if (isEdit.value) {
+    return props.room.slug
   }
 
-  if (!SLUG_PATTERN.test(form.slug)) {
-    return 'Только латинские буквы, цифры и дефис; начинаться должен с буквы или цифры.'
-  }
-
-  return ''
+  return form.name.trim()
+    ? uniqueSlug(form.name, roomsStore.rooms.map((room) => room.slug))
+    : ''
 })
-
-// Typing a name fills the slug until the user edits the slug by hand.
-watch(
-  () => form.name,
-  (value) => {
-    if (!slugTouched.value) {
-      form.slug = slugify(value)
-    }
-  },
-)
-
-function onSlugInput(value) {
-  slugTouched.value = true
-  form.slug = slugify(value)
-}
 
 async function submit() {
   error.value = ''
@@ -57,15 +44,11 @@ async function submit() {
     return
   }
 
-  if (!SLUG_PATTERN.test(form.slug)) {
-    error.value = 'Slug комнаты: латинские буквы, цифры и дефис, до 64 символов.'
-    return
-  }
-
   saving.value = true
 
   try {
-    const payload = { name: form.name.trim(), slug: form.slug }
+    // No slug in the payload: the server derives and de-duplicates it.
+    const payload = { name: form.name.trim() }
     const saved = isEdit.value
       ? await roomsStore.update(props.room.id, payload)
       : await roomsStore.create(payload)
@@ -117,26 +100,25 @@ async function submit() {
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-ink-soft">Slug в адресе</span>
               <AppInput
-                :model-value="form.slug"
-                placeholder="stripe-prod"
+                :model-value="slugPreview"
+                placeholder="присвоится автоматически"
                 class="font-mono"
-                :invalid="Boolean(form.slug) && Boolean(slugHint)"
-                @update:model-value="onSlugInput"
+                disabled
               />
             </label>
 
-            <p class="text-[11px]" :class="slugHint ? 'text-amber-700 dark:text-amber-300' : 'text-ink-mute'">
-              {{ slugHint || 'Вебхуки комнаты: /hook/' + form.slug + '/stripe' }}
+            <p class="text-[11px] text-ink-mute">
+              <template v-if="slugPreview">
+                Вебхуки комнаты: /hook/{{ slugPreview }}/stripe. Slug присваивается автоматически и
+                не меняется.
+              </template>
+              <template v-else> Slug присвоится автоматически из названия комнаты. </template>
             </p>
 
             <p
-              v-if="isEdit"
-              class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200"
+              v-if="error"
+              class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300"
             >
-              Смена slug меняет адрес вебхука: интеграции, настроенные на старый адрес, получат 404.
-            </p>
-
-            <p v-if="error" class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
               {{ error }}
             </p>
           </div>

@@ -6,10 +6,13 @@ import MethodBadge from '../components/MethodBadge.vue'
 import RequestDetail from '../components/RequestDetail.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
+import AppSpinner from '../components/ui/AppSpinner.vue'
 import { api } from '../api/client'
+import { confirm } from '../composables/dialog'
 import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
+import { useRefresh } from '../composables/useRefresh'
 import { useRoomsStore } from '../stores/rooms'
-import { formatBytes, formatTime } from '../utils/format'
+import { formatBytes, formatClock, formatTime } from '../utils/format'
 
 const route = useRoute()
 const rooms = useRoomsStore()
@@ -113,9 +116,11 @@ async function load({ silent = false } = {}) {
   }
 }
 
-function reload() {
-  load()
-}
+/**
+ * Manual refreshes go through `useRefresh` so the spinner stays visible long
+ * enough to be noticed; realtime reloads stay silent and do not flash the list.
+ */
+const { busy: refreshing, updatedAt, run: refreshNow } = useRefresh(() => load())
 
 /**
  * Realtime events are thin, so any of them just means "re-read what I show".
@@ -242,7 +247,13 @@ function closeDetail() {
 }
 
 async function removeRequest(id) {
-  if (!window.confirm(`Удалить запрос #${id}?`)) {
+  const confirmed = await confirm({
+    title: 'Удалить запрос?',
+    message: `Запрос #${id} и связанные запуски сценариев будут удалены.`,
+    confirmLabel: 'Удалить запрос',
+  })
+
+  if (!confirmed) {
     return
   }
 
@@ -320,7 +331,15 @@ onUnmounted(() => {
             <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
             {{ realtimeLabel.label }}
           </span>
-          <button type="button" class="btn" @click="reload">Обновить</button>
+
+          <span v-if="updatedAt" class="font-mono text-[11px] text-ink-mute">
+            обновлено {{ formatClock(updatedAt) }}
+          </span>
+
+          <button type="button" class="btn" :disabled="refreshing" @click="refreshNow">
+            <AppSpinner v-if="refreshing" size="xs" />
+            {{ refreshing ? 'Обновляем…' : 'Обновить' }}
+          </button>
         </div>
       </header>
 
@@ -384,7 +403,19 @@ onUnmounted(() => {
         </button>
       </section>
 
-      <section class="card overflow-hidden">
+      <section class="card relative overflow-hidden">
+        <Transition name="fade">
+          <div
+            v-if="refreshing || (loading && items.length > 0)"
+            class="absolute inset-0 z-10 grid place-items-center bg-surface/70 backdrop-blur-[1px]"
+          >
+            <span class="flex items-center gap-2 text-xs font-medium text-ink-soft">
+              <AppSpinner size="sm" />
+              Обновляем лог…
+            </span>
+          </div>
+        </Transition>
+
         <div class="overflow-x-auto">
           <table class="min-w-full text-left">
             <thead class="border-b border-line bg-surface-2 text-[11px] uppercase tracking-wider text-ink-mute">
@@ -398,7 +429,7 @@ onUnmounted(() => {
                 <th class="px-4 py-3"></th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-line" :class="{ 'opacity-50': loading }">
+            <tbody class="divide-y divide-line">
               <tr
                 v-for="row in items"
                 :key="row.id"
@@ -433,6 +464,15 @@ onUnmounted(() => {
                     Отправьте запрос на <code class="font-mono text-indigo-600 dark:text-indigo-300">{{ webhookUrl }}</code>
                     — он появится здесь сразу.
                   </p>
+                </td>
+              </tr>
+
+              <tr v-if="loading && items.length === 0">
+                <td colspan="7" class="px-4 py-16 text-center">
+                  <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
+                    <AppSpinner size="sm" />
+                    Загружаем лог…
+                  </span>
                 </td>
               </tr>
             </tbody>
@@ -480,7 +520,7 @@ onUnmounted(() => {
           class="fixed inset-y-0 right-0 z-50 flex w-full max-w-2xl flex-col border-l border-line bg-surface shadow-2xl"
         >
           <div v-if="detailLoading" class="flex h-full items-center justify-center gap-2 text-sm text-ink-soft">
-            <span class="h-3 w-3 animate-spin rounded-full border-2 border-line border-t-indigo-500"></span>
+            <AppSpinner size="sm" />
             Загружаем запрос…
           </div>
           <RequestDetail

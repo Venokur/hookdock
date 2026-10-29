@@ -65,6 +65,19 @@ Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Header
 Assert-Status { Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
         -Body (@{ name = "Bad $suffix"; slug = "Bad Slug!" } | ConvertTo-Json) } 422 "invalid room slug is rejected"
 
+# Without a slug the server derives one from the name and suffixes collisions,
+# so the SPA can leave the field read-only.
+$autoName = "Auto room $suffix"
+$auto = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = $autoName } | ConvertTo-Json)
+Assert-True ($auto.data.slug -eq "auto-room-$suffix") "slug is generated from the room name"
+$autoDup = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rooms" -Headers $auth -ContentType "application/json" `
+    -Body (@{ name = $autoName } | ConvertTo-Json)
+Assert-True ($autoDup.data.slug -eq "auto-room-$suffix-2") "a taken slug gets a numeric suffix"
+Assert-True ($autoDup.data.id -gt 0) "duplicate room name does not fail creation"
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$($autoDup.data.id)" -Headers $auth | Out-Null
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$($auto.data.id)" -Headers $auth | Out-Null
+
 $renamed = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth -ContentType "application/json" `
     -Body (@{ name = "Smoke room renamed $suffix" } | ConvertTo-Json)
 Assert-True ($renamed.data.slug -eq $roomSlug) "renaming a room keeps its slug unless one is sent"
