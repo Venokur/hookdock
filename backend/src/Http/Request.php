@@ -25,14 +25,49 @@ final class Request
         $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
         $path = '/' . trim($path, '/');
 
+        $raw = (string) file_get_contents('php://input');
+
+        // A non-empty Content-Length with an empty stream means something consumed
+        // php://input before us (PHP form parsing, or a proxy buffering the body).
+        // Storing a silently empty webhook is the worst failure mode for a catcher,
+        // so make it visible in the log instead of losing it quietly.
+        $declared = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+        if ($declared > 0 && $raw === '' && strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'HEAD') {
+            error_log(sprintf(
+                '[request] body missing: declared %d bytes from %s %s',
+                $declared,
+                $_SERVER['REMOTE_ADDR'] ?? '?',
+                $_SERVER['REQUEST_URI'] ?? '?',
+            ));
+        }
+
         return new self(
             strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET'),
             $path === '/' ? '/' : rtrim($path, '/'),
             $_GET,
             self::captureHeaders(),
-            (string) file_get_contents('php://input'),
-            $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0',
+            $raw,
+            self::clientIp(),
         );
+    }
+
+    /**
+     * The address the request actually came from.
+     *
+     * Behind nginx, `REMOTE_ADDR` is the nginx container, which would make every
+     * client share one rate-limit bucket. nginx sets `X-Real-IP` from `$remote_addr`
+     * (it overwrites whatever the client sent), so it is trusted only when it is a
+     * valid address. `X-Forwarded-For` is deliberately ignored: a client can append
+     * to it freely.
+     */
+    private static function clientIp(): string
+    {
+        $real = (string) ($_SERVER['HTTP_X_REAL_IP'] ?? '');
+        if ($real !== '' && filter_var($real, FILTER_VALIDATE_IP) !== false) {
+            return $real;
+        }
+
+        return (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
     }
 
     /**

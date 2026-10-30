@@ -31,6 +31,19 @@ services:
       APP_DEBUG: ${APP_DEBUG:-0}
       WS_CHANNEL: ${WS_CHANNEL:-hookdock_events}
       WS_TICKET_TTL: ${WS_TICKET_TTL:-60}
+      ROUTING_MAX_ATTEMPTS: ${ROUTING_MAX_ATTEMPTS:-3}
+      ROUTING_RETRY_BASE: ${ROUTING_RETRY_BASE:-1}
+      FORWARD_TIMEOUT: ${FORWARD_TIMEOUT:-8}
+      FORWARD_ALLOW_INTERNAL: ${FORWARD_ALLOW_INTERNAL:-0}
+      FORWARD_BLOCKED_HOSTS: ${FORWARD_BLOCKED_HOSTS:-}
+      DEMO_LOGIN: ${DEMO_LOGIN:-1}
+      DEMO_EMAIL: ${DEMO_EMAIL:-admin@hookdock.local}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-123456}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-10}
+      LOGIN_IP_MAX_ATTEMPTS: ${LOGIN_IP_MAX_ATTEMPTS:-50}
+      LOGIN_WINDOW_SECONDS: ${LOGIN_WINDOW_SECONDS:-60}
+      INGEST_MAX_PER_WINDOW: ${INGEST_MAX_PER_WINDOW:-0}
+      INGEST_WINDOW_SECONDS: ${INGEST_WINDOW_SECONDS:-60}
     depends_on:
       db:
         condition: service_healthy
@@ -59,6 +72,38 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Routing worker: claims queued runs from `workflow_runs` and performs the
+  # actions, so the receiver can answer 202 before any HTTP forward happens.
+  worker:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    command: ["php", "/var/www/backend/bin/worker.php"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-webhooks}
+      DB_USER: ${DB_USER:-webhooks}
+      DB_PASSWORD: ${DB_PASSWORD:-webhooks}
+      WS_CHANNEL: ${WS_CHANNEL:-hookdock_events}
+      ROUTING_MAX_ATTEMPTS: ${ROUTING_MAX_ATTEMPTS:-3}
+      ROUTING_RETRY_BASE: ${ROUTING_RETRY_BASE:-1}
+      ROUTING_STALE_MINUTES: ${ROUTING_STALE_MINUTES:-5}
+      FORWARD_TIMEOUT: ${FORWARD_TIMEOUT:-8}
+      FORWARD_ALLOW_INTERNAL: ${FORWARD_ALLOW_INTERNAL:-0}
+      FORWARD_BLOCKED_HOSTS: ${FORWARD_BLOCKED_HOSTS:-}
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+      RETENTION_RUN_DAYS: ${RETENTION_RUN_DAYS:-0}
+      RETENTION_INTERVAL_SECONDS: ${RETENTION_INTERVAL_SECONDS:-3600}
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      db:
+        condition: service_healthy
+      # `api` applies migrations; the worker reads the columns they add.
+      api:
+        condition: service_started
     restart: unless-stopped
 
   web:

@@ -32,6 +32,14 @@ final class Auth
             return self::$cachedUser = null;
         }
 
+        // A websocket ticket (`scope: ws`) is deliberately short-lived and rides in
+        // a query string. Accepting it here would turn that 60s ticket into a full
+        // API credential, so only an unscoped/`api` token may authenticate a REST
+        // request. This is what keeps the ticket single-purpose.
+        if (isset($claims['scope']) && $claims['scope'] !== 'api') {
+            return self::$cachedUser = null;
+        }
+
         $stmt = Database::pdo()->prepare('SELECT id, email, created_at, last_login_at FROM users WHERE id = :id');
         $stmt->execute(['id' => (int) $claims['sub']]);
         $user = $stmt->fetch();

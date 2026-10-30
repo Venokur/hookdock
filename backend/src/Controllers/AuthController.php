@@ -9,6 +9,7 @@ use App\Config;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Support\RateLimiter;
 
 final class AuthController
 {
@@ -21,6 +22,27 @@ final class AuthController
         if ($email === '' || $password === '') {
             Response::error('Укажите email и пароль', 422);
         }
+
+        // Two buckets: per-address stops one host from spraying many accounts, and
+        // per-account stops a botnet from spraying one address. The address limit is
+        // looser on purpose — a whole office or NAT shares one address, so a strict
+        // per-IP cap would lock out innocent users before it slows an attacker down.
+        // Counting happens before the password check, so a correct password does not
+        // bypass the limit.
+        $this->enforceLimit(
+            'login-ip',
+            $request->ip,
+            'LOGIN_IP_MAX_ATTEMPTS',
+            50,
+            'Слишком много попыток входа с этого адреса. Повторите через %d с.',
+        );
+        $this->enforceLimit(
+            'login-email',
+            $email,
+            'LOGIN_MAX_ATTEMPTS',
+            10,
+            'Слишком много попыток входа для этой учётной записи. Повторите через %d с.',
+        );
 
         $stmt = Database::pdo()->prepare('SELECT id, email, password_hash FROM users WHERE lower(email) = :email');
         $stmt->execute(['email' => $email]);
@@ -44,7 +66,7 @@ final class AuthController
         $touch->execute(['id' => (int) $user['id']]);
 
         Response::json([
-            'token' => Jwt::issue(['sub' => (int) $user['id'], 'email' => $user['email']]),
+            'token' => Jwt::issue(['sub' => (int) $user['id'], 'email' => $user['email'], 'scope' => 'api']),
             'user' => [
                 'id' => (int) $user['id'],
                 'email' => $user['email'],
@@ -72,6 +94,49 @@ final class AuthController
     }
 
     /**
+     * What the login page is allowed to reveal.
+     *
+     * The seeded demo account is convenient on `localhost` and a liability anywhere
+     * else, so it is opt-in (`DEMO_LOGIN=1`) and rendered from this response instead
+     * of a literal baked into the JS bundle. `JWT_SECRET` must not be left at its
+     * default either, so that is reported as a warning rather than silently used.
+     */
+    public function config(): void
+    {
+        $demo = Config::get('DEMO_LOGIN', '0') === '1';
+
+        Response::json([
+            'data' => [
+                'demo' => $demo
+                    ? [
+                        'email' => (string) Config::get('DEMO_EMAIL', 'admin@hookdock.local'),
+                        'password' => (string) Config::get('DEMO_PASSWORD', '123456'),
+                    ]
+                    : null,
+                'warnings' => $this->configWarnings(),
+            ],
+        ]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function configWarnings(): array
+    {
+        $warnings = [];
+
+        if (Config::get('JWT_SECRET', 'dev-only-change-me') === 'dev-only-change-me') {
+            $warnings[] = 'JWT_SECRET оставлен по умолчанию — задайте свой перед публикацией наружу.';
+        }
+
+        if (Config::get('DEMO_LOGIN', '0') === '1') {
+            $warnings[] = 'Демо-вход включён — выключите DEMO_LOGIN на публичной установке.';
+        }
+
+        return $warnings;
+    }
+
+    /**
      * Short-lived ticket for the websocket handshake.
      *
      * Browsers cannot send an Authorization header on WebSocket(), and putting the
@@ -89,5 +154,23 @@ final class AuthController
                 'expires_in' => $ttl,
             ],
         ]);
+    }
+
+    private function enforceLimit(string $bucket, string $subject, string $limitKey, int $defaultLimit, string $message): void
+    {
+        $result = RateLimiter::hit(
+            $bucket,
+            $subject,
+            RateLimiter::limit($limitKey, $defaultLimit),
+            RateLimiter::window('LOGIN_WINDOW_SECONDS', 60),
+        );
+
+        if ($result['allowed']) {
+            return;
+        }
+
+        header('Retry-After: ' . $result['retry_after']);
+
+        Response::error(sprintf($message, $result['retry_after']), 429);
     }
 }

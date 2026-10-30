@@ -26,6 +26,7 @@ $router->add('GET', '/api/health', static fn (): never => Response::json(['statu
 $router->add('POST', '/api/auth/login', fn (Request $r) => $auth->login($r));
 $router->add('GET', '/api/auth/me', fn (Request $r) => $auth->me($r));
 $router->add('POST', '/api/auth/logout', fn () => $auth->logout());
+$router->add('GET', '/api/auth/config', fn () => $auth->config());
 $router->add('POST', '/api/ws/ticket', fn (Request $r) => $auth->wsTicket($r));
 
 $router->add('GET', '/api/rooms', fn (Request $r) => $rooms->index($r));
@@ -46,20 +47,17 @@ $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflo
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
 
-// Public catcher: every HTTP method, no auth. {room} and {endpoint} are optional
-// and validated in the controller, because /hook/{x} is ambiguous on its own.
-foreach (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as $method) {
-    $router->add($method, '/api/webhook', fn (Request $r) => $webhook->receive($r));
-    $router->add($method, '/api/webhook/{a}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/api/webhook/{a}/{b}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/api/webhook/{a}/{b}/{rest}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/hook', fn (Request $r) => $webhook->receive($r));
-    $router->add($method, '/hook/{a}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/hook/{a}/{b}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-    $router->add($method, '/hook/{a}/{b}/{rest}', fn (Request $r, array $p) => $webhook->receive($r, $p));
-}
-
 $request = Request::capture();
+
+// The catcher is claimed by prefix rather than by routes: a webhook path can be
+// arbitrarily deep (`/hook/{room}/{endpoint}/a/b/c`), and a router pattern can
+// only match a fixed number of segments. Every method is accepted and the path
+// is resolved in the controller, because `/hook/{x}` is ambiguous on its own.
+if (isWebhookPath($request->path)) {
+    respondToCors($request);
+
+    $webhook->receive($request);
+}
 
 if ($router->dispatch($request)) {
     exit;
@@ -71,3 +69,43 @@ if (!str_starts_with($request->path, '/api/')) {
 }
 
 Response::error('Не найдено', 404);
+
+/**
+ * `/api/webhook…` and `/hook…` are the public catcher. `/api/webhookX` must not
+ * be mistaken for it, so the match requires a segment boundary.
+ */
+function isWebhookPath(string $path): bool
+{
+    foreach (['/api/webhook', '/hook'] as $prefix) {
+        if ($path === $prefix || str_starts_with($path, $prefix . '/')) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Browsers refuse to POST a payload to another origin without a preflight, so a
+ * page on another port could not use the catcher at all. A real preflight is
+ * answered here and never reaches the room resolver: it carries no body worth
+ * storing. An `OPTIONS` webhook sent by a client (no
+ * `Access-Control-Request-Method`) is still ingested like any other method.
+ */
+function respondToCors(Request $request): void
+{
+    header('Access-Control-Allow-Origin: *');
+    header('Vary: Origin');
+
+    if ($request->method !== 'OPTIONS' || $request->header('access-control-request-method') === null) {
+        return;
+    }
+
+    header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    header('Access-Control-Allow-Headers: ' . ($request->header('access-control-request-headers') ?? 'Content-Type'));
+    header('Access-Control-Max-Age: 600');
+    http_response_code(204);
+
+    exit;
+}
+

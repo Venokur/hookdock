@@ -10,9 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uniq ON users (lower(email));
 
--- Default admin: admin@l.loc / 123456 (bcrypt, cost 12). Change the password after first login.
+-- Default admin: admin@hookdock.local / 123456 (bcrypt, cost 12). Change the password after first login.
 INSERT INTO users (email, password_hash)
-VALUES ('admin@l.loc', '$2y$12$17qq2VdkGLwTG9uVDZXe6eIqU94aYpqq9eYeobLh2Xli//vVtqp2y')
+VALUES ('admin@hookdock.local', '$2y$12$17qq2VdkGLwTG9uVDZXe6eIqU94aYpqq9eYeobLh2Xli//vVtqp2y')
 ON CONFLICT (lower(email)) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS workflows (

@@ -10,6 +10,7 @@ use App\Http\Response;
 use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
+use App\Support\RateLimiter;
 
 final class WebhookController
 {
@@ -20,6 +21,8 @@ final class WebhookController
      */
     public function receive(Request $request, array $params = []): void
     {
+        $this->enforceLimit($request);
+
         [$room, $endpoint] = $this->resolveTarget($request, $params);
 
         $raw = $request->rawBody;
@@ -64,7 +67,7 @@ final class WebhookController
         $row['id'] = (int) $saved['id'];
         $row['received_at'] = $saved['received_at'];
 
-        // Realtime first: the list can show the row while routing is still running.
+        // Realtime first: the list can show the row before routing has started.
         Realtime::publish('request.created', [
             'id' => $row['id'],
             'room_id' => $row['room_id'],
@@ -72,18 +75,9 @@ final class WebhookController
             'method' => $row['method'],
         ]);
 
-        $runs = WorkflowEngine::process($row);
-
-        if ($runs !== []) {
-            $failed = count(array_filter($runs, static fn (array $run): bool => ($run['status'] ?? '') === 'failed'));
-
-            Realtime::publish('request.updated', [
-                'id' => $row['id'],
-                'room_id' => $row['room_id'],
-                'run_count' => count($runs),
-                'failed_runs' => $failed,
-            ]);
-        }
+        // Routing happens in the `worker` service: the receiver only records what
+        // has to be done, so a slow forward target cannot hold the sender.
+        $queued = WorkflowEngine::enqueue($row);
 
         Response::json([
             'ok' => true,
@@ -91,8 +85,39 @@ final class WebhookController
             'room' => $room['slug'],
             'endpoint' => $row['endpoint'],
             'received_at' => $row['received_at'],
-            'workflow_runs' => count($runs),
+            'queued' => $queued,
         ], 202);
+    }
+
+    /**
+     * Per-address throttle for the public catcher.
+     *
+     * An unauthenticated endpoint that writes a row per request is a free disk-fill
+     * and write-amplification vector. The limit is deliberately generous (a real
+     * sender bursts) and off unless configured, because a busy integration should
+     * not start dropping deliveries after an upgrade.
+     */
+    private function enforceLimit(Request $request): void
+    {
+        $limit = RateLimiter::limit('INGEST_MAX_PER_WINDOW', 0);
+        if ($limit <= 0) {
+            return;
+        }
+
+        $result = RateLimiter::hit(
+            'ingest-ip',
+            $request->ip,
+            $limit,
+            RateLimiter::window('INGEST_WINDOW_SECONDS', 60),
+        );
+
+        if ($result['allowed']) {
+            return;
+        }
+
+        header('Retry-After: ' . $result['retry_after']);
+
+        Response::error('Слишком много входящих запросов, повторите позже', 429);
     }
 
     /**
@@ -170,6 +195,14 @@ final class WebhookController
                 $rest = substr($path, strlen($prefix));
 
                 return array_values(array_filter(explode('/', trim($rest, '/')), static fn (string $part): bool => $part !== ''));
+            }
+        }
+
+        // A bare `/api/webhook` or `/hook` has no path of its own: it belongs to the
+        // default room with the default endpoint, like `/hook/{room}` with no endpoint.
+        foreach (['/api/webhook', '/hook'] as $bare) {
+            if ($path === $bare) {
+                return [];
             }
         }
 

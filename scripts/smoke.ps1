@@ -26,15 +26,46 @@ function Assert-Status {
     Write-Host "ok - $Message" -ForegroundColor Green
 }
 
+# Routing is asynchronous now: the receiver answers 202 before any action runs, so
+# every assertion about runs has to wait for the worker to reach a terminal state.
+function Wait-ForRuns {
+    param(
+        [long]$Id,
+        [int]$TimeoutSec = 20,
+        [switch]$AllowEmpty
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $detail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$Id" -Headers $auth
+        $runs = @($detail.data.runs)
+
+        if ($runs.Count -eq 0) {
+            if ($AllowEmpty) { return $detail }
+            Start-Sleep -Milliseconds 150
+            continue
+        }
+
+        $waiting = @($runs | Where-Object { $_.status -eq "pending" -or $_.status -eq "running" })
+        if ($waiting.Count -eq 0) {
+            return $detail
+        }
+
+        Start-Sleep -Milliseconds 150
+    }
+
+    throw "FAIL: runs for request $Id did not finish within $TimeoutSec s"
+}
+
 Write-Host "Smoke testing $BaseUrl" -ForegroundColor Cyan
 
 $health = Invoke-RestMethod -Uri "$BaseUrl/api/health"
 Assert-True ($health.status -eq "ok") "health endpoint responds"
 
 $login = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/auth/login" -ContentType "application/json" `
-    -Body (@{ email = "admin@l.loc"; password = "123456" } | ConvertTo-Json)
+    -Body (@{ email = "admin@hookdock.local"; password = "123456" } | ConvertTo-Json)
 $token = $login.token
-Assert-True (-not [string]::IsNullOrWhiteSpace($token)) "admin@l.loc can sign in"
+Assert-True (-not [string]::IsNullOrWhiteSpace($token)) "admin@hookdock.local can sign in"
 
 $auth = @{ Authorization = "Bearer $token" }
 
@@ -45,6 +76,34 @@ try {
     $unauthorized = $true
 }
 Assert-True $unauthorized "requests API rejects anonymous access"
+
+# --- Auth hardening -----------------------------------------------------------
+# The websocket ticket is a 60s JWT that rides in a query string; accepting it as a
+# Bearer token would turn it into a full API credential.
+$ticket = (Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/ws/ticket" -Headers $auth).data.ticket
+Assert-True (-not [string]::IsNullOrWhiteSpace($ticket)) "ws ticket is issued for a signed-in user"
+try {
+    Invoke-RestMethod -Uri "$BaseUrl/api/rooms" -Headers @{ Authorization = "Bearer $ticket" } | Out-Null
+    throw "FAIL: ws ticket must not authenticate a REST request"
+} catch {
+    if ($_.Exception.Message -like "FAIL:*") { throw }
+    Assert-True ([int]$_.Exception.Response.StatusCode -eq 401) "ws ticket cannot be used as an API token"
+}
+
+# Repeated bad passwords for one account are throttled (429) instead of guessed.
+$throttleEmail = "smoke-throttle-$([guid]::NewGuid().ToString('N').Substring(0, 8))@example.com"
+$statuses = @()
+for ($i = 1; $i -le 12; $i++) {
+    try {
+        Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/auth/login" -ContentType "application/json" `
+            -Body (@{ email = $throttleEmail; password = "wrong" } | ConvertTo-Json) | Out-Null
+        $statuses += 200
+    } catch {
+        $statuses += [int]$_.Exception.Response.StatusCode
+    }
+}
+Assert-True ($statuses -contains 429) "repeated failed logins are rate limited"
+Assert-True (@($statuses | Where-Object { $_ -eq 429 }).Count -ge 2) "login throttle stays active while the window lasts"
 
 # --- Rooms --------------------------------------------------------------------
 $rooms = Invoke-RestMethod -Uri "$BaseUrl/api/rooms" -Headers $auth
@@ -192,18 +251,20 @@ $match = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$ro
     -ContentType "application/json" -Body $payload
 $matchId = ($match.Content | ConvertFrom-Json).id
 
-$detail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$matchId" -Headers $auth
+$detail = Wait-ForRuns -Id $matchId
 Assert-True ($detail.data.runs.Count -eq 1) "only the room's own workflow fires"
 Assert-True ($detail.data.runs[0].workflow_id -eq $workflow.data.id) "run belongs to the room workflow"
 Assert-True ($detail.data.request.headers -isnot [string] -and $detail.data.request.query -isnot [string]) "request JSON columns return as objects"
 Assert-True ($detail.data.runs[0].status -eq "success") "log action succeeds"
 Assert-True ($detail.data.runs[0].message -like "*Ada*") "template placeholders resolve"
+Assert-True (@($detail.data.runs[0].steps).Count -ge 1) "run records one step per action"
+Assert-True ($detail.data.runs[0].steps[0].type -eq "log") "step log names the action type"
 
 $skipPayload = @{ event = @{ type = "refund" } } | ConvertTo-Json -Depth 4
 $skip = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$endpoint" `
     -ContentType "application/json" -Body $skipPayload
 $skipId = ($skip.Content | ConvertFrom-Json).id
-$skipDetail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$skipId" -Headers $auth
+$skipDetail = Wait-ForRuns -Id $skipId
 Assert-True ($skipDetail.data.runs[0].status -eq "skipped") "non-matching conditions are skipped"
 
 $forwardEndpoint = "$endpoint-forward"
@@ -226,11 +287,105 @@ Assert-True ($paused.data.enabled -eq $false) "workflow can be created paused"
 
 $forwardHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$forwardEndpoint" -ContentType "text/plain" -Body "ping"
 $forwardId = ($forwardHit.Content | ConvertFrom-Json).id
-$forwardDetail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$forwardId" -Headers $auth
+$forwardDetail = Wait-ForRuns -Id $forwardId
 Assert-True ($forwardDetail.data.request.body -eq $null) "non-JSON payload keeps body null"
 Assert-True ($forwardDetail.data.request.raw_body -eq "ping") "non-JSON payload keeps raw body"
 Assert-True ($forwardDetail.data.runs[0].status -eq "success") "forward action reaches target"
 Assert-True ($forwardDetail.data.runs[0].message -like "*200*") "forward action records HTTP status"
+Assert-True ($forwardDetail.data.runs[0].steps[0].response_status -eq 200) "forward step records the upstream status"
+
+# A transient failure is retried with backoff and then reported, rather than
+# silently dropped: the receiver already answered 202, so the run log is the only
+# place the sender (and the operator) can learn about it.
+$retryEndpoint = "$endpoint-retry"
+$retry = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room     = $roomSlug
+    name     = "Smoke retry"
+    endpoint = $retryEndpoint
+    enabled  = $true
+    actions  = @(@{ type = "forward"; url = "http://web:9999/nope"; method = "POST"; payload = "body" })
+} | ConvertTo-Json -Depth 8)
+
+$retryHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$retryEndpoint" `
+    -ContentType "application/json" -Body '{"x":1}'
+$retryId = ($retryHit.Content | ConvertFrom-Json).id
+$retryDetail = Wait-ForRuns -Id $retryId -TimeoutSec 30
+Assert-True ($retryDetail.data.runs[0].status -eq "failed") "unreachable forward ends up failed"
+Assert-True ($retryDetail.data.runs[0].attempts -ge 2) "transient failure is retried"
+
+# A retry must not repeat an action that already succeeded: the first action here
+# is a log, the second one always fails, so the log step has to appear exactly once
+# even though the run was attempted several times. This is what keeps a forward
+# from being delivered twice by a retry. `transform` is the exception: it is pure,
+# so it re-runs on every attempt to rebuild the context a later forward reads.
+$skipEndpoint = "$endpoint-retry-skip"
+$retrySkip = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+    room     = $roomSlug
+    name     = "Smoke retry keeps successes"
+    endpoint = $skipEndpoint
+    enabled  = $true
+    actions  = @(
+        @{ type = "log"; message = "первый шаг" },
+        @{ type = "transform"; mapping = @{ first = "body.x" } },
+        @{ type = "forward"; url = "http://web:9999/nope"; method = "POST"; payload = "transformed" }
+    )
+} | ConvertTo-Json -Depth 8)
+
+$skipHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$skipEndpoint" `
+    -ContentType "application/json" -Body '{"x":1}'
+$skipId = ($skipHit.Content | ConvertFrom-Json).id
+$skipDetail = Wait-ForRuns -Id $skipId -TimeoutSec 30
+$skipRun = $skipDetail.data.runs[0]
+Assert-True ($skipRun.status -eq "failed") "run with a failing last action ends up failed"
+Assert-True ($skipRun.attempts -ge 2) "run with a failing last action is retried"
+$logSteps = @($skipRun.steps | Where-Object { $_.type -eq "log" })
+Assert-True ($logSteps.Count -eq 1) "retry does not repeat an action that already succeeded"
+Assert-True (@($skipRun.steps | Where-Object { $_.type -eq "transform" }).Count -ge 2) "retry rebuilds a pure transform instead of skipping it"
+Assert-True (@($skipRun.steps | Where-Object { $_.type -eq "forward" }).Count -ge 2) "retry records each failed attempt"
+
+# The router sits inside a private network, so an unchecked forward URL is an SSRF
+# primitive (the api container, the database, the cloud metadata service). Loopback
+# and link-local targets must be refused before a packet is sent, and refused as a
+# configuration error (no retry).
+# Every spelling of loopback and link-local has to be refused, not just the dotted
+# IPv4 one: `::1`, its fully expanded form, an IPv4-mapped address and a name that
+# only exists in `/etc/hosts` all reach the same socket. A textual comparison passes
+# them through while this test stays green, so each spelling is asserted separately.
+$ssrfTargets = @(
+    @{ url = "http://169.254.169.254/latest/meta-data/"; label = "link-local" },
+    @{ url = "http://[::1]/"; label = "IPv6 loopback" },
+    @{ url = "http://[0:0:0:0:0:0:0:1]/"; label = "expanded IPv6 loopback" },
+    @{ url = "http://[::ffff:7f00:1]/"; label = "IPv4-mapped loopback (hex)" },
+    @{ url = "http://[::ffff:127.0.0.1]/"; label = "IPv4-mapped loopback" },
+    @{ url = "http://ip6-localhost/"; label = "hosts-file alias for loopback" }
+)
+
+$ssrfWorkflowIds = @()
+
+foreach ($target in $ssrfTargets) {
+    $ssrfEndpoint = "$endpoint-ssrf-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
+    $ssrf = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/workflows" -Headers $auth -ContentType "application/json" -Body (@{
+        room     = $roomSlug
+        name     = "Smoke ssrf $( $target.label )"
+        endpoint = $ssrfEndpoint
+        enabled  = $true
+        actions  = @(@{ type = "forward"; url = $target.url; method = "GET"; payload = "raw" })
+    } | ConvertTo-Json -Depth 8)
+    $ssrfWorkflowIds += $ssrf.data.id
+
+    $ssrfHit = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$ssrfEndpoint" `
+        -ContentType "application/json" -Body '{"x":1}'
+    $ssrfId = ($ssrfHit.Content | ConvertFrom-Json).id
+    $ssrfRun = (Wait-ForRuns -Id $ssrfId).data.runs[0]
+
+    Assert-True ($ssrfRun.status -eq "failed") "$($target.label) forward target is refused"
+    Assert-True ($ssrfRun.attempts -eq 1) "$($target.label) refusal is terminal, not retried"
+    Assert-True ($ssrfRun.message -like "*запрещ*" -or $ssrfRun.message -like "*резолв*") "$($target.label) refusal explains why"
+}
+
+# A log-only workflow never touches the network, so the receiver's 202 is not
+# delayed by routing: `queued` reports the work that was stored.
+Assert-True ($match.Content -like '*"queued"*') "receiver reports how many runs were queued"
 
 # --- Address resolution -------------------------------------------------------
 $roomOnly = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug" -ContentType "application/json" -Body '{"x":1}'
@@ -244,6 +399,49 @@ $legacy = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$e
 $legacyBody = $legacy.Content | ConvertFrom-Json
 Assert-True ($legacyBody.room -eq "default") "legacy /hook/{endpoint} lands in the default room"
 
+# --- Deep paths ---------------------------------------------------------------
+# The catcher is claimed by prefix, not by a fixed number of route segments, so an
+# endpoint can carry a path of its own (Stripe-style /stripe/payment/succeeded).
+# Both aliases must behave the same, including the room-must-exist rule.
+$deep = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$roomSlug/deep/a/b/c" `
+    -ContentType "application/json" -Body '{"deep":true}'
+$deepBody = $deep.Content | ConvertFrom-Json
+Assert-True ($deep.StatusCode -eq 202) "deep webhook path under /api/webhook is accepted"
+Assert-True ($deepBody.endpoint -eq "deep/a/b/c") "deep webhook path keeps the whole endpoint slug"
+
+$deepShort = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/deep/a/b/c" `
+    -ContentType "application/json" -Body '{"deep":true}'
+Assert-True ($deepShort.StatusCode -eq 202) "deep webhook path under /hook is accepted"
+
+Assert-Status { Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/api/webhook/$roomSlug-unknown/deep/a" `
+        -ContentType "application/json" -Body '{"x":1}' } 404 "unknown room in a deep /api/webhook path is rejected"
+
+# --- multipart bodies ---------------------------------------------------------
+# PHP form parsing is off in php.ini; with it on, php://input is empty for
+# multipart and the catcher would store the request with no body at all.
+$boundary = "----smoke$suffix"
+$multipart = "--$boundary`r`nContent-Disposition: form-data; name=`"payload`"`r`n`r`nhello`r`n--$boundary--`r`n"
+$multipartResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/hook/$roomSlug/$endpoint-multipart" `
+    -ContentType "multipart/form-data; boundary=$boundary" -Body $multipart
+$multipartId = ($multipartResponse.Content | ConvertFrom-Json).id
+$multipartDetail = Invoke-RestMethod -Uri "$BaseUrl/api/requests/$multipartId" -Headers $auth
+Assert-True ($multipartDetail.data.request.raw_body -like "*hello*") "multipart body is stored, not swallowed by PHP form parsing"
+Assert-True ($multipartDetail.data.request.body_bytes -gt 0) "multipart body size is recorded"
+Assert-True ($null -eq $multipartDetail.data.request.body) "multipart body is not decoded as JSON"
+
+# --- CORS on the catcher ------------------------------------------------------
+# A browser cannot POST to another origin without a preflight, so the catcher
+# answers it; a plain OPTIONS request (no Access-Control-Request-Method) is still
+# ingested as a webhook rather than treated as a preflight.
+$preflight = Invoke-WebRequest -UseBasicParsing -Method Options -Uri "$BaseUrl/hook/$roomSlug/$endpoint" `
+    -Headers @{ "Origin" = "http://localhost:3000"; "Access-Control-Request-Method" = "POST" }
+Assert-True ($preflight.StatusCode -eq 204) "CORS preflight is answered with 204"
+Assert-True ($preflight.Headers["Access-Control-Allow-Origin"] -eq "*") "CORS preflight allows any origin"
+
+$optionsHit = Invoke-WebRequest -UseBasicParsing -Method Options -Uri "$BaseUrl/hook/$roomSlug/$endpoint-options" `
+    -ContentType "application/json" -Body '{"probe":1}'
+Assert-True ($optionsHit.StatusCode -eq 202) "a real OPTIONS webhook is still ingested, not treated as a preflight"
+
 $list = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=5" -Headers $auth
 Assert-True ($list.data.Count -ge 1) "requests list returns data"
 Assert-True ($list.meta.total -ge 3) "requests list exposes pagination meta"
@@ -251,7 +449,8 @@ Assert-True ($null -eq ($list.data[0].PSObject.Properties['body'])) "lean reques
 
 # The workflow editor builds condition paths from a real payload, so it asks
 # for the body explicitly; jsonb must arrive decoded, not as a JSON string.
-$sampleList = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&per_page=5&include=body" -Headers $auth
+# Scoped to its endpoint: later sections add unrelated requests to the same room.
+$sampleList = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&endpoint=$endpoint&per_page=5&include=body" -Headers $auth
 Assert-True ($sampleList.data.Count -ge 1) "request samples with body return data"
 $jsonSample = @($sampleList.data | Where-Object { $_.body -and $_.body.customer.name -eq "Ada" })[0]
 Assert-True ($null -ne $jsonSample) "request sample for the endpoint is listed"
@@ -273,6 +472,21 @@ Assert-True ($null -eq $ignoredInclude.data[0].PSObject.Properties['body']) "unk
 $stats = Invoke-RestMethod -Uri "$BaseUrl/api/stats?room=$roomSlug" -Headers $auth
 Assert-True ($stats.data.requests_total -ge 3) "stats endpoint aggregates requests"
 Assert-True ($stats.data.workflows_active -ge 1) "stats endpoint counts the room's workflows"
+
+# Free-text search spans the path, the endpoint and the raw body. The body branch
+# has to stay a plain `raw_body ILIKE`, otherwise the trigram index cannot be used.
+$found = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&q=Ada" -Headers $auth
+Assert-True (@($found.data).Count -ge 1) "search finds a payload by its raw body"
+Assert-True (@($found.data | Where-Object { $_.endpoint -eq $endpoint }).Count -ge 1) "search does not lose the matching row"
+$missing = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&q=zzz-no-such-payload" -Headers $auth
+Assert-True (@($missing.data).Count -eq 0) "search with no match returns an empty page"
+
+# `%` and `_` are LIKE wildcards. Passed through unescaped, `q=%` matches every
+# stored payload and the operator sees "everything" instead of "nothing".
+$wildcard = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&q=%25" -Headers $auth
+Assert-True (@($wildcard.data).Count -eq 0) "a literal percent sign in search is not a LIKE wildcard"
+$underscore = Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug&q=_" -Headers $auth
+Assert-True (@($underscore.data).Count -eq 0) "a literal underscore in search is not a LIKE wildcard"
 
 Assert-Status { Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=$roomSlug-nope" -Headers $auth } 404 "unknown room filter is rejected"
 
@@ -351,6 +565,11 @@ try {
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($workflow.data.id)" -Headers $auth | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($forward.data.id)" -Headers $auth | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($paused.data.id)" -Headers $auth | Out-Null
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($retry.data.id)" -Headers $auth | Out-Null
+Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($retrySkip.data.id)" -Headers $auth | Out-Null
+foreach ($ssrfWorkflowId in $ssrfWorkflowIds) {
+    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$ssrfWorkflowId" -Headers $auth | Out-Null
+}
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/workflows/$($decoy.data.id)" -Headers $auth | Out-Null
 
 Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/rooms/$roomId" -Headers $auth | Out-Null
@@ -364,8 +583,7 @@ if ($liveRequestId) {
     Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$liveRequestId" -Headers $auth | Out-Null
 }
 foreach ($legacyId in @((Invoke-RestMethod -Uri "$BaseUrl/api/requests?room=default&per_page=100" -Headers $auth).data |
-        Where-Object { $_.endpoint -eq "$endpoint-legacy" } | ForEach-Object { $_.id })) {
-    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$legacyId" -Headers $auth | Out-Null
+        Where-Object { $_.endpoint -eq "$endpoint-legacy" } | ForEach-Object { $_.id })) {    Invoke-RestMethod -Method Delete -Uri "$BaseUrl/api/requests/$legacyId" -Headers $auth | Out-Null
 }
 
 Write-Host "All smoke checks passed." -ForegroundColor Green

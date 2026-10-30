@@ -44,10 +44,22 @@ final class RequestsController
 
         $q = trim((string) ($request->query['q'] ?? ''));
         if ($q !== '') {
-            $where[] = "(r.path ILIKE :q_path OR r.endpoint ILIKE :q_endpoint OR COALESCE(r.raw_body, '') ILIKE :q_body)";
-            $params['q_path'] = '%' . $q . '%';
-            $params['q_endpoint'] = '%' . $q . '%';
-            $params['q_body'] = '%' . $q . '%';
+            // No `COALESCE(raw_body, '')` here: a NULL body already fails `ILIKE`, and
+            // wrapping the column in a function would stop Postgres from using the
+            // trigram index (`incoming_requests_raw_body_trgm_idx`), turning each
+            // keystroke into a sequential scan of every stored payload.
+            //
+            // `%` and `_` are LIKE wildcards. Unescaped, a search for "50%" matches
+            // every payload containing "50" — and the user cannot tell why. Backslash
+            // is Postgres' default LIKE escape character, so escaping the value is
+            // enough; a literal `ESCAPE '\'` clause is deliberately avoided because
+            // PDO's statement parser reads `\'` as an escaped quote and then fails to
+            // bind the remaining placeholders (`HY093`).
+            $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+            $where[] = '(r.path ILIKE :q_path OR r.endpoint ILIKE :q_endpoint OR r.raw_body ILIKE :q_body)';
+            $params['q_path'] = $like;
+            $params['q_endpoint'] = $like;
+            $params['q_body'] = $like;
         }
 
         $from = $this->parseDate((string) ($request->query['from'] ?? ''));
@@ -76,10 +88,13 @@ final class RequestsController
 
         $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
                        COALESCE(stats.runs, 0)::int AS run_count,
-                       COALESCE(stats.failed, 0)::int AS failed_runs" . $extraColumns . "
+                       COALESCE(stats.failed, 0)::int AS failed_runs,
+                       COALESCE(stats.pending, 0)::int AS pending_runs" . $extraColumns . "
                 FROM incoming_requests r
                 LEFT JOIN LATERAL (
-                    SELECT count(*) AS runs, count(*) FILTER (WHERE wr.status = 'failed') AS failed
+                    SELECT count(*) AS runs,
+                           count(*) FILTER (WHERE wr.status = 'failed') AS failed,
+                           count(*) FILTER (WHERE wr.status IN ('pending', 'running')) AS pending
                     FROM workflow_runs wr
                     WHERE wr.request_id = r.id
                 ) stats ON TRUE" . $clause . '
@@ -126,19 +141,49 @@ final class RequestsController
 
         $row = JsonColumns::decode($row, ['query', 'headers', 'body']);
 
-        $runs = Database::pdo()->prepare(
-            'SELECT wr.id, wr.workflow_id, wr.status, wr.message, wr.created_at, w.name AS workflow_name
+        $pdo = Database::pdo();
+
+        $runs = $pdo->prepare(
+            'SELECT wr.id, wr.workflow_id, wr.status, wr.message, wr.attempts, wr.created_at, wr.updated_at,
+                    w.name AS workflow_name
              FROM workflow_runs wr
              JOIN workflows w ON w.id = wr.workflow_id
              WHERE wr.request_id = :id
              ORDER BY wr.id'
         );
         $runs->execute(['id' => $id]);
+        $runRows = $runs->fetchAll();
+
+        // Step logs for every run of this request in one query. A per-run query
+        // would make the detail card scale with the number of workflows.
+        $steps = [];
+        if ($runRows !== []) {
+            $ids = array_map(static fn (array $run): int => (int) $run['id'], $runRows);
+            $placeholders = implode(', ', array_fill(0, count($ids), '?'));
+
+            $stepsStmt = $pdo->prepare(
+                "SELECT id, run_id, attempt, action_index, type, status, message,
+                        response_status, response_body, duration_ms, created_at
+                   FROM workflow_run_steps
+                  WHERE run_id IN ({$placeholders})
+                  ORDER BY run_id, id"
+            );
+            $stepsStmt->execute($ids);
+
+            foreach ($stepsStmt->fetchAll() as $step) {
+                $steps[(int) $step['run_id']][] = $step;
+            }
+        }
+
+        foreach ($runRows as &$run) {
+            $run['steps'] = $steps[(int) $run['id']] ?? [];
+        }
+        unset($run);
 
         Response::json([
             'data' => [
                 'request' => $row,
-                'runs' => $runs->fetchAll(),
+                'runs' => $runRows,
             ],
         ]);
     }
@@ -172,10 +217,9 @@ final class RequestsController
         // `room` narrows every counter to one room; without it the totals stay
         // installation-wide (the SPA always sends a room).
         $requestWhere = $roomId === null ? '' : ' WHERE room_id = :room_id';
-        $runWhere = $roomId === null
-            ? " WHERE status = 'failed' AND created_at >= now() - interval '24 hours'"
-            : " WHERE status = 'failed' AND created_at >= now() - interval '24 hours'
-                AND request_id IN (SELECT id FROM incoming_requests WHERE room_id = :room_id)";
+        $runScope = $roomId === null
+            ? ''
+            : ' AND request_id IN (SELECT id FROM incoming_requests WHERE room_id = :room_id)';
 
         $requestsStmt = $pdo->prepare(
             "SELECT count(*)::int AS total,
@@ -191,8 +235,20 @@ final class RequestsController
         );
         $workflowsStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
 
-        $failedStmt = $pdo->prepare('SELECT count(*)::int AS failed FROM workflow_runs' . $runWhere);
+        $failedStmt = $pdo->prepare(
+            "SELECT count(*)::int AS failed FROM workflow_runs
+              WHERE status = 'failed'
+                AND created_at >= now() - interval '24 hours'" . $runScope
+        );
         $failedStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
+
+        // How much routing is still in flight: the number the UI shows when the
+        // receiver has answered 202 but the worker has not finished yet.
+        $queuedStmt = $pdo->prepare(
+            "SELECT count(*)::int AS queued FROM workflow_runs
+              WHERE status IN ('pending', 'running')" . $runScope
+        );
+        $queuedStmt->execute($roomId === null ? [] : ['room_id' => $roomId]);
 
         $endpointsStmt = $pdo->prepare(
             'SELECT endpoint, count(*)::int AS total
@@ -207,6 +263,7 @@ final class RequestsController
         $requests = $requestsStmt->fetch();
         $workflows = $workflowsStmt->fetch();
         $failed = $failedStmt->fetch();
+        $queued = $queuedStmt->fetch();
 
         Response::json([
             'data' => [
@@ -215,6 +272,7 @@ final class RequestsController
                 'requests_last_24h' => (int) ($requests['last_24h'] ?? 0),
                 'workflows_active' => (int) ($workflows['active'] ?? 0),
                 'failed_runs_24h' => (int) ($failed['failed'] ?? 0),
+                'queued_runs' => (int) ($queued['queued'] ?? 0),
                 'endpoints' => $endpointsStmt->fetchAll(),
             ],
         ]);

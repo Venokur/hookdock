@@ -4,52 +4,228 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Config;
 use App\Database;
 use App\Support\HttpClient;
 use App\Support\JsonPath;
 use App\Support\Template;
+use App\Support\UrlGuard;
+use PDO;
 use Throwable;
 
 /**
- * Evaluates enabled workflows against a freshly stored webhook request.
- * Failures are recorded per workflow and never bubble up to the receiver.
+ * Routes a stored webhook through the workflows of its room.
+ *
+ * The receiver must answer fast, so the work is split in three:
+ *   enqueue()  – called inside the request, records one `pending` run per
+ *                matching workflow (no conditions are evaluated yet);
+ *   claim()    – the worker takes a batch of due runs with SKIP LOCKED, so two
+ *                workers never execute the same run;
+ *   execute()  – conditions and actions, with a per-action step log.
+ *
+ * A run is retried on transient failures only, and a retry replays the actions
+ * that already succeeded, so a forward is never sent twice by a retry.
  */
 final class WorkflowEngine
 {
+    /** Statuses that occupy the queue. */
+    public const QUEUE = ['pending', 'running'];
+
     /**
+     * Records the runs a stored request still has to go through.
+     *
+     * Conditions are deliberately not evaluated here: the payload is already in
+     * the database, so the worker can decide, and a slow condition write would
+     * delay the 202 the sender is waiting for.
+     *
      * @param array<string, mixed> $request incoming_requests row + decoded fields
-     * @return list<array<string, mixed>> created workflow_runs
      */
-    public static function process(array $request): array
+    public static function enqueue(array $request): int
     {
         $pdo = Database::pdo();
-        $context = self::context($request);
 
-        // Room isolation: a workflow can only fire for requests of its own room.
-        $stmt = $pdo->prepare('SELECT * FROM workflows WHERE enabled AND room_id = :room_id ORDER BY id');
+        $stmt = $pdo->prepare('SELECT id, endpoint FROM workflows WHERE enabled AND room_id = :room_id ORDER BY id');
         $stmt->execute(['room_id' => (int) ($request['room_id'] ?? 0)]);
-        $workflows = $stmt->fetchAll();
 
-        $runs = [];
-        foreach ($workflows as $workflow) {
-            $endpoint = (string) $workflow['endpoint'];
-            if (!self::endpointMatches($endpoint, (string) $request['endpoint'])) {
-                continue;
+        $ids = [];
+        foreach ($stmt->fetchAll() as $workflow) {
+            if (self::endpointMatches((string) $workflow['endpoint'], (string) $request['endpoint'])) {
+                $ids[] = (int) $workflow['id'];
             }
-
-            $conditions = self::decode((string) $workflow['conditions']);
-            $actions = self::decode((string) $workflow['actions']);
-
-            if (!self::conditionsPass($conditions, $context)) {
-                $runs[] = self::recordRun((int) $workflow['id'], (int) $request['id'], 'skipped', 'Условия не выполнены');
-                continue;
-            }
-
-            [$status, $message] = self::runActions($actions, $context);
-            $runs[] = self::recordRun((int) $workflow['id'], (int) $request['id'], $status, $message);
         }
 
-        return $runs;
+        if ($ids === []) {
+            return 0;
+        }
+
+        $values = [];
+        $params = ['request_id' => (int) $request['id']];
+
+        foreach ($ids as $index => $id) {
+            $values[] = sprintf('(:workflow_%d, :request_id, \'pending\')', $index);
+            $params['workflow_' . $index] = $id;
+        }
+
+        $insert = $pdo->prepare(
+            'INSERT INTO workflow_runs (workflow_id, request_id, status) VALUES ' . implode(', ', $values)
+        );
+        $insert->execute($params);
+
+        return count($ids);
+    }
+
+    /**
+     * Takes due runs for one worker. `FOR UPDATE SKIP LOCKED` makes concurrent
+     * workers partition the queue instead of blocking on each other.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public static function claim(int $limit, string $workerId): array
+    {
+        $pdo = Database::pdo();
+
+        $stmt = $pdo->prepare(
+            "UPDATE workflow_runs
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    locked_at = now(),
+                    locked_by = :worker,
+                    updated_at = now()
+              WHERE id IN (
+                    SELECT id FROM workflow_runs
+                     WHERE status = 'pending' AND available_at <= now()
+                     ORDER BY available_at, id
+                     LIMIT :limit
+                     FOR UPDATE SKIP LOCKED
+              )
+              RETURNING id, workflow_id, request_id, attempts"
+        );
+        $stmt->bindValue(':worker', $workerId);
+        $stmt->bindValue(':limit', max(1, $limit), PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * Runs one claimed run and records the outcome.
+     *
+     * @param array<string, mixed> $run row from claim()
+     */
+    public static function execute(array $run): string
+    {
+        $pdo = Database::pdo();
+        $runId = (int) $run['id'];
+        $attempt = (int) $run['attempts'];
+
+        $request = self::loadRequest((int) $run['request_id']);
+        if ($request === null) {
+            // The request was deleted while queued: nothing to route.
+            self::finish($runId, 'skipped', 'Запрос удалён до выполнения');
+
+            return 'skipped';
+        }
+
+        $workflow = self::loadWorkflow((int) $run['workflow_id']);
+        if ($workflow === null) {
+            self::finish($runId, 'skipped', 'Сценарий удалён до выполнения');
+
+            return 'skipped';
+        }
+
+        $context = self::context($request);
+        $conditions = self::decode((string) $workflow['conditions']);
+        $actions = self::decode((string) $workflow['actions']);
+
+        if (!self::conditionsPass($conditions, $context)) {
+            self::finish($runId, 'skipped', 'Условия не выполнены');
+
+            return 'skipped';
+        }
+
+        $done = self::succeededSteps($runId);
+        [$status, $message, $retry] = self::runActions($actions, $context, $runId, $attempt, $done);
+
+        if ($retry && $attempt < self::maxAttempts()) {
+            self::reschedule($runId, $attempt, $message);
+
+            return 'pending';
+        }
+
+        if ($retry) {
+            $message .= ' · попыток: ' . $attempt;
+        }
+
+        self::finish($runId, $status, $message);
+
+        return $status;
+    }
+
+    /**
+     * Returns runs whose worker died back to the queue.
+     *
+     * A `running` row older than the threshold belongs to a process that no
+     * longer exists (container restart, OOM), so it would otherwise stay in the
+     * queue forever.
+     */
+    public static function recoverStale(int $minutes = 5): int
+    {
+        $stmt = Database::pdo()->prepare(
+            "UPDATE workflow_runs
+                SET status = 'pending', locked_at = NULL, locked_by = NULL, updated_at = now()
+              WHERE status = 'running'
+                AND locked_at < now() - make_interval(mins => :minutes)
+              RETURNING id"
+        );
+        $stmt->bindValue(':minutes', max(1, $minutes), PDO::PARAM_INT);
+        $stmt->execute();
+
+        return count($stmt->fetchAll());
+    }
+
+    public static function maxAttempts(): int
+    {
+        return max(1, Config::int('ROUTING_MAX_ATTEMPTS', 3));
+    }
+
+    /**
+     * Exponential backoff, counted from the first attempt (1s → 2s → 4s).
+     */
+    public static function retryDelay(int $attempt): int
+    {
+        $base = max(1, Config::int('ROUTING_RETRY_BASE', 1));
+
+        return $base * (2 ** max(0, $attempt - 1));
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private static function loadRequest(int $id): ?array
+    {
+        $stmt = Database::pdo()->prepare('SELECT * FROM incoming_requests WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $row = $stmt->fetch();
+
+        if ($row === false) {
+            return null;
+        }
+
+        $row = \App\Support\JsonColumns::decode($row, ['query', 'headers', 'body']);
+
+        return $row;
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private static function loadWorkflow(int $id): ?array
+    {
+        $stmt = Database::pdo()->prepare('SELECT * FROM workflows WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $row = $stmt->fetch();
+
+        return $row === false ? null : $row;
     }
 
     /**
@@ -174,20 +350,35 @@ final class WorkflowEngine
     /**
      * @param list<array<string, mixed>> $actions
      * @param array<string, mixed> $context
-     * @return array{0: string, 1: string} status and message
+     * @param array<int, true> $done action indexes that already succeeded in an earlier attempt
+     * @return array{0: string, 1: string, 2: bool} status, message, whether a retry is warranted
      */
-    private static function runActions(array $actions, array &$context): array
+    private static function runActions(array $actions, array &$context, int $runId, int $attempt, array $done): array
     {
         $messages = [];
         $failed = false;
+        $retry = false;
 
-        foreach ($actions as $action) {
+        foreach ($actions as $index => $action) {
+            $type = (string) ($action['type'] ?? '');
+
+            if (isset($done[$index]) && $type !== 'transform') {
+                // Already performed by an earlier attempt: never repeat a side effect.
+                // `transform` is excluded on purpose: it has no side effect, and a
+                // retry has to rebuild `context['transformed']` — otherwise a later
+                // `forward` with `payload: "transformed"` would send an empty body.
+                $messages[] = 'повтор пропущен: ' . $type;
+                continue;
+            }
+
+            $started = microtime(true);
+
             try {
-                $type = (string) ($action['type'] ?? '');
-
                 if ($type === 'log') {
                     $rendered = Template::render((string) ($action['message'] ?? ''), $context);
-                    $messages[] = 'лог: ' . ($rendered !== '' ? $rendered : 'совпадение');
+                    $message = 'лог: ' . ($rendered !== '' ? $rendered : 'совпадение');
+                    $messages[] = $message;
+                    self::recordStep($runId, $attempt, $index, $type, 'success', $message, null, null, $started);
                     continue;
                 }
 
@@ -203,7 +394,9 @@ final class WorkflowEngine
                     }
 
                     $context['transformed'] = $result;
-                    $messages[] = 'трансформация: ' . count($result) . ' пол.';
+                    $message = 'трансформация: ' . count($result) . ' пол.';
+                    $messages[] = $message;
+                    self::recordStep($runId, $attempt, $index, $type, 'success', $message, null, null, $started);
                     continue;
                 }
 
@@ -213,7 +406,21 @@ final class WorkflowEngine
 
                     if ($url === '') {
                         $failed = true;
-                        $messages[] = 'пересылка: пустой URL';
+                        $message = 'пересылка: пустой URL';
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
+                        continue;
+                    }
+
+                    // Checked before the request, never after: the guard exists to
+                    // stop the packet, not to log that it was sent. A refused URL is
+                    // a configuration error, so it is terminal (no retry).
+                    $guard = UrlGuard::check($url);
+                    if (!$guard['allowed']) {
+                        $failed = true;
+                        $message = 'пересылка запрещена: ' . ($guard['reason'] ?? 'адрес не разрешён');
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
                         continue;
                     }
 
@@ -239,32 +446,42 @@ final class WorkflowEngine
                         $headers[(string) $headerName] = Template::render((string) $headerValue, $context);
                     }
 
-                    $result = HttpClient::send($method, $url, $headers, $body);
+                    $result = HttpClient::send($method, $url, $headers, $body, $guard['addresses']);
+
                     if (!$result['ok']) {
                         $failed = true;
-                        $messages[] = sprintf(
+                        $retry = $retry || HttpClient::retryable($result);
+                        $message = sprintf(
                             'пересылка %s %s → %s%s',
                             $method,
                             $url,
                             $result['status'] !== 0 ? (string) $result['status'] : 'ошибка',
                             $result['error'] !== null ? ' (' . $result['error'] . ')' : '',
                         );
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, $result['status'], $result['body'], $started);
                         continue;
                     }
 
-                    $messages[] = sprintf('пересылка %s %s → %d', $method, $url, $result['status']);
+                    $message = sprintf('пересылка %s %s → %d', $method, $url, $result['status']);
+                    $messages[] = $message;
+                    self::recordStep($runId, $attempt, $index, $type, 'success', $message, $result['status'], $result['body'], $started);
                     continue;
                 }
 
                 $failed = true;
-                $messages[] = 'неизвестное действие: ' . $type;
+                $message = 'неизвестное действие: ' . $type;
+                $messages[] = $message;
+                self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
             } catch (Throwable $e) {
                 $failed = true;
-                $messages[] = 'ошибка действия: ' . $e->getMessage();
+                $message = 'ошибка действия: ' . $e->getMessage();
+                $messages[] = $message;
+                self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
             }
         }
 
-        return [$failed ? 'failed' : 'success', implode('; ', $messages) ?: 'Готово'];
+        return [$failed ? 'failed' : 'success', implode('; ', $messages) ?: 'Готово', $failed && $retry];
     }
 
     /**
@@ -297,24 +514,89 @@ final class WorkflowEngine
     }
 
     /**
-     * @param array<string, mixed> $run
-     * @return array<string, mixed>
+     * Action indexes that succeeded in an earlier attempt of this run.
+     *
+     * @return array<int, true>
      */
-    private static function recordRun(int $workflowId, int $requestId, string $status, string $message): array
+    private static function succeededSteps(int $runId): array
     {
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflow_runs (workflow_id, request_id, status, message)
-             VALUES (:workflow_id, :request_id, :status, :message)
-             RETURNING id, workflow_id, request_id, status, message, created_at'
+            "SELECT DISTINCT action_index FROM workflow_run_steps
+              WHERE run_id = :run_id AND status = 'success'"
+        );
+        $stmt->execute(['run_id' => $runId]);
+
+        $done = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $index) {
+            $done[(int) $index] = true;
+        }
+
+        return $done;
+    }
+
+    private static function recordStep(
+        int $runId,
+        int $attempt,
+        int $index,
+        string $type,
+        string $status,
+        string $message,
+        ?int $responseStatus,
+        ?string $responseBody,
+        float $started,
+    ): void {
+        $stmt = Database::pdo()->prepare(
+            'INSERT INTO workflow_run_steps
+                (run_id, attempt, action_index, type, status, message, response_status, response_body, duration_ms)
+             VALUES
+                (:run_id, :attempt, :action_index, :type, :status, :message, :response_status, :response_body, :duration_ms)'
         );
         $stmt->execute([
-            'workflow_id' => $workflowId,
-            'request_id' => $requestId,
+            'run_id' => $runId,
+            'attempt' => $attempt,
+            'action_index' => $index,
+            'type' => $type,
             'status' => $status,
             'message' => mb_substr($message, 0, 2000),
+            'response_status' => $responseStatus,
+            'response_body' => $responseBody === null ? null : mb_substr($responseBody, 0, 4000),
+            'duration_ms' => (int) round((microtime(true) - $started) * 1000),
         ]);
+    }
 
-        return $stmt->fetch();
+    private static function reschedule(int $runId, int $attempt, string $message): void
+    {
+        $delay = self::retryDelay($attempt);
+
+        $stmt = Database::pdo()->prepare(
+            "UPDATE workflow_runs
+                SET status = 'pending',
+                    available_at = now() + make_interval(secs => :delay),
+                    locked_at = NULL,
+                    locked_by = NULL,
+                    message = :message,
+                    updated_at = now()
+              WHERE id = :id"
+        );
+        $stmt->execute([
+            'delay' => $delay,
+            'message' => mb_substr($message, 0, 2000),
+            'id' => $runId,
+        ]);
+    }
+
+    private static function finish(int $runId, string $status, string $message): void
+    {
+        $stmt = Database::pdo()->prepare(
+            'UPDATE workflow_runs
+                SET status = :status, message = :message, locked_at = NULL, locked_by = NULL, updated_at = now()
+              WHERE id = :id'
+        );
+        $stmt->execute([
+            'status' => $status,
+            'message' => mb_substr($message, 0, 2000),
+            'id' => $runId,
+        ]);
     }
 
     /**
