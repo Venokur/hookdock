@@ -48,6 +48,8 @@ const operatorLabels = {
 }
 
 const statusLabels = {
+  pending: 'в очереди',
+  running: 'выполняется',
   success: 'успех',
   failed: 'ошибка',
   skipped: 'пропущен',
@@ -60,12 +62,22 @@ async function load({ silent = false } = {}) {
     loading.value = true
   }
 
+  // A slower answer for the previous room must not repaint this one's list.
+  const roomSlug = slug.value
+
   try {
-    const data = await api.workflows({ room: slug.value })
+    const data = await api.workflows({ room: roomSlug })
+
+    if (roomSlug !== slug.value) {
+      return
+    }
+
     workflows.value = data.data
     error.value = ''
   } catch (e) {
-    error.value = e.message
+    if (roomSlug === slug.value) {
+      error.value = e.message
+    }
   } finally {
     if (!silent) {
       loading.value = false
@@ -225,7 +237,6 @@ watch(slug, () => {
   workflows.value = []
   load()
 })
-
 onUnmounted(() => {
   offRealtime?.()
   releaseLive?.()
@@ -293,6 +304,19 @@ onUnmounted(() => {
           <button type="button" class="btn-primary mt-5" @click="createWorkflow">
             Создать первый сценарий
           </button>
+        </section>
+
+        <!-- A room switch clears the list before the response arrives. Without this
+             branch the view shows a blank area: the empty state is suppressed while
+             `loading` is true and the grid has nothing to render. -->
+        <section
+          v-else-if="loading && workflows.length === 0"
+          class="rounded-2xl border border-line bg-surface px-6 py-16 text-center"
+        >
+          <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
+            <AppSpinner size="sm" />
+            Загружаем сценарии…
+          </span>
         </section>
 
         <section v-else class="grid gap-4 xl:grid-cols-2" :class="{ 'opacity-60': loading }">

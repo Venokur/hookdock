@@ -154,6 +154,36 @@ async function copyCurl() {
             <StatusPill :status="run.status" />
           </div>
           <p class="mt-1 break-words font-mono text-[11px] text-ink-mute">{{ run.message || '—' }}</p>
+          <p v-if="run.attempts > 1" class="mt-1 text-[11px] text-ink-mute">попыток: {{ run.attempts }}</p>
+
+          <!-- Step log: one row per action per attempt, so a retried forward and
+               the response it got are visible instead of collapsed into a string. -->
+          <details v-if="(run.steps ?? []).length" class="mt-2 border-t border-line pt-2">
+            <summary class="cursor-pointer text-[11px] font-medium text-ink-mute">
+              Шаги ({{ run.steps.length }})
+            </summary>
+            <ul class="mt-2 space-y-1.5">
+              <li
+                v-for="step in run.steps"
+                :key="step.id"
+                class="rounded-lg border border-line bg-surface px-2.5 py-2"
+              >
+                <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span class="font-mono text-ink-mute">{{ step.action_index + 1 }}.</span>
+                  <span class="font-medium text-ink-soft">{{ step.type }}</span>
+                  <StatusPill :status="step.status" />
+                  <span v-if="step.attempt > 1" class="text-ink-mute">попытка {{ step.attempt }}</span>
+                  <span v-if="step.response_status" class="font-mono text-ink-mute">HTTP {{ step.response_status }}</span>
+                  <span class="ml-auto font-mono text-[10px] text-ink-mute">{{ step.duration_ms }} мс</span>
+                </div>
+                <p class="mt-1 break-words font-mono text-[11px] text-ink-mute">{{ step.message || '—' }}</p>
+                <pre
+                  v-if="step.response_body"
+                  class="mt-1 max-h-32 overflow-auto rounded-md bg-surface-2 p-2 font-mono text-[10px] text-ink-soft"
+                >{{ step.response_body }}</pre>
+              </li>
+            </ul>
+          </details>
         </div>
       </div>
 

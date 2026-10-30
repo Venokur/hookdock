@@ -29,15 +29,13 @@ const loading = ref(false)
 const error = ref('')
 const copied = ref(false)
 
-// User-driven reloads (filters, paging, room switch) get their own busy flags so
-// the loader is visible even when a local API answers in a few milliseconds.
-// `filtering` additionally drives the spinner inside the method select.
+// User-driven reloads (filters, paging, room switch) get their own busy flag so the
+// loader is visible even when a local API answers in a few milliseconds.
+// `filtering` only picks the wording ("Фильтруем…"): the select no longer carries its
+// own spinner, because the table already shows one for the same action — two
+// indicators for one click read as two operations.
 const filtering = ref(false)
 const listBusy = ref(false)
-// Whether the list had rows when the current reload started. The overlay dims
-// existing content; a list that is still empty shows its own inline spinner
-// instead, so a fresh result never flashes the overlay on arrival.
-const listHasContent = ref(false)
 
 const showDetail = ref(false)
 const detailLoading = ref(false)
@@ -49,6 +47,7 @@ let offRealtime = null
 let filterTimer = null
 let reloadTimer = null
 let busyToken = 0
+let loadSeq = 0
 
 const FILTER_DEBOUNCE = 250
 const BUSY_MIN = 350
@@ -94,6 +93,12 @@ const cards = computed(() => [
   },
   { label: 'Активные сценарии', value: stats.value?.workflows_active ?? 0, hint: 'правила включены' },
   {
+    label: 'В очереди',
+    value: stats.value?.queued_runs ?? 0,
+    hint: 'выполняются в воркере',
+    alert: false,
+  },
+  {
     label: 'Ошибки маршрутизации · 24ч',
     value: stats.value?.failed_runs_24h ?? 0,
     hint: 'смотрите детали запроса',
@@ -102,6 +107,15 @@ const cards = computed(() => [
 ])
 
 async function load({ silent = false } = {}) {
+  // Two loads can overlap: a room switch while a filter reload is still in flight,
+  // or a realtime resync during a manual refresh. Without a sequence number the
+  // older response wins the race and, worse, its `finally` clears `loading` while
+  // the newer request is still running — the loader vanishes and the table looks
+  // idle next to stale data.
+  const seq = ++loadSeq
+  const roomSlug = slug.value
+  const current = () => seq === loadSeq && roomSlug === slug.value
+
   if (!silent) {
     loading.value = true
   }
@@ -109,24 +123,32 @@ async function load({ silent = false } = {}) {
   try {
     const [list, summary] = await Promise.all([
       api.requests({
-        room: slug.value,
+        room: roomSlug,
         page: meta.page,
         per_page: meta.per_page,
         method: filters.method,
         q: filters.q.trim(),
         endpoint: filters.endpoint.trim(),
       }),
-      api.stats({ room: slug.value }),
+      api.stats({ room: roomSlug }),
     ])
+
+    // Superseded by a newer load, or the room changed while the requests were in
+    // flight: painting this answer would show one room's rows under another's title.
+    if (!current()) {
+      return
+    }
 
     items.value = list.data
     Object.assign(meta, list.meta)
     stats.value = summary.data
     error.value = ''
   } catch (e) {
-    error.value = e.message
+    if (current()) {
+      error.value = e.message
+    }
   } finally {
-    if (!silent) {
+    if (seq === loadSeq && !silent) {
       loading.value = false
     }
   }
@@ -139,14 +161,24 @@ async function load({ silent = false } = {}) {
 const { busy: refreshing, updatedAt, run: refreshNow } = useRefresh(() => load())
 
 /**
+ * Is any loader owed to the user? The list has three independent sources of
+ * "waiting" — the initial load, a user-driven reload held for a minimum duration,
+ * and the manual refresh button — and they overlap. Derived from one predicate, the
+ * overlay and the inline spinner can never render at the same time.
+ */
+const listLoading = computed(() => loading.value || listBusy.value || refreshing.value)
+// The overlay dims rows that exist; with nothing to dim, the empty table shows its
+// own spinner instead. Keeping these mutually exclusive is what prevents the
+// "two loaders" flash when the room changes to one with no requests yet.
+const showOverlay = computed(() => listLoading.value && items.value.length > 0)
+const showInlineLoader = computed(() => listLoading.value && items.value.length === 0)
+
+/**
  * Marks the start of a user-driven reload and returns its token. A newer token
  * wins, so a stale response cannot hide the loader the user is looking at.
  */
 function beginBusy({ filter = false } = {}) {
   const token = ++busyToken
-  // Snapshot the list before the request: an empty list keeps its inline
-  // spinner instead of dimming a table that has nothing to dim.
-  listHasContent.value = items.value.length > 0
   listBusy.value = true
 
   if (filter) {
@@ -247,12 +279,26 @@ function onRequestDeleted(payload) {
 }
 
 // Switching rooms is a different data set: reset filters/paging and drop the
-// open card so no request from the previous room stays on screen.
+// open card so no request from the previous room stays on screen. The rows and the
+// counters are cleared too — leaving them up would show the previous room's
+// requests under the new room's heading until the response arrives.
+//
+// Resetting the filters above would trip the `filters` watcher and fire a second,
+// redundant load. `suppressFilterReload` swallows exactly that one tick; the room
+// switch already loads everything the filters would have asked for. It is set only
+// when a filter actually differs from its default — writing the same value does not
+// trigger the watcher, and a stale flag would swallow the user's next real change.
+let suppressFilterReload = false
+
 watch(slug, () => {
-  meta.page = 1
+  suppressFilterReload = filters.method !== 'ALL' || filters.q !== '' || filters.endpoint !== ''
+
   filters.method = 'ALL'
   filters.q = ''
   filters.endpoint = ''
+  items.value = []
+  stats.value = null
+  Object.assign(meta, { page: 1, total: 0, pages: 1 })
   showDetail.value = false
   detail.value = null
   runs.value = []
@@ -262,6 +308,11 @@ watch(slug, () => {
 watch(
   filters,
   () => {
+    if (suppressFilterReload) {
+      suppressFilterReload = false
+      return
+    }
+
     clearTimeout(filterTimer)
 
     // Claim the loader before the debounce: a method pick must react at once,
@@ -439,7 +490,6 @@ onUnmounted(() => {
         <AppSelect
           v-model="filters.method"
           :options="methodOptions"
-          :loading="filtering"
           size="sm"
           aria-label="Фильтр по методу"
           class="w-36"
@@ -473,7 +523,7 @@ onUnmounted(() => {
       <section class="card relative overflow-hidden">
         <Transition name="fade">
           <div
-            v-if="refreshing || (listBusy && listHasContent)"
+            v-if="showOverlay"
             class="absolute inset-0 z-10 grid place-items-center bg-surface/70 backdrop-blur-[1px]"
           >
             <span class="flex items-center gap-2 text-xs font-medium text-ink-soft">
@@ -517,14 +567,15 @@ onUnmounted(() => {
                   {{ formatBytes(row.body_bytes) }}
                 </td>
                 <td class="whitespace-nowrap px-4 py-3 text-xs">
-                  <span v-if="row.run_count" class="text-ink-soft">запусков: {{ row.run_count }}</span>
+                  <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
+                  <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
                   <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>
                   <span v-if="!row.run_count" class="text-ink-mute">без правил</span>
                 </td>
                 <td class="px-4 py-3 text-right text-ink-mute">→</td>
               </tr>
 
-              <tr v-if="!loading && !listBusy && items.length === 0">
+              <tr v-if="!listLoading && items.length === 0">
                 <td colspan="7" class="px-4 py-16 text-center">
                   <p class="text-sm font-medium text-ink">Пока ничего не поймано</p>
                   <p class="mx-auto mt-1 max-w-md text-xs text-ink-mute">
@@ -534,7 +585,7 @@ onUnmounted(() => {
                 </td>
               </tr>
 
-              <tr v-if="(loading || listBusy) && items.length === 0">
+              <tr v-if="showInlineLoader">
                 <td colspan="7" class="px-4 py-16 text-center">
                   <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
                     <AppSpinner size="sm" />

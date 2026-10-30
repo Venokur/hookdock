@@ -6,6 +6,8 @@ const props = defineProps({
 })
 
 const labels = {
+  pending: 'в очереди',
+  running: 'выполняется',
   success: 'успех',
   failed: 'ошибка',
   skipped: 'пропущен',
@@ -13,6 +15,8 @@ const labels = {
 
 const classes = computed(() => {
   const map = {
+    pending: 'bg-ink/5 text-ink-mute ring-line',
+    running: 'bg-indigo-500/10 text-indigo-700 ring-indigo-500/25 dark:text-indigo-300',
     success: 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300',
     failed: 'bg-rose-500/10 text-rose-700 ring-rose-500/25 dark:text-rose-300',
     skipped: 'bg-ink/5 text-ink-mute ring-line',

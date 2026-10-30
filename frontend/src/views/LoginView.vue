@@ -1,31 +1,67 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ThemeToggle from '../components/ThemeToggle.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
+import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
 
-const form = reactive({ email: 'admin@l.loc', password: '123456' })
+const form = reactive({ email: '', password: '' })
 const loading = ref(false)
+const demoLoading = ref(false)
 const error = ref('')
 
-async function submit() {
+// The demo account is opt-in on the server (`DEMO_LOGIN=1`) and described by
+// /api/auth/config, so no credentials are baked into the JS bundle.
+const demo = ref(null)
+const warnings = ref([])
+
+const busy = computed(() => loading.value || demoLoading.value)
+
+onMounted(async () => {
+  try {
+    const data = await api.config()
+    demo.value = data?.data?.demo ?? null
+    warnings.value = data?.data?.warnings ?? []
+  } catch {
+    // The login form still works without this; it only hides the demo shortcut.
+  }
+})
+
+async function signIn(email, password) {
   error.value = ''
-  loading.value = true
 
   try {
-    await auth.login(form.email.trim(), form.password)
+    await auth.login(email, password)
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : null
     router.push(redirect || { name: 'home' })
   } catch (e) {
     error.value = e.message
+  }
+}
+
+async function submit() {
+  loading.value = true
+  try {
+    await signIn(form.email.trim(), form.password)
   } finally {
     loading.value = false
+  }
+}
+
+async function demoSignIn() {
+  if (!demo.value) return
+
+  demoLoading.value = true
+  try {
+    await signIn(demo.value.email, demo.value.password)
+  } finally {
+    demoLoading.value = false
   }
 }
 </script>
@@ -83,7 +119,8 @@ async function submit() {
                 type="email"
                 autocomplete="username"
                 required
-              />            </label>
+              />
+            </label>
 
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-ink-soft">Пароль</span>
@@ -99,16 +136,37 @@ async function submit() {
               {{ error }}
             </p>
 
-            <button type="submit" :disabled="loading" class="btn-primary w-full py-2.5 text-sm">
+            <p
+              v-for="warning in warnings"
+              :key="warning"
+              class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {{ warning }}
+            </p>
+
+            <button type="submit" :disabled="busy" class="btn-primary w-full py-2.5 text-sm">
               <AppSpinner v-if="loading" size="xs" />
               {{ loading ? 'Входим…' : 'Войти' }}
             </button>
           </form>
 
-          <p class="mt-6 rounded-xl border border-line bg-surface-2 px-3 py-2.5 text-xs text-ink-mute">
-            Демо-доступ <span class="font-medium text-ink">admin@l.loc</span> /
-            <span class="font-medium text-ink">123456</span>
-          </p>
+          <template v-if="demo">
+            <div class="mt-6 flex items-center gap-3">
+              <span class="h-px flex-1 bg-line" />
+              <span class="text-[11px] uppercase tracking-wide text-ink-mute">или</span>
+              <span class="h-px flex-1 bg-line" />
+            </div>
+
+            <button type="button" :disabled="busy" class="btn mt-4 w-full py-2.5 text-sm" @click="demoSignIn">
+              <AppSpinner v-if="demoLoading" size="xs" />
+              {{ demoLoading ? 'Открываем демо…' : 'Войти в демо-кабинет' }}
+            </button>
+
+            <p class="mt-3 text-center text-xs text-ink-mute">
+              Демо-доступ: <span class="font-medium text-ink">{{ demo.email }}</span> /
+              <span class="font-medium text-ink">{{ demo.password }}</span>
+            </p>
+          </template>
         </div>
       </div>
     </section>

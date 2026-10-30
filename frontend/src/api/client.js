@@ -71,6 +71,7 @@ function query(params) {
 
 export const api = {
   login: (email, password) => request('/api/auth/login', { method: 'POST', body: { email, password } }),
+  config: () => request('/api/auth/config'),
   wsTicket: () => request('/api/ws/ticket', { method: 'POST' }),
   me: () => request('/api/auth/me'),
   rooms: () => request('/api/rooms'),
