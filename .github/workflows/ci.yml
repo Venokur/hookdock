@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # `master` is this repository's branch; `main` is included because a rename or a
+  # fork should not silently stop running the suite.
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
 
 # One run per branch: a force-push makes the previous run pointless, and the
