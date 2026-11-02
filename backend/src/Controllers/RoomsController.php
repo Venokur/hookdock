@@ -80,6 +80,7 @@ final class RoomsController
         $stmt = Database::pdo()->prepare(
             "SELECT r.id, r.name, r.slug, r.endpoint, r.created_at, r.updated_at,
                     (r.secret IS NOT NULL) AS has_secret,
+                    r.dedup_header, r.require_timestamp,
                     COALESCE(req.total, 0)::int AS requests_total,
                     COALESCE(req.last_24h, 0)::int AS requests_last_24h,
                     req.last_received_at,
@@ -87,7 +88,8 @@ final class RoomsController
                     COALESCE(wf.total, 0)::int AS workflows_total,
                     COALESCE(fail.total, 0)::int AS failed_runs_24h
              FROM (
-                 SELECT id, name, slug, endpoint, created_at, updated_at, secret
+                 SELECT id, name, slug, endpoint, created_at, updated_at, secret,
+                        dedup_header, require_timestamp
                    FROM rooms r" . $clause . "
                   ORDER BY " . $order . "
                   LIMIT " . $limit . "
@@ -173,8 +175,11 @@ final class RoomsController
         $withSecret = filter_var($payload['require_signature'] ?? false, FILTER_VALIDATE_BOOLEAN);
         $secret = $withSecret ? Signature::generate() : null;
 
+        $dedupHeader = $this->validDedupHeader($payload['dedup_header'] ?? null);
+        $requireTimestamp = filter_var($payload['require_timestamp'] ?? false, FILTER_VALIDATE_BOOLEAN);
+
         try {
-            $row = $this->insert($name, $slug, $endpoint, $secret);
+            $row = $this->insert($name, $slug, $endpoint, $secret, $dedupHeader, $requireTimestamp);
         } catch (\PDOException $e) {
             if ($e->getCode() === '23505') {
                 Response::error(self::SLUG_TAKEN, 422);
@@ -228,15 +233,39 @@ final class RoomsController
             $endpoint = $this->validEndpoint((string) $payload['endpoint']);
         }
 
+        // Delivery settings follow the same convention: an omitted key keeps the
+        // current value, so the SPA's "rename" form does not silently turn
+        // deduplication off. `dedup_header: ""` is the explicit "off".
+        $dedupHeader = $existing['dedup_header'];
+        if (array_key_exists('dedup_header', $payload)) {
+            $dedupHeader = $this->validDedupHeader($payload['dedup_header']);
+        }
+
+        $requireTimestamp = (bool) $existing['require_timestamp'];
+        if (array_key_exists('require_timestamp', $payload)) {
+            $requireTimestamp = filter_var($payload['require_timestamp'], FILTER_VALIDATE_BOOLEAN);
+        }
+
         $stmt = Database::pdo()->prepare(
-            'UPDATE rooms SET name = :name, slug = :slug, endpoint = :endpoint, updated_at = now()
-             WHERE id = :id
-             RETURNING id, name, slug, endpoint, created_at, updated_at,
-                       (secret IS NOT NULL) AS has_secret'
+            'UPDATE rooms
+                SET name = :name, slug = :slug, endpoint = :endpoint,
+                    dedup_header = :dedup_header, require_timestamp = :require_timestamp,
+                    updated_at = now()
+              WHERE id = :id
+              RETURNING id, name, slug, endpoint, created_at, updated_at,
+                        (secret IS NOT NULL) AS has_secret,
+                        dedup_header, require_timestamp'
         );
 
         try {
-            $stmt->execute(['id' => $id, 'name' => $name, 'slug' => $slug, 'endpoint' => $endpoint]);
+            $stmt->execute([
+                'id' => $id,
+                'name' => $name,
+                'slug' => $slug,
+                'endpoint' => $endpoint,
+                'dedup_header' => $dedupHeader,
+                'require_timestamp' => $requireTimestamp ? 'true' : 'false',
+            ]);
         } catch (\PDOException $e) {
             // The unique index can still win a race against the check above.
             if ($e->getCode() === '23505') {
@@ -337,7 +366,8 @@ final class RoomsController
 
         $stmt = Database::pdo()->prepare(
             'SELECT id, name, slug, endpoint, created_at, updated_at,
-                    (secret IS NOT NULL) AS has_secret
+                    (secret IS NOT NULL) AS has_secret,
+                    dedup_header, require_timestamp
                FROM rooms WHERE id = :id'
         );
         $stmt->execute(['id' => $id]);
@@ -416,14 +446,26 @@ final class RoomsController
     /**
      * @return array<string, mixed>
      */
-    private function insert(string $name, string $slug, string $endpoint, ?string $secret = null): array
-    {
+    private function insert(
+        string $name,
+        string $slug,
+        string $endpoint,
+        ?string $secret = null,
+        ?string $dedupHeader = null,
+        bool $requireTimestamp = false,
+    ): array {
         // Two statements instead of one with `CASE WHEN :secret IS NULL`: native
         // prepared statements make Postgres infer the parameter type, and a bare
         // `:secret IS NULL` fails with "could not determine data type".
-        $columns = 'name, slug, endpoint';
-        $values = ':name, :slug, :endpoint';
-        $params = ['name' => $name, 'slug' => $slug, 'endpoint' => $endpoint];
+        $columns = 'name, slug, endpoint, dedup_header, require_timestamp';
+        $values = ':name, :slug, :endpoint, :dedup_header, :require_timestamp';
+        $params = [
+            'name' => $name,
+            'slug' => $slug,
+            'endpoint' => $endpoint,
+            'dedup_header' => $dedupHeader,
+            'require_timestamp' => $requireTimestamp ? 'true' : 'false',
+        ];
 
         if ($secret !== null) {
             $columns .= ', secret, secret_set_at';
@@ -434,11 +476,35 @@ final class RoomsController
         $stmt = Database::pdo()->prepare(
             'INSERT INTO rooms (' . $columns . ') VALUES (' . $values . ')
              RETURNING id, name, slug, endpoint, created_at, updated_at,
-                       (secret IS NOT NULL) AS has_secret'
+                       (secret IS NOT NULL) AS has_secret,
+                       dedup_header, require_timestamp'
         );
         $stmt->execute($params);
 
         return $stmt->fetch();
+    }
+
+    /**
+     * A header name, or null for "deduplication off".
+     *
+     * The value is read back from the incoming request with the same name, so it
+     * has to be a legal HTTP field name: anything else would make the setting
+     * silently never match.
+     *
+     * @param mixed $value
+     */
+    private function validDedupHeader(mixed $value): ?string
+    {
+        $header = trim((string) ($value ?? ''));
+        if ($header === '') {
+            return null;
+        }
+
+        if (preg_match('/^[A-Za-z0-9!#$%&\'*+.^_`|~-]{1,64}$/', $header) !== 1) {
+            Response::error('Заголовок дедупликации: латинские буквы, цифры и дефис, до 64 символов', 422);
+        }
+
+        return $header;
     }
 
     private function assertSlugFree(string $slug, ?int $ignoreId = null): void

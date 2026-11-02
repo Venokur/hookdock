@@ -16,7 +16,9 @@ info:
       which is what the UI shows.
     * **The catcher** (`/hook/...` and `/api/webhook/...`) — public by design. A
       room with an HMAC secret only accepts requests carrying
-      `X-Hookdock-Signature`.
+      `X-Hookdock-Signature`, optionally bound to a `X-Hookdock-Timestamp` so a
+      captured request cannot be replayed. A room can also deduplicate deliveries
+      by one header, so a retried event runs the room's rules once.
 
     Scopes: a login token carries `scope: api` and may do anything; a token from
     `POST /api/auth/read-token` carries `scope: read` and is refused with `403` on
@@ -345,6 +347,16 @@ paths:
                 require_signature:
                   type: boolean
                   default: false
+                dedup_header:
+                  type: string
+                  nullable: true
+                  maxLength: 64
+                  description: Optional delivery-id header; empty or omitted means off.
+                  example: X-GitHub-Delivery
+                require_timestamp:
+                  type: boolean
+                  default: false
+                  description: Require `X-Hookdock-Timestamp`; meaningful only with a secret.
       responses:
         '201':
           description: Created. `secret` is present only when a signature was requested.
@@ -395,6 +407,9 @@ paths:
         The slug changes **only** when sent explicitly, because external
         integrations already use the address; an explicitly empty value asks for a
         fresh random one. An omitted `endpoint` keeps the current value.
+
+        `dedup_header` and `require_timestamp` follow the same rule: omitted keeps
+        the stored value, `dedup_header: ""` turns deduplication off.
       requestBody:
         required: true
         content:
@@ -408,6 +423,12 @@ paths:
                   type: string
                 endpoint:
                   type: string
+                dedup_header:
+                  type: string
+                  nullable: true
+                  maxLength: 64
+                require_timestamp:
+                  type: boolean
       responses:
         '200':
           description: Updated.
@@ -1285,6 +1306,20 @@ paths:
         the digest is `HMAC-SHA256(raw_body, secret)`. The check happens **before**
         the `INSERT`, so a forged request is neither stored nor queued. A bare hex
         digest without the prefix is accepted too, because some senders strip it.
+
+        With `require_timestamp`, the room also requires
+        `X-Hookdock-Timestamp: <unix seconds>` and the digest covers
+        `"<ts>.<raw_body>"`; a timestamp outside `SIGNATURE_TOLERANCE_SECONDS`
+        (300 by default) is refused with `401`. When the timestamp header is
+        present but the room does not require it, the timestamped form is used
+        anyway — a body-only signature next to a timestamp would make the
+        timestamp decorative.
+
+        With `dedup_header` set, the header's value is the delivery id. The first
+        delivery stores it; a repeat is stored with `duplicate_of` and answered
+        with `202 {duplicate: true, queued: 0}`, so the sender sees success and no
+        action runs twice. A missing header is not an error — the delivery is
+        handled like any other.
       security: []
       parameters:
         - $ref: '#/components/parameters/RoomSlugPath'
@@ -1301,6 +1336,15 @@ paths:
           schema:
             type: string
             example: sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+        - name: X-Hookdock-Timestamp
+          in: header
+          required: false
+          description: |
+            Unix seconds. Required when the room sets `require_timestamp`; the
+            signature then covers `"<timestamp>.<body>"`.
+          schema:
+            type: string
+            example: '1735689600'
       requestBody:
         required: false
         content:
@@ -1341,10 +1385,23 @@ paths:
                     format: date-time
                   queued:
                     type: integer
-                    description: How many rule runs were queued.
+                    description: How many rule runs were queued. `0` for a duplicate.
                     example: 2
+                  duplicate:
+                    type: boolean
+                    description: |
+                      `true` when the delivery repeated a known `dedup_header`
+                      value. The row is stored, nothing is queued, and the answer
+                      is still `202` — a different status would make the sender
+                      retry the delivery it was told to stop sending.
+                  duplicate_of:
+                    type: integer
+                    nullable: true
+                    description: The original request id for a duplicate, otherwise `null`.
         '401':
-          description: The room requires a signature and none (or a wrong one) was sent.
+          description: |
+            The room requires a signature and none (or a wrong one) was sent, or
+            the timestamp is missing/stale where the room requires one.
           content:
             application/json:
               schema:
@@ -1590,6 +1647,19 @@ components:
         has_secret:
           type: boolean
           description: Whether the room requires an HMAC signature. The secret itself is never returned.
+        dedup_header:
+          type: string
+          nullable: true
+          description: |
+            Header whose value identifies a delivery (`X-GitHub-Delivery`,
+            `Stripe-Event-Id`, …). `null` means deduplication is off. A repeat of
+            a known value is stored with `duplicate_of` set and is never routed.
+          example: X-GitHub-Delivery
+        require_timestamp:
+          type: boolean
+          description: |
+            Requires `X-Hookdock-Timestamp` and a signature over `"<ts>.<body>"`.
+            Only has an effect together with a secret.
         created_at:
           type: string
           format: date-time
@@ -1647,6 +1717,12 @@ components:
           type: integer
         pending_runs:
           type: integer
+        duplicate_of:
+          type: integer
+          nullable: true
+          description: |
+            Set when this delivery repeated a `dedup_header` value already seen in
+            the room. Such a row is stored for the audit log but never queued.
         body:
           description: Present only with `?include=body`. NULL for a non-JSON payload.
           nullable: true
@@ -1840,6 +1916,20 @@ components:
           type: boolean
           readOnly: true
           description: Present on read when the stored forward carries a secret.
+        sign_timestamp:
+          type: boolean
+          default: false
+          description: |
+            `forward` only. When set, the outgoing signature carries
+            `X-Hookdock-Timestamp` and covers `"<ts>.<body>"`. Off by default: a
+            recipient that verifies a body-only HMAC would reject the new form.
+        timeout:
+          type: integer
+          minimum: 1
+          maximum: 60
+          description: |
+            `forward` only. Seconds for this request. Omitted means the global
+            `FORWARD_TIMEOUT`, which is why the key is not stored as `0`.
         mapping:
           type: object
           additionalProperties:

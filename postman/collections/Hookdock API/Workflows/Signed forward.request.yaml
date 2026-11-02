@@ -21,7 +21,9 @@ body:
           "method": "POST",
           "payload": "body",
           "headers": { "X-Event": "{{ body.event.type }}" },
-          "secret": "shared-hmac-secret"
+          "secret": "shared-hmac-secret",
+          "sign_timestamp": true,
+          "timeout": 15
         }
       ]
     }
@@ -32,9 +34,14 @@ scripts:
       // The secret signs the outgoing body with `X-Hookdock-Signature` and is
       // never echoed back: reads expose `signed: true` instead. An empty `secret`
       // on an edit means "keep it"; removal is `clear_signature: true`.
+      //
+      // `sign_timestamp` and `timeout` are not secrets, so they are returned as
+      // stored: the editor has to show the settings it is about to overwrite.
       pm.test('a signed forward never returns its secret', function () {
         pm.response.to.have.status(201);
         const action = pm.response.json().data.actions[0];
         pm.expect(action.signed).to.eql(true);
         pm.expect(action).to.not.have.property('secret');
+        pm.expect(action.sign_timestamp).to.eql(true);
+        pm.expect(action.timeout).to.eql(15);
       });

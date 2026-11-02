@@ -44,11 +44,75 @@ final class WebhookController
             'ip' => $request->ip,
         ];
 
+        // The unique index on `(room_id, dedup_key)` is the check: no preceding
+        // SELECT, because two deliveries of one event can pass a SELECT at the
+        // same time and both be treated as the first. The conflicting INSERT is
+        // what makes "only one wins" atomic.
+        $dedupKey = $this->dedupKey($request, $room);
+        $duplicateOf = null;
+
+        try {
+            $saved = $this->store($row, $dedupKey, null);
+        } catch (\PDOException $e) {
+            if ($dedupKey === null || $e->getCode() !== '23505') {
+                throw $e;
+            }
+
+            $duplicateOf = $this->findOriginalId($room, $dedupKey);
+
+            // The original can vanish between the conflicting INSERT and this
+            // SELECT (retention pruned it). Storing the delivery beats answering
+            // 202 for a row nobody has.
+            $saved = $this->store($row, null, $duplicateOf);
+        }
+
+        $row['id'] = (int) $saved['id'];
+        $row['received_at'] = $saved['received_at'];
+        $row['duplicate_of'] = $duplicateOf;
+
+        // Realtime first: the list can show the row before routing has started.
+        Realtime::publish('request.created', [
+            'id' => $row['id'],
+            'room_id' => $row['room_id'],
+            'endpoint' => $row['endpoint'],
+            'method' => $row['method'],
+            'duplicate' => $duplicateOf !== null,
+        ]);
+
+        // A repeat is logged but never routed: the first delivery already ran the
+        // room's workflows, and running them again is exactly the double side
+        // effect deduplication exists to prevent.
+        //
+        // Routing itself happens in the `worker` service: the receiver only
+        // records what has to be done, so a slow forward target cannot hold the
+        // sender.
+        $queued = $duplicateOf === null ? WorkflowEngine::enqueue($row) : 0;
+
+        Response::json([
+            'ok' => true,
+            'id' => $row['id'],
+            'room' => $room['slug'],
+            'endpoint' => $row['endpoint'],
+            'received_at' => $row['received_at'],
+            'queued' => $queued,
+            'duplicate' => $duplicateOf !== null,
+            'duplicate_of' => $duplicateOf,
+        ], 202);
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     * @return array{id: mixed, received_at: mixed}
+     */
+    private function store(array $row, ?string $dedupKey, ?int $duplicateOf): array
+    {
         $stmt = Database::pdo()->prepare(
             'INSERT INTO incoming_requests
-                (room_id, endpoint, method, path, query, headers, body, raw_body, content_type, body_bytes, ip)
+                (room_id, endpoint, method, path, query, headers, body, raw_body,
+                 content_type, body_bytes, ip, dedup_key, duplicate_of)
              VALUES
-                (:room_id, :endpoint, :method, :path, :query, :headers, :body, :raw_body, :content_type, :body_bytes, :ip)
+                (:room_id, :endpoint, :method, :path, :query, :headers, :body, :raw_body,
+                 :content_type, :body_bytes, :ip, :dedup_key, :duplicate_of)
              RETURNING id, received_at'
         );
         $stmt->execute([
@@ -63,32 +127,52 @@ final class WebhookController
             'content_type' => $row['content_type'],
             'body_bytes' => $row['body_bytes'],
             'ip' => $row['ip'],
+            'dedup_key' => $dedupKey,
+            'duplicate_of' => $duplicateOf,
         ]);
 
-        $saved = $stmt->fetch();
-        $row['id'] = (int) $saved['id'];
-        $row['received_at'] = $saved['received_at'];
+        return $stmt->fetch();
+    }
 
-        // Realtime first: the list can show the row before routing has started.
-        Realtime::publish('request.created', [
-            'id' => $row['id'],
-            'room_id' => $row['room_id'],
-            'endpoint' => $row['endpoint'],
-            'method' => $row['method'],
-        ]);
+    /**
+     * The delivery id, or null when the room does not deduplicate.
+     *
+     * A configured header that the sender did not send is not an error: the
+     * delivery is stored and routed like any other. Rejecting it would make
+     * turning the setting on a breaking change for every sender that has not
+     * been updated yet.
+     *
+     * @param array<string, mixed> $room
+     */
+    private function dedupKey(Request $request, array $room): ?string
+    {
+        $header = trim((string) ($room['dedup_header'] ?? ''));
+        if ($header === '') {
+            return null;
+        }
 
-        // Routing happens in the `worker` service: the receiver only records what
-        // has to be done, so a slow forward target cannot hold the sender.
-        $queued = WorkflowEngine::enqueue($row);
+        $value = trim((string) $request->header($header));
+        if ($value === '') {
+            return null;
+        }
 
-        Response::json([
-            'ok' => true,
-            'id' => $row['id'],
-            'room' => $room['slug'],
-            'endpoint' => $row['endpoint'],
-            'received_at' => $row['received_at'],
-            'queued' => $queued,
-        ], 202);
+        // The column is VARCHAR(200): truncating here keeps the stored key and
+        // the compared key identical, which is what the unique index relies on.
+        return mb_substr($value, 0, 200);
+    }
+
+    /**
+     * @param array<string, mixed> $room
+     */
+    private function findOriginalId(array $room, string $dedupKey): ?int
+    {
+        $stmt = Database::pdo()->prepare(
+            'SELECT id FROM incoming_requests WHERE room_id = :room_id AND dedup_key = :dedup_key'
+        );
+        $stmt->execute(['room_id' => $room['id'], 'dedup_key' => $dedupKey]);
+        $id = $stmt->fetchColumn();
+
+        return $id === false ? null : (int) $id;
     }
 
     /**
@@ -129,6 +213,10 @@ final class WebhookController
      * the log and never queues a workflow. A room without a secret stays public:
      * the catcher is meant to be reachable from any sender.
      *
+     * `require_timestamp` only has an effect together with a secret — there is
+     * nothing to verify without one, and a room that has the flag but no secret
+     * stays public rather than rejecting every delivery.
+     *
      * @param array<string, mixed> $room
      */
     private function verifySignature(Request $request, array $room): void
@@ -138,16 +226,29 @@ final class WebhookController
             return;
         }
 
-        if (Signature::verify($request->header(Signature::HEADER), $request->rawBody, $secret)) {
+        $requireTimestamp = (bool) ($room['require_timestamp'] ?? false);
+
+        if (Signature::verify(
+            $request->header(Signature::HEADER),
+            $request->rawBody,
+            $secret,
+            $request->header(Signature::TIMESTAMP_HEADER),
+            $requireTimestamp,
+        )) {
             return;
         }
 
         header('WWW-Authenticate: Signature realm="hookdock"');
 
-        Response::error(
-            'Неверная подпись вебхука: проверьте секрет комнаты и заголовок ' . Signature::HEADER,
-            401,
-        );
+        $message = 'Неверная подпись вебхука: проверьте секрет комнаты и заголовок ' . Signature::HEADER;
+
+        if ($requireTimestamp) {
+            $message .= '. Комната требует ' . Signature::TIMESTAMP_HEADER
+                . ' (unix-время), подпись считается по "<timestamp>.<тело>" и окно '
+                . Signature::tolerance() . ' с';
+        }
+
+        Response::error($message, 401);
     }
 
     /**

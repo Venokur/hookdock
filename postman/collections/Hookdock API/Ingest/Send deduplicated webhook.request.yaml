@@ -1,0 +1,33 @@
+$kind: http-request
+name: Send deduplicated webhook
+method: POST
+url: '{{base_url}}/hook/{{room_slug}}/postman'
+order: 7000
+auth:
+  type: noauth
+headers:
+  - key: Content-Type
+    value: application/json
+  - key: X-Postman-Delivery
+    value: postman-dedup-1
+body:
+  type: json
+  content: |-
+    {
+      "event": { "type": "payment", "amount": 42 },
+      "delivery": "first"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The room was created with `dedup_header: X-Postman-Delivery`, so this
+      // value becomes the delivery id. The first delivery is a normal one: it is
+      // stored, routed, and `duplicate` is false.
+      pm.test('the first delivery of a dedup key is routed normally', function () {
+        pm.response.to.have.status(202);
+        const body = pm.response.json();
+        pm.expect(body.duplicate).to.eql(false);
+        pm.expect(body.duplicate_of).to.be.null;
+        pm.collectionVariables.set('dedup_request_id', String(body.id));
+      });

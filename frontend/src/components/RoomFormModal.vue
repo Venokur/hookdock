@@ -23,6 +23,11 @@ const form = reactive({
   // New room only: the signature is part of the same INSERT, so the room never
   // exists for a moment in a state the operator did not ask for.
   requireSignature: false,
+  // Idempotent delivery. The header is the sender's own delivery id; empty means
+  // "off", which is the default so an upgrade cannot silently drop repeats.
+  dedupHeader: props.room?.dedup_header ?? '',
+  // Only meaningful together with a secret: there is nothing to sign otherwise.
+  requireTimestamp: Boolean(props.room?.require_timestamp),
 })
 const saving = ref(false)
 const error = ref('')
@@ -41,6 +46,14 @@ const secretError = ref('')
 const createdSecret = computed(() => !isEdit.value && secret.value !== '')
 
 const isEdit = computed(() => Boolean(props.room))
+
+/**
+ * Whether the room will verify signatures after this form is saved: an existing
+ * room by its issued secret, a new one by the checkbox that issues it in the same
+ * INSERT. The timestamp requirement is meaningless without it, and the hint has
+ * to say so instead of letting the operator enable a setting that does nothing.
+ */
+const willSign = computed(() => (isEdit.value ? hasSecret.value : form.requireSignature))
 
 /**
  * The slug is part of the webhook URL and is random, not derived from the room
@@ -190,7 +203,12 @@ async function submit() {
   try {
     // The slug is sent only for a new room: an edit must not silently change an
     // address integrations already use, so the server keeps the current one.
-    const payload = { name: form.name.trim(), endpoint }
+    const payload = {
+      name: form.name.trim(),
+      endpoint,
+      dedup_header: form.dedupHeader.trim(),
+      require_timestamp: form.requireTimestamp,
+    }
     if (!isEdit.value) {
       payload.slug = slug
       // The signature is issued inside the same INSERT. Enabling it afterwards
@@ -340,6 +358,45 @@ function close() {
                 >
                   Сгенерировать
                 </button>
+              </div>
+            </div>
+
+            <!-- Delivery settings: idempotency and the signed-timestamp requirement.
+                 Both are opt-in, so an existing room keeps accepting exactly the
+                 requests it accepts today until the operator turns them on. -->
+            <div class="rounded-xl border border-line bg-surface-2 p-3">
+              <p class="text-xs font-medium text-ink-soft">Доставка</p>
+
+              <label class="mt-2 block">
+                <span class="mb-1.5 block text-[11px] text-ink-mute">Заголовок дедупликации</span>
+                <AppInput
+                  v-model="form.dedupHeader"
+                  placeholder="X-GitHub-Delivery"
+                  class="font-mono"
+                  aria-label="Заголовок дедупликации"
+                />
+              </label>
+              <p class="mt-1 text-[11px] text-ink-mute">
+                Значение этого заголовка считается идентификатором доставки. Повтор с тем же
+                значением сохраняется в логе, но не запускает сценарии второй раз. Пусто — выключено.
+              </p>
+
+              <div class="mt-3">
+                <AppCheckbox
+                  v-model="form.requireTimestamp"
+                  label="Требовать X-Hookdock-Timestamp"
+                  description="Подпись считается по «timestamp.тело», запрос со старым timestamp отклоняется."
+                />
+                <p class="mt-1 text-[11px] text-ink-mute">
+                  <template v-if="willSign">
+                    Окно допуска — 5 минут. Заголовок обязателен, иначе запрос получит
+                    <code class="font-mono">401</code>.
+                  </template>
+                  <template v-else>
+                    Работает только вместе с подписью: у комнаты без секрета проверять нечего,
+                    и флаг будет проигнорирован.
+                  </template>
+                </p>
               </div>
             </div>
 

@@ -1,0 +1,29 @@
+$kind: http-request
+name: Update room delivery settings
+method: PUT
+url: '{{base_url}}/api/rooms/{{room_id}}'
+order: 2500
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "Postman room",
+      "require_timestamp": false
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `dedup_header` is omitted on purpose. An omitted key keeps the stored
+      // value, exactly like `endpoint`: the SPA's rename form must not silently
+      // turn deduplication off. `require_timestamp` is sent explicitly to prove
+      // the two conventions coexist.
+      pm.test('an omitted dedup_header is kept, not cleared', function () {
+        pm.response.to.have.status(200);
+        const room = pm.response.json().data;
+        pm.expect(room.dedup_header).to.eql('X-Postman-Delivery');
+        pm.expect(room.require_timestamp).to.eql(false);
+      });

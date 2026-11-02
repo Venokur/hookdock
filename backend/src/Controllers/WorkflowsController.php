@@ -622,7 +622,18 @@ final class WorkflowsController
                     $secret = '';
                 }
 
-                $normalizedActions[] = [
+                // An action-level timeout, in seconds. Absent means "use
+                // FORWARD_TIMEOUT", which is why the key is omitted rather than
+                // stored as 0: 0 would have to be special-cased in two places.
+                $timeout = null;
+                if (array_key_exists('timeout', $action) && $action['timeout'] !== null && $action['timeout'] !== '') {
+                    $timeout = (int) $action['timeout'];
+                    if ($timeout < 1 || $timeout > 60) {
+                        Response::error('Таймаут пересылки: от 1 до 60 секунд', 422);
+                    }
+                }
+
+                $forward = [
                     'type' => 'forward',
                     'url' => $url,
                     'method' => $method,
@@ -630,6 +641,18 @@ final class WorkflowsController
                     'headers' => $headers,
                     'secret' => $secret,
                 ];
+
+                if ($timeout !== null) {
+                    $forward['timeout'] = $timeout;
+                }
+
+                // Opt-in, because a recipient that verifies a body-only HMAC
+                // rejects the `"<ts>.<body>"` form this flag produces.
+                if (self::isTrue($action['sign_timestamp'] ?? false)) {
+                    $forward['sign_timestamp'] = true;
+                }
+
+                $normalizedActions[] = $forward;
                 continue;
             }
 

@@ -386,9 +386,20 @@ final class WorkflowEngine
                 }
 
                 if ((string) ($action['secret'] ?? '') !== '') {
-                    $headers[Signature::HEADER] = Signature::sign($body, (string) $action['secret']) . ' (не показан полностью)';
+                    [$signedAt, $signature] = Signature::outgoing(
+                        $body,
+                        (string) $action['secret'],
+                        self::isTrue($action['sign_timestamp'] ?? false),
+                    );
+
+                    if ($signedAt !== null) {
+                        $headers[Signature::TIMESTAMP_HEADER] = $signedAt;
+                    }
+
+                    $headers[Signature::HEADER] = $signature . ' (не показан полностью)';
                 }
 
+                $timeout = self::actionTimeout($action);
                 $guard = $url === '' ? ['allowed' => false, 'reason' => 'пустой URL'] : UrlGuard::check($url);
 
                 $steps[] = $step + [
@@ -396,6 +407,7 @@ final class WorkflowEngine
                     'method' => $method,
                     'headers' => $headers,
                     'body' => $body,
+                    'timeout' => $timeout,
                     'allowed' => (bool) ($guard['allowed'] ?? false),
                     'reason' => $guard['reason'] ?? null,
                 ];
@@ -806,12 +818,34 @@ final class WorkflowEngine
                     // the body actually sent, so it cannot be replayed with a
                     // different payload. The secret lives in the action, not in the
                     // run log.
+                    //
+                    // `sign_timestamp` is opt-in and off by default: a recipient
+                    // that verifies a body-only HMAC would reject the `"<ts>.<body>"`
+                    // form, so turning it on for every forward would break existing
+                    // integrations the day this version ships.
                     $secret = (string) ($action['secret'] ?? '');
                     if ($secret !== '') {
-                        $headers[Signature::HEADER] = Signature::sign($body, $secret);
+                        [$signedAt, $signature] = Signature::outgoing(
+                            $body,
+                            $secret,
+                            self::isTrue($action['sign_timestamp'] ?? false),
+                        );
+
+                        if ($signedAt !== null) {
+                            $headers[Signature::TIMESTAMP_HEADER] = $signedAt;
+                        }
+
+                        $headers[Signature::HEADER] = $signature;
                     }
 
-                    $result = HttpClient::send($method, $url, $headers, $body, $guard['addresses']);
+                    $result = HttpClient::send(
+                        $method,
+                        $url,
+                        $headers,
+                        $body,
+                        $guard['addresses'],
+                        self::actionTimeout($action),
+                    );
 
                     if (!$result['ok']) {
                         $failed = true;
@@ -995,5 +1029,26 @@ final class WorkflowEngine
         }
 
         return in_array($value, [1, '1', 't', 'true'], true);
+    }
+
+    /**
+     * Per-action forward timeout, or null for the global `FORWARD_TIMEOUT`.
+     *
+     * Kept as a helper because the preview and the worker must agree: a preview
+     * that reports one number and a worker that uses another is worse than no
+     * preview at all.
+     *
+     * @param array<string, mixed> $action
+     */
+    private static function actionTimeout(array $action): ?int
+    {
+        $value = $action['timeout'] ?? null;
+        if (!is_numeric($value)) {
+            return null;
+        }
+
+        $seconds = (int) $value;
+
+        return $seconds >= 1 ? min(60, $seconds) : null;
     }
 }

@@ -32,11 +32,16 @@ function blankAction(type = 'forward') {
     message: '',
     mappingText: '{\n  "email": "body.user.email"\n}',
     seconds: 5,
+    // 0 = "use the global FORWARD_TIMEOUT". Sent as no `timeout` key at all, so
+    // the API does not have to special-case a zero.
+    timeout: 0,
     // The stored secret is never sent back by the API — only `signed: true`.
     // Typing into the field replaces it; `clearSignature` removes it.
     secret: '',
     signed: false,
     clearSignature: false,
+    // Opt-in: a recipient that verifies a body-only HMAC rejects `"<ts>.<body>"`.
+    signTimestamp: false,
   }
 }
 
@@ -106,7 +111,9 @@ function toForm(workflow) {
         mappingText:
           action.type === 'transform' ? JSON.stringify(action.mapping ?? {}, null, 2) : base.mappingText,
         seconds: Number(action.seconds ?? base.seconds),
+        timeout: Number(action.timeout ?? 0),
         signed: Boolean(action.signed),
+        signTimestamp: Boolean(action.sign_timestamp),
       }
     }),
   }
@@ -312,6 +319,17 @@ function buildPayload() {
       }
       if (action.clearSignature) {
         body.clear_signature = true
+      }
+
+      // 0/empty means "use FORWARD_TIMEOUT": the key is omitted rather than sent
+      // as 0, so the API stores no timeout instead of a value it has to ignore.
+      const timeout = Math.round(Number(action.timeout) || 0)
+      if (timeout >= 1) {
+        body.timeout = Math.min(60, timeout)
+      }
+
+      if (action.signTimestamp) {
+        body.sign_timestamp = true
       }
 
       actions.push(body)
@@ -551,6 +569,25 @@ async function check() {
                   <AppSelect v-model="action.payload" :options="payloadOptions" size="sm" />
                 </div>
 
+                <label class="block">
+                  <span class="mb-1.5 block text-[11px] text-ink-mute">
+                    Таймаут, секунд (пусто — как у сервера)
+                  </span>
+                  <AppInput
+                    v-model.number="action.timeout"
+                    size="sm"
+                    type="number"
+                    min="0"
+                    max="60"
+                    placeholder="8"
+                    aria-label="Таймаут пересылки"
+                  />
+                </label>
+                <p class="text-[11px] text-ink-mute">
+                  От 1 до 60 секунд. Пустое поле — общий таймаут сервера. Долгий таймаут держит
+                  очередь, поэтому он ограничен.
+                </p>
+
                 <AppTextarea
                   v-if="action.payload === 'custom'"
                   v-model="action.payloadText"
@@ -620,6 +657,19 @@ async function check() {
                     :placeholder="action.signed ? 'оставьте пустым, чтобы сохранить' : 'секрет получателя'"
                     :disabled="action.clearSignature"
                   />
+
+                  <div class="mt-2">
+                    <AppCheckbox
+                      v-model="action.signTimestamp"
+                      label="Подписывать с timestamp"
+                      description="X-Hookdock-Timestamp и подпись по «timestamp.тело»."
+                      :disabled="action.clearSignature || (!action.signed && action.secret === '')"
+                    />
+                    <p class="mt-1 text-[11px] text-ink-mute">
+                      Включайте, только если получатель умеет проверять такую подпись: проверка
+                      «HMAC только тела» ответит отказом.
+                    </p>
+                  </div>
                 </div>
 
                 <p class="text-[11px] text-ink-mute">
@@ -754,6 +804,7 @@ async function check() {
 
               <template v-else-if="step.type === 'forward'">
                 <p class="mt-1 font-mono text-ink-mute break-all">{{ step.method }} {{ step.url }}</p>
+                <p v-if="step.timeout" class="mt-1 text-ink-mute">таймаут {{ step.timeout }} с</p>
                 <p
                   v-if="!step.allowed"
                   class="mt-1 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-600 dark:text-rose-300"

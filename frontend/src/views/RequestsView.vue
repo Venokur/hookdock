@@ -909,6 +909,11 @@ onUnmounted(() => {
                   {{ formatBytes(row.body_bytes) }}
                 </td>
                 <td class="whitespace-nowrap px-4 py-3 text-xs">
+                  <span
+                    v-if="row.duplicate_of"
+                    class="mr-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
+                    :title="`Повтор доставки #${row.duplicate_of}: сценарии не запускались`"
+                  >повтор</span>
                   <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
                   <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
                   <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>
@@ -938,6 +943,10 @@ onUnmounted(() => {
               </p>
 
               <p class="mt-1 text-[11px]">
+                <span
+                  v-if="row.duplicate_of"
+                  class="mr-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
+                >повтор</span>
                 <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
                 <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
                 <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>

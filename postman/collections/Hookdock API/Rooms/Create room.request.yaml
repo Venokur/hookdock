@@ -11,7 +11,8 @@ body:
   content: |-
     {
       "name": "Postman room",
-      "require_signature": false
+      "require_signature": false,
+      "dedup_header": "X-Postman-Delivery"
     }
 scripts:
   - type: afterResponse
@@ -19,12 +20,16 @@ scripts:
     code: |-
       // The slug and endpoint are generated when omitted; nothing about the name
       // determines the address, so renaming a room never breaks a webhook URL.
+      // `dedup_header` is stored as sent: it is the sender's own delivery id
+      // header, and the catcher reads it back by that exact name.
       pm.test('a room is created with a generated address', function () {
         pm.response.to.have.status(201);
         const room = pm.response.json().data;
         pm.expect(room.slug).to.be.a('string').and.not.empty;
         pm.expect(room.endpoint).to.match(/^hook-/);
         pm.expect(room.secret).to.be.undefined;
+        pm.expect(room.dedup_header).to.eql('X-Postman-Delivery');
+        pm.expect(room.require_timestamp).to.eql(false);
       });
   - type: afterResponse
     language: text/javascript

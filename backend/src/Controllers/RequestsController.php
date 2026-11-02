@@ -46,6 +46,7 @@ final class RequestsController
         $total = (int) $countStmt->fetchColumn();
 
         $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
+                       r.duplicate_of,
                        COALESCE(stats.runs, 0)::int AS run_count,
                        COALESCE(stats.failed, 0)::int AS failed_runs,
                        COALESCE(stats.pending, 0)::int AS pending_runs" . $extraColumns . "

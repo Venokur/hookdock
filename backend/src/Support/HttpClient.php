@@ -22,11 +22,22 @@ final class HttpClient
      *
      * @param array<string, string> $headers
      * @param list<string> $addresses
+     * @param int|null $timeout seconds for one action; null keeps `FORWARD_TIMEOUT`
      * @return array{ok: bool, status: int, error: ?string, body: string, duration_ms: int}
      */
-    public static function send(string $method, string $url, array $headers, string $body, array $addresses = []): array
-    {
-        $timeout = max(1, Config::int('FORWARD_TIMEOUT', 8));
+    public static function send(
+        string $method,
+        string $url,
+        array $headers,
+        string $body,
+        array $addresses = [],
+        ?int $timeout = null,
+    ): array {
+        // The per-action value is clamped, not trusted: the worker would otherwise
+        // hold a queue slot for as long as an action asked it to.
+        $timeout = $timeout !== null && $timeout > 0
+            ? min(60, $timeout)
+            : max(1, Config::int('FORWARD_TIMEOUT', 8));
 
         $headerLines = [];
         foreach ($headers as $name => $value) {

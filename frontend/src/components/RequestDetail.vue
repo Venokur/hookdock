@@ -115,16 +115,26 @@ const curl = computed(() => {
   return lines.join(' \\\n  ')
 })
 
-const metaRows = computed(() => [
-  ['ID', `#${props.request.id}`],
-  ['Эндпоинт', props.request.endpoint],
-  ['Метод', props.request.method],
-  ['Путь', props.request.path],
-  ['IP-адрес', props.request.ip],
-  ['Content-Type', props.request.content_type || '—'],
-  ['Размер тела', formatBytes(props.request.body_bytes)],
-  ['Получен', formatTime(props.request.received_at)],
-])
+const metaRows = computed(() => {
+  const rows = [
+    ['ID', `#${props.request.id}`],
+    ['Эндпоинт', props.request.endpoint],
+    ['Метод', props.request.method],
+    ['Путь', props.request.path],
+    ['IP-адрес', props.request.ip],
+    ['Content-Type', props.request.content_type || '—'],
+    ['Размер тела', formatBytes(props.request.body_bytes)],
+    ['Получен', formatTime(props.request.received_at)],
+  ]
+
+  // A repeat is stored (so the log shows that the sender retried) but was never
+  // routed. Naming the original is the only way to tell the two apart later.
+  if (props.request.duplicate_of) {
+    rows.push(['Повтор доставки', `#${props.request.duplicate_of} — сценарии не запускались`])
+  }
+
+  return rows
+})
 
 function queryString(query) {
   if (!query || typeof query !== 'object') {
@@ -160,6 +170,11 @@ async function copyCurl() {
           <div class="flex items-center gap-2">
             <MethodBadge :method="request.method" />
             <span class="text-xs text-ink-mute">#{{ request.id }}</span>
+            <span
+              v-if="request.duplicate_of"
+              class="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
+              :title="`Повтор доставки #${request.duplicate_of}`"
+            >повтор</span>
           </div>
           <p class="mt-2 break-all font-mono text-sm text-ink">{{ request.path }}</p>
           <p class="mt-1 text-xs text-ink-mute">
@@ -269,6 +284,7 @@ async function copyCurl() {
 
               <template v-else-if="step.type === 'forward'">
                 <p class="mt-1 break-all font-mono text-ink-mute">{{ step.method }} {{ step.url }}</p>
+                <p v-if="step.timeout" class="mt-1 text-ink-mute">таймаут {{ step.timeout }} с</p>
                 <p
                   v-if="!step.allowed"
                   class="mt-1 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-600 dark:text-rose-300"

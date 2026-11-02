@@ -1,0 +1,42 @@
+$kind: http-request
+name: Send duplicate webhook
+method: POST
+url: '{{base_url}}/hook/{{room_slug}}/postman'
+order: 7100
+auth:
+  type: noauth
+headers:
+  - key: Content-Type
+    value: application/json
+  - key: X-Postman-Delivery
+    value: postman-dedup-1
+body:
+  type: json
+  content: |-
+    {
+      "event": { "type": "payment", "amount": 42 },
+      "delivery": "second"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Same delivery id as the previous request: the catcher must recognise the
+      // repeat. Without the first request there is nothing to compare against,
+      // so the assertion would pass for the wrong reason.
+      if (!pm.collectionVariables.get('dedup_request_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A repeat is stored (the log should show that the sender retried) but is
+      // never queued, and the answer stays 202: a 409 would make the sender retry
+      // the delivery it was just told to stop sending.
+      pm.test('a repeated delivery id is stored but not routed', function () {
+        pm.response.to.have.status(202);
+        const body = pm.response.json();
+        pm.expect(body.duplicate).to.eql(true);
+        pm.expect(body.queued).to.eql(0);
+        pm.expect(String(body.duplicate_of)).to.eql(pm.collectionVariables.get('dedup_request_id'));
+      });
