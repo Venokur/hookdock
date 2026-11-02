@@ -1,0 +1,31 @@
+$kind: http-request
+name: Redeliver with edits
+method: POST
+url: '{{base_url}}/api/requests/{{request_id}}/redeliver'
+order: 5500
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "body": {
+        "event": "redelivered",
+        "amount": 99
+      }
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A corrected copy, not a mutation: the original row must stay exactly as the
+      // sender sent it, so the log keeps the evidence and the copy gets its own id.
+      const json = pm.response.json();
+      pm.test('the corrected copy is stored and routed', function () {
+        pm.response.to.have.status(202);
+        pm.expect(json.data.id).to.be.a('number');
+        pm.expect(json.data.replayed_from).to.eql(Number(pm.collectionVariables.get('request_id')));
+        pm.expect(json.data.id).to.not.eql(Number(pm.collectionVariables.get('request_id')));
+      });
+      pm.collectionVariables.set('redelivery_id', String(json.data.id));

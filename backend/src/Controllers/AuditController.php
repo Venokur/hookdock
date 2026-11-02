@@ -34,6 +34,7 @@ final class AuditController
         'workflow.toggled', 'workflow.duplicated', 'workflow.imported',
         'workflow.rolled_back',
         'request.deleted', 'request.replayed', 'run.retried',
+        'request.redelivered', 'request.bulk_deleted', 'request.bulk_replayed',
         'breaker.reset',
         'user.created', 'user.updated', 'user.deleted', 'user.password_changed',
     ];

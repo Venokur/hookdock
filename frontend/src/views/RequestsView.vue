@@ -7,15 +7,20 @@ import RequestDetail from '../components/RequestDetail.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
+import AppCheckbox from '../components/ui/AppCheckbox.vue'
 import { api } from '../api/client'
 import { confirm, notify } from '../composables/dialog'
 import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
 import { useRefresh } from '../composables/useRefresh'
+import { useAuthStore } from '../stores/auth'
 import { useRoomsStore } from '../stores/rooms'
 import { formatBytes, formatClock, formatTime } from '../utils/format'
 
 const route = useRoute()
 const rooms = useRoomsStore()
+// `canWrite` folds the role and the token scope into one flag, so a viewer and a
+// read-only token are both spared a button the API would refuse.
+const auth = useAuthStore()
 
 const slug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
 const room = computed(() => (slug.value ? rooms.find(slug.value) : null))
@@ -51,6 +56,39 @@ const showDetail = ref(false)
 const detailLoading = ref(false)
 const detail = ref(null)
 const runs = ref([])
+
+/**
+ * Selected rows for a bulk action.
+ *
+ * An explicit id list, never "everything that matches the filter": the API takes
+ * ids for the same reason, and the visible page is the only thing the operator
+ * can actually see before clicking. Cleared whenever the list is reloaded for a
+ * different query, because keeping ids that are no longer on screen would let
+ * «Удалить выбранные» act on rows nobody is looking at.
+ */
+const selected = ref([])
+const bulkBusy = ref(false)
+
+const allSelected = computed(() => items.value.length > 0 && selected.value.length === items.value.length)
+const someSelected = computed(() => selected.value.length > 0 && !allSelected.value)
+
+function isSelected(id) {
+  return selected.value.includes(id)
+}
+
+function toggleSelected(id) {
+  selected.value = isSelected(id)
+    ? selected.value.filter((value) => value !== id)
+    : [...selected.value, id]
+}
+
+function toggleAll() {
+  selected.value = allSelected.value ? [] : items.value.map((row) => row.id)
+}
+
+function clearSelection() {
+  selected.value = []
+}
 
 let releaseLive = null
 let offRealtime = null
@@ -308,6 +346,12 @@ async function load({ silent = false } = {}) {
     Object.assign(meta, list.meta)
     stats.value = summary.data
     error.value = ''
+
+    // A selection cannot outlive the rows it was made on: paging, a filter
+    // change or a deletion elsewhere would otherwise leave ids ticked that are
+    // not on screen, and the bulk button would act on the invisible ones.
+    const visible = new Set(items.value.map((row) => row.id))
+    selected.value = selected.value.filter((id) => visible.has(id))
   } catch (e) {
     if (current()) {
       error.value = e.message
@@ -473,10 +517,25 @@ function resetFilterValues() {
   filters.to = ''
 }
 
-watch(slug, () => {
-  suppressFilterReload = hasActiveFilters()
-
+/**
+ * Applies a whole filter set in one tick and reports whether anything moved.
+ *
+ * The watcher ignores exactly one firing, so the flag must only be raised when a
+ * value actually changes: writing the same set does not trigger Vue's watcher,
+ * and a stale flag would swallow the user's next real edit.
+ */
+function applyFilters(values) {
+  const before = JSON.stringify(filters)
   resetFilterValues()
+  Object.assign(filters, values)
+
+  return JSON.stringify(filters) !== before
+}
+
+watch(slug, () => {
+  // Coming back to a room restores the question last asked there. A default set
+  // is not stored, so a room nobody filtered opens unfiltered.
+  suppressFilterReload = applyFilters(savedFiltersFor(slug.value) ?? defaultFilters())
   // A search term for the previous room would be sent with the new room's first
   // stats request; the endpoints of one room say nothing about another's. Bumping
   // the sequence also discards an answer that is still in flight.
@@ -508,9 +567,13 @@ watch(
     // and 250 ms of silence already reads as "the filter did nothing".
     const token = beginBusy({ filter: true })
     const started = Date.now()
+    // The room is captured here, not read in the timer: switching rooms before
+    // the debounce must not save the old filter under the new room's key.
+    const roomSlug = slug.value
 
     filterTimer = setTimeout(() => {
       meta.page = 1
+      persistFilters(roomSlug)
       loadWithLoader({ filter: true, started, token })
     }, FILTER_DEBOUNCE)
   },
@@ -594,8 +657,19 @@ async function removeRequest(id) {
   }
 }
 
-async function copyWebhook() {
-  try {
+/**
+ * A corrected copy was created: switch the drawer to the new row.
+ *
+ * Opening the copy is the whole point of the action — the operator wants to see
+ * whether the corrected payload matched more rules — and leaving the original
+ * card up would show the old result under a toast about a new request.
+ */
+async function onRedelivered(id) {
+  await load({ silent: true })
+  await openRequestById(id)
+}
+
+async function copyWebhook() {  try {
     await navigator.clipboard.writeText(webhookUrl.value)
     copied.value = true
     setTimeout(() => (copied.value = false), 1500)
@@ -606,6 +680,82 @@ async function copyWebhook() {
 
 function resetFilters() {
   resetFilterValues()
+}
+
+/**
+ * Saved filter sets, one per room.
+ *
+ * A filter is a question the operator asks repeatedly ("what did Stripe send
+ * today"), and re-picking four controls on every page load makes the log feel
+ * like a form. Stored in `localStorage` rather than on the server: it is a view
+ * preference of this browser, not a property of the installation, and it must
+ * keep working before the first API call.
+ *
+ * Only rooms with an actual filter are stored — a default set is not a
+ * preference, and writing one would make «Сбросить» silently ineffective on the
+ * next visit.
+ */
+const FILTERS_KEY = 'wr_filters'
+
+function readSavedFilters() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FILTERS_KEY) || '{}')
+
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * A saved set from an older build (or a hand-edited entry) must not be able to
+ * put the list into a state the controls cannot represent: an unknown method or
+ * period would render the select as «Все» while the request stayed filtered,
+ * which reads as a broken filter rather than as a stale value.
+ */
+function savedFiltersFor(roomSlug) {
+  if (!roomSlug) {
+    return null
+  }
+
+  const saved = readSavedFilters()[roomSlug]
+  if (!saved || typeof saved !== 'object') {
+    return null
+  }
+
+  const periods = ['all', 'custom', ...Object.keys(PERIOD_HOURS)]
+
+  return {
+    method: methods.includes(saved.method) ? saved.method : 'ALL',
+    q: typeof saved.q === 'string' ? saved.q : '',
+    endpoint: typeof saved.endpoint === 'string' ? saved.endpoint : '',
+    period: periods.includes(saved.period) ? saved.period : 'all',
+    from: typeof saved.from === 'string' ? saved.from : '',
+    to: typeof saved.to === 'string' ? saved.to : '',
+  }
+}
+
+function defaultFilters() {
+  return { method: 'ALL', q: '', endpoint: '', period: 'all', from: '', to: '' }
+}
+
+function persistFilters(roomSlug = slug.value) {
+  if (!roomSlug) {
+    return
+  }
+
+  const all = readSavedFilters()
+  if (hasActiveFilters()) {
+    all[roomSlug] = { ...filters }
+  } else {
+    delete all[roomSlug]
+  }
+
+  try {
+    localStorage.setItem(FILTERS_KEY, JSON.stringify(all))
+  } catch {
+    // Private mode or a full quota: losing the preference is not an error.
+  }
 }
 
 /**
@@ -651,6 +801,103 @@ async function retryRun(runId) {
 }
 
 /**
+ * Re-routes everything selected in one call.
+ *
+ * One request instead of N: a page of 25 replays used to be 25 round trips, each
+ * with its own toast, and a failure in the middle left the operator unsure what
+ * had been queued. The API reports how many rows it skipped (a run still in
+ * flight) and how many ids no longer exist, which is more truthful than a
+ * blanket "готово".
+ */
+async function replaySelected() {
+  if (selected.value.length === 0) {
+    return
+  }
+
+  bulkBusy.value = true
+
+  try {
+    const data = await api.bulkRequests('replay', selected.value)
+    const { count, queued, skipped, missing } = data.data
+
+    const details = [
+      queued > 0 ? `в очередь: ${queued}` : 'нет активных сценариев',
+      skipped.length > 0 ? `пропущено: ${skipped.length} (запуск ещё идёт)` : '',
+      missing.length > 0 ? `не найдено: ${missing.length}` : '',
+    ].filter(Boolean)
+
+    notify(`Повторно маршрутизировано: ${count}. ${details.join(', ')}`, {
+      tone: skipped.length > 0 || missing.length > 0 ? 'warning' : 'info',
+    })
+
+    clearSelection()
+    await load({ silent: true })
+  } catch (e) {
+    notify(e.message)
+  } finally {
+    bulkBusy.value = false
+  }
+}
+
+/**
+ * Deletes the selected rows after an explicit confirmation that names the count.
+ *
+ * The dialog is not decoration: the log is the only record of what a sender
+ * actually sent, and there is no undo. A request with a run still in flight is
+ * refused by the API per row, so the answer says which ones stayed.
+ */
+async function deleteSelected() {
+  if (selected.value.length === 0) {
+    return
+  }
+
+  const count = selected.value.length
+  const ok = await confirm({
+    title: 'Удалить запросы?',
+    message: `Будет удалено запросов: ${count}. Записи и их журнал запусков исчезнут без возможности отмены.`
+      + ' Запросы, у которых маршрутизация ещё выполняется, останутся.',
+    confirmLabel: `Удалить ${count}`,
+    tone: 'danger',
+  })
+
+  if (!ok) {
+    return
+  }
+
+  bulkBusy.value = true
+
+  try {
+    const data = await api.bulkRequests('delete', selected.value)
+    const { count: deleted, skipped, missing } = data.data
+
+    const details = [
+      skipped.length > 0 ? `пропущено: ${skipped.length} (маршрутизация идёт)` : '',
+      missing.length > 0 ? `не найдено: ${missing.length}` : '',
+    ].filter(Boolean)
+
+    notify(`Удалено: ${deleted}. ${details.join(', ')}`, {
+      tone: skipped.length > 0 || missing.length > 0 ? 'warning' : 'info',
+    })
+
+    clearSelection()
+
+    // The open card may be one of the deleted rows; leaving it up would show a
+    // request the API no longer has.
+    if (detail.value?.id && !items.value.some((row) => row.id === detail.value.id)) {
+      showDetail.value = false
+      detail.value = null
+      runs.value = []
+    }
+
+    await load({ silent: true })
+  } catch (e) {
+    notify(e.message)
+  } finally {
+    bulkBusy.value = false
+  }
+}
+
+/**
  * Downloads the current selection as a file. The request goes through `fetch`
  * because the API needs a Bearer token, which a plain link cannot send.
  */
@@ -682,7 +929,12 @@ async function exportNow() {
 }
 
 onMounted(() => {
-  load()
+  // Restore before the first request: loading unfiltered and then reloading a
+  // tick later would paint one list and immediately replace it. The watcher
+  // consumes the flag on the next tick and stays silent, because this load
+  // already uses the restored values.
+  suppressFilterReload = applyFilters(savedFiltersFor(slug.value) ?? defaultFilters())
+  loadWithLoader()
 
   // A link from the run journal: open the request it names.
   const requested = Number(route.query.request)
@@ -858,6 +1110,49 @@ onUnmounted(() => {
         </div>
       </section>
 
+      <!-- Bulk actions appear only with a selection, and the count is in the bar
+           itself: "delete selected" with no visible number is a button nobody
+           dares press. The bar sits between the filters and the log so it cannot
+           be mistaken for a row of the table. -->
+      <section
+        v-if="selected.length > 0"
+        class="flex flex-wrap items-center gap-2 rounded-2xl border border-indigo-500/30 bg-indigo-500/[0.08] px-4 py-3"
+      >
+        <span class="text-xs font-medium text-ink">
+          Выбрано: {{ selected.length }}<span v-if="meta.total > items.length" class="text-ink-mute"> из {{ items.length }} на странице</span>
+        </span>
+        <button
+          type="button"
+          class="btn px-2.5 py-1 text-[11px]"
+          :disabled="bulkBusy"
+          @click="clearSelection"
+        >
+          Снять выбор
+        </button>
+        <div class="ml-auto flex flex-wrap items-center gap-2">
+          <button
+            v-if="auth.canWrite"
+            type="button"
+            class="btn"
+            :disabled="bulkBusy"
+            title="Запустить активные сценарии для выбранных запросов"
+            @click="replaySelected"
+          >
+            <AppSpinner v-if="bulkBusy" size="xs" />
+            Повторить маршрутизацию
+          </button>
+          <button
+            v-if="auth.canWrite"
+            type="button"
+            class="btn-danger"
+            :disabled="bulkBusy"
+            @click="deleteSelected"
+          >
+            Удалить выбранные
+          </button>
+        </div>
+      </section>
+
       <section class="card relative overflow-hidden">
         <Transition name="fade">
           <div
@@ -879,6 +1174,16 @@ onUnmounted(() => {
           <table class="min-w-full text-left">
             <thead class="border-b border-line bg-surface-2 text-[11px] uppercase tracking-wider text-ink-mute">
               <tr>
+                <th class="w-10 px-4 py-3 font-medium">
+                  <span class="sr-only">Выбрать все</span>
+                  <AppCheckbox
+                    v-if="auth.canWrite"
+                    :model-value="allSelected"
+                    :indeterminate="someSelected"
+                    aria-label="Выбрать все запросы на странице"
+                    @update:model-value="toggleAll"
+                  />
+                </th>
                 <th class="px-4 py-3 font-medium">Получен</th>
                 <th class="px-4 py-3 font-medium">Метод</th>
                 <th class="px-4 py-3 font-medium">Эндпоинт</th>
@@ -893,8 +1198,17 @@ onUnmounted(() => {
                 v-for="row in items"
                 :key="row.id"
                 class="cursor-pointer transition hover:bg-surface-2"
+                :class="{ 'bg-indigo-500/[0.06]': isSelected(row.id) }"
                 @click="openRequest(row)"
               >
+                <td class="w-10 px-4 py-3" @click.stop>
+                  <AppCheckbox
+                    v-if="auth.canWrite"
+                    :model-value="isSelected(row.id)"
+                    :aria-label="`Выбрать запрос #${row.id}`"
+                    @update:model-value="toggleSelected(row.id)"
+                  />
+                </td>
                 <td class="whitespace-nowrap px-4 py-3 font-mono text-[11px] text-ink-soft">
                   {{ formatTime(row.received_at) }}
                 </td>
@@ -925,11 +1239,34 @@ onUnmounted(() => {
           </table>
         </div>
 
+        <!-- The phone layout needs its own "select all": the table header that
+             carries it on wide screens is not rendered here, and a bulk action
+             whose only entry point is a column nobody can see is a bug. -->
+        <div
+          v-if="items.length && auth.canWrite"
+          class="flex items-center justify-between border-b border-line px-4 py-2 md:hidden"
+        >
+          <AppCheckbox
+            :model-value="allSelected"
+            :indeterminate="someSelected"
+            label="Выбрать все на странице"
+            @update:model-value="toggleAll"
+          />
+          <span class="text-[11px] text-ink-mute">{{ items.length }}</span>
+        </div>
+
         <ul v-if="items.length" class="divide-y divide-line md:hidden">
-          <li v-for="row in items" :key="row.id">
+          <li v-for="row in items" :key="row.id" class="flex items-start gap-2 px-4 py-3">
+            <span v-if="auth.canWrite" class="pt-0.5">
+              <AppCheckbox
+                :model-value="isSelected(row.id)"
+                :aria-label="`Выбрать запрос #${row.id}`"
+                @update:model-value="toggleSelected(row.id)"
+              />
+            </span>
             <button
               type="button"
-              class="block w-full px-4 py-3 text-left transition active:bg-surface-2"
+              class="block min-w-0 flex-1 text-left transition active:opacity-70"
               @click="openRequest(row)"
             >
               <div class="flex items-center gap-2">
@@ -1027,6 +1364,7 @@ onUnmounted(() => {
             @delete="removeRequest"
             @replay="replayRequest"
             @retry="retryRun"
+            @redelivered="onRedelivered"
           />
         </aside>
       </Transition>

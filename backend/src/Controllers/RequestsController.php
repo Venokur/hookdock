@@ -23,6 +23,13 @@ final class RequestsController
      */
     private const ENDPOINT_LIMIT = 15;
 
+    /**
+     * Upper bound on one bulk call. A page holds at most 100 requests, so 200
+     * covers "select all on this page" plus a manual list, while a mistake still
+     * cannot become a table-wide delete.
+     */
+    private const BULK_MAX = 200;
+
     public function index(Request $request): void
     {
         Auth::requireUser($request);
@@ -47,7 +54,7 @@ final class RequestsController
         $total = (int) $countStmt->fetchColumn();
 
         $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
-                       r.duplicate_of,
+                       r.duplicate_of, r.replayed_from,
                        COALESCE(stats.runs, 0)::int AS run_count,
                        COALESCE(stats.failed, 0)::int AS failed_runs,
                        COALESCE(stats.pending, 0)::int AS pending_runs" . $extraColumns . "
@@ -375,6 +382,246 @@ final class RequestsController
     }
 
     /**
+     * Routes a *corrected copy* of a stored delivery.
+     *
+     * `replay` answers "the rule was wrong, try the same payload again"; this
+     * answers "the payload was wrong, would the rule have matched?". Mutating the
+     * stored row would be the easy implementation and the wrong product: the log
+     * is the evidence of what the sender actually sent, and every run step of
+     * that request would then describe a payload that never arrived.
+     *
+     * The copy is a real row, so the whole pipeline (conditions, template
+     * rendering, dry run, step log) works on it unchanged. It is marked with
+     * `replayed_from` rather than `duplicate_of`, because the latter means "the
+     * sender retried and we deliberately did not route it" — the opposite of what
+     * happened here.
+     */
+    public function redeliver(Request $request, array $params): void
+    {
+        Auth::requireUser($request, true);
+
+        $id = (int) ($params['id'] ?? 0);
+        $stmt = Database::pdo()->prepare('SELECT * FROM incoming_requests WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $original = $stmt->fetch();
+
+        if ($original === false) {
+            Response::error('Запрос не найден', 404);
+        }
+
+        // `headers` is jsonb and PDO hands it back as a string. Merging a string
+        // into `is_array(...)` silently produced an empty header map, so the copy
+        // lost `content-type` and every rule that reads `headers.*` stopped
+        // matching — the failure was invisible in the response.
+        $original = JsonColumns::decode($original, ['query', 'headers', 'body']);
+
+        $payload = $request->json() ?? [];
+        $raw = $this->redeliveryBody($payload, $original);
+
+        // The endpoint defaults to the original one: a corrected payload almost
+        // always means "the same rule should have matched", and a different
+        // endpoint would silently route to other rules.
+        $endpoint = $this->redeliveryEndpoint($payload, $original);
+        $headers = $this->redeliveryHeaders($payload, $original);
+        $decoded = $raw === '' ? null : json_decode($raw, true);
+
+        $contentType = (string) ($payload['content_type'] ?? $original['content_type'] ?? 'application/json');
+
+        $row = [
+            'room_id' => (int) $original['room_id'],
+            'endpoint' => $endpoint,
+            'method' => strtoupper((string) ($payload['method'] ?? $original['method'])),
+            'path' => (string) ($payload['path'] ?? $original['path']),
+            // Omitted query parameters are inherited like the body: a corrected
+            // payload is still the same delivery, and dropping the query would
+            // silently change which rule matches.
+            'query' => is_array($payload['query'] ?? null)
+                ? $payload['query']
+                : (is_array($original['query'] ?? null) ? $original['query'] : []),
+            'headers' => $headers,
+            'body' => is_array($decoded) ? $decoded : null,
+            'raw_body' => $raw,
+            'content_type' => $contentType,
+            'body_bytes' => strlen($raw),
+            // The sender's address, not the operator's: this row stands in for a
+            // delivery, so showing the dashboard's IP would make the log lie about
+            // where the traffic came from.
+            'ip' => (string) $original['ip'],
+        ];
+
+        $insert = Database::pdo()->prepare(
+            'INSERT INTO incoming_requests
+                (room_id, endpoint, method, path, query, headers, body, raw_body,
+                 content_type, body_bytes, ip, replayed_from)
+             VALUES
+                (:room_id, :endpoint, :method, :path, :query, :headers, :body, :raw_body,
+                 :content_type, :body_bytes, :ip, :replayed_from)
+             RETURNING id, received_at'
+        );
+        $insert->execute([
+            'room_id' => $row['room_id'],
+            'endpoint' => $row['endpoint'],
+            'method' => $row['method'],
+            'path' => $row['path'],
+            'query' => $this->json($row['query']),
+            'headers' => $this->json($row['headers']),
+            'body' => $row['body'] === null ? null : $this->json($row['body']),
+            'raw_body' => $row['raw_body'],
+            'content_type' => $row['content_type'],
+            'body_bytes' => $row['body_bytes'],
+            'ip' => $row['ip'],
+            'replayed_from' => $id,
+        ]);
+
+        $saved = $insert->fetch();
+        $row['id'] = (int) $saved['id'];
+
+        Realtime::publish('request.created', [
+            'id' => $row['id'],
+            'room_id' => $row['room_id'],
+            'endpoint' => $row['endpoint'],
+            'method' => $row['method'],
+            'duplicate' => false,
+        ]);
+
+        // No `dedup_key` on purpose: the room's dedup header would make the copy a
+        // duplicate of itself and it would be stored without being routed. A
+        // redelivery is a human action, not a sender retry, so the deduplication
+        // rule does not apply to it.
+        $queued = WorkflowEngine::enqueue($row);
+
+        Audit::record([
+            'action' => 'request.redelivered',
+            'object_type' => 'request',
+            'object_id' => $row['id'],
+            'object_label' => '#' . $row['id'],
+            'room_id' => $row['room_id'],
+            'summary' => sprintf(
+                'Запрос #%d отправлен заново с правками как #%d, в очередь: %d',
+                $id,
+                $row['id'],
+                $queued,
+            ),
+            'changes' => ['replayed_from' => [null, $id], 'queued' => [null, $queued]],
+        ], $request);
+
+        Response::json([
+            'data' => [
+                'id' => $row['id'],
+                'replayed_from' => $id,
+                'received_at' => $saved['received_at'],
+                'queued' => $queued,
+            ],
+        ], 202);
+    }
+
+    /**
+     * Bulk delete / bulk replay over an explicit id list.
+     *
+     * Deliberately takes **ids**, not filters. "Delete everything matching this
+     * search" turns one mis-click into an outage, and the log has no undo. The
+     * client sends what the operator could see and had selected; the cap keeps a
+     * script from turning one request into a table scan with a million deletes.
+     *
+     * A request whose run is still `pending`/`running` is skipped and reported
+     * rather than deleted: removing it would cancel routing that is being done
+     * right now, which is exactly what retention refuses to do silently.
+     */
+    public function bulk(Request $request): void
+    {
+        Auth::requireUser($request, true);
+
+        $payload = $request->json() ?? [];
+        $action = strtolower(trim((string) ($payload['action'] ?? '')));
+        if (!in_array($action, ['delete', 'replay'], true)) {
+            Response::error('Действие: delete или replay', 422);
+        }
+
+        $ids = $this->bulkIds($payload['ids'] ?? null);
+        if ($ids === []) {
+            Response::error('Не выбрано ни одного запроса', 422);
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($ids), '?'));
+        $pdo = Database::pdo();
+
+        $find = $pdo->prepare(
+            "SELECT r.id, r.room_id, r.endpoint,
+                    EXISTS (
+                        SELECT 1 FROM workflow_runs wr
+                         WHERE wr.request_id = r.id AND wr.status IN ('pending', 'running')
+                    ) AS in_flight
+               FROM incoming_requests r
+              WHERE r.id IN ({$placeholders})"
+        );
+        $find->execute($ids);
+        $rows = $find->fetchAll();
+
+        $found = [];
+        foreach ($rows as $row) {
+            $found[(int) $row['id']] = $row;
+        }
+
+        $missing = array_values(array_filter($ids, static fn (int $id): bool => !isset($found[$id])));
+
+        $done = 0;
+        $queued = 0;
+        $skipped = [];
+        $rooms = [];
+
+        foreach ($found as $row) {
+            $rooms[(int) $row['room_id']] = true;
+
+            if (self::isTrue($row['in_flight'] ?? false)) {
+                $skipped[] = ['id' => (int) $row['id'], 'reason' => 'Запуск ещё выполняется'];
+
+                continue;
+            }
+
+            if ($action === 'replay') {
+                $queued += WorkflowEngine::enqueue($row);
+                $done++;
+
+                continue;
+            }
+
+            $delete = $pdo->prepare('DELETE FROM incoming_requests WHERE id = :id');
+            $delete->execute(['id' => (int) $row['id']]);
+            $done++;
+        }
+
+        foreach (array_keys($rooms) as $roomId) {
+            Realtime::publish($action === 'delete' ? 'request.deleted' : 'request.updated', [
+                'id' => 0,
+                'room_id' => $roomId,
+                'bulk' => $done,
+            ]);
+        }
+
+        // One journal entry for the batch, not one per row: clearing a page of
+        // 100 requests would otherwise bury every other change in the feed.
+        Audit::record([
+            'action' => $action === 'delete' ? 'request.bulk_deleted' : 'request.bulk_replayed',
+            'object_type' => 'request',
+            'object_label' => $done . ' запросов',
+            'summary' => $action === 'delete'
+                ? sprintf('Удалено запросов: %d (пропущено: %d)', $done, count($skipped))
+                : sprintf('Маршрутизировано повторно запросов: %d, в очередь: %d', $done, $queued),
+            'changes' => ['count' => [null, $done], 'skipped' => [null, count($skipped)]],
+        ], $request);
+
+        Response::json([
+            'data' => [
+                'action' => $action,
+                'count' => $done,
+                'queued' => $queued,
+                'skipped' => $skipped,
+                'missing' => $missing,
+            ],
+        ]);
+    }
+
+    /**
      * Queues a fresh run of the same workflow for the same request.
      *
      * A manual retry is deliberately a new row: the failed one keeps its attempts
@@ -668,6 +915,128 @@ final class RequestsController
 
         echo $content;
         exit;
+    }
+
+    /**
+     * The body of a redelivery: `body` wins over `raw_body`, and neither means
+     * "send exactly what the sender sent".
+     *
+     * `body` is the normal case (the operator fixes a field in the JSON), but a
+     * non-JSON delivery has no structured body at all, so `raw_body` is the only
+     * way to correct one. Encoding an array here rather than passing it through
+     * keeps `raw_body` and `body` consistent: the catcher stores both, and a row
+     * whose jsonb and text disagree would render one thing and route another.
+     *
+     * @param array<string, mixed> $payload
+     * @param array<string, mixed> $original
+     */
+    private function redeliveryBody(array $payload, array $original): string
+    {
+        if (array_key_exists('body', $payload)) {
+            $body = $payload['body'];
+
+            // A string in `body` is a JSON string, not raw bytes; only `raw_body`
+            // carries text verbatim. Treating it otherwise would store `"hello"`
+            // with quotes as the payload.
+            return $body === null ? '' : $this->json($body);
+        }
+
+        if (array_key_exists('raw_body', $payload)) {
+            return (string) $payload['raw_body'];
+        }
+
+        return (string) ($original['raw_body'] ?? '');
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     * @param array<string, mixed> $original
+     */
+    private function redeliveryEndpoint(array $payload, array $original): string
+    {
+        $endpoint = trim((string) ($payload['endpoint'] ?? ($original['endpoint'] ?? '')), '/');
+
+        if ($endpoint === '') {
+            $endpoint = (string) ($original['endpoint'] ?? 'default');
+        }
+
+        $endpoint = mb_substr($endpoint, 0, 160);
+
+        return $endpoint === '' ? 'default' : $endpoint;
+    }
+
+    /**
+     * Corrected headers are merged over the stored ones, not substituted for
+     * them: an operator fixing `x-event-type` should not have to retype the whole
+     * envelope, and a replacement would drop `user-agent` and friends that the
+     * rules may read.
+     *
+     * @param array<string, mixed> $payload
+     * @param array<string, mixed> $original
+     * @return array<string, string>
+     */
+    private function redeliveryHeaders(array $payload, array $original): array
+    {
+        $headers = is_array($original['headers'] ?? null) ? $original['headers'] : [];
+
+        if (is_array($payload['headers'] ?? null)) {
+            foreach ($payload['headers'] as $name => $value) {
+                $key = strtolower(trim((string) $name));
+                if ($key === '') {
+                    continue;
+                }
+                $headers[$key] = is_scalar($value) ? (string) $value : $this->compactJson($value);
+            }
+        }
+
+        return $headers;
+    }
+
+    /**
+     * Validates the explicit id list of a bulk operation.
+     *
+     * A flat list, not "the filters": a filter is a query the operator was
+     * looking at, and the rows it matches can change between the click and the
+     * request. The cap bounds one call so a script cannot turn `bulk` into a
+     * table-wide delete.
+     *
+     * @return list<int>
+     */
+    private function bulkIds(mixed $value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $ids = [];
+        foreach ($value as $item) {
+            if (!is_scalar($item)) {
+                continue;
+            }
+
+            $id = (int) $item;
+            if ($id > 0) {
+                $ids[$id] = $id;
+            }
+        }
+
+        $ids = array_values($ids);
+        sort($ids);
+
+        return array_slice($ids, 0, self::BULK_MAX);
+    }
+
+    private function isTrue(mixed $value): bool
+    {
+        return $value === true || $value === 't' || $value === 'true' || $value === 1 || $value === '1';
+    }
+
+    /**
+     * @param array<string, mixed>|list<mixed>|string|int|float|bool|null $value
+     */
+    private function json(mixed $value): string
+    {
+        return (string) json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 
     private function isJsonType(string $contentType): bool

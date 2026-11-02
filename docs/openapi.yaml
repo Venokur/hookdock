@@ -1162,6 +1162,186 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/requests/bulk:
+    post:
+      tags: [Requests]
+      summary: Delete or replay several requests at once
+      description: |
+        Takes an **explicit id list**, never the current filter: "delete
+        everything matching this search" turns one mis-click into an outage, and
+        the log has no undo. The client sends what the operator could see and had
+        selected; `ids` is capped at 200, so a script cannot turn one call into a
+        table-wide delete.
+
+        A request whose run is still `pending`/`running` is **skipped** and
+        reported with a reason instead of being deleted — removing it would cancel
+        routing that is being done right now. Ids that no longer exist are
+        reported in `missing` rather than failing the whole batch.
+
+        The journal gets one entry per call (`request.bulk_deleted` /
+        `request.bulk_replayed`), because a hundred rows would bury every other
+        change in the feed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, ids]
+              properties:
+                action:
+                  type: string
+                  enum: [delete, replay]
+                ids:
+                  type: array
+                  maxItems: 200
+                  items:
+                    type: integer
+            examples:
+              replay:
+                value:
+                  action: replay
+                  ids: [1201, 1202, 1203]
+              delete:
+                value:
+                  action: delete
+                  ids: [1201]
+      responses:
+        '200':
+          description: The batch report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      action:
+                        type: string
+                        enum: [delete, replay]
+                      count:
+                        type: integer
+                        description: Rows actually deleted or replayed.
+                      queued:
+                        type: integer
+                        description: Runs queued (zero for `delete`).
+                      skipped:
+                        type: array
+                        description: Rows left alone, with the reason.
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: integer
+                            reason:
+                              type: string
+                              example: Запуск ещё выполняется
+                      missing:
+                        type: array
+                        description: Ids that were not found.
+                        items:
+                          type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/requests/{id}/redeliver:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Requests]
+      summary: Route a corrected copy of a stored request
+      description: |
+        The counterpart of `replay`: that one re-routes the payload that is
+        stored, which is useless when the **payload** was wrong. This stores a
+        new row with the corrections and routes it, so the whole pipeline
+        (conditions, templates, dry run, step log) works unchanged.
+
+        The original row is never mutated: the log is the evidence of what the
+        sender actually sent, and a run's step log must not describe a payload
+        that never arrived. The copy carries `replayed_from` instead of
+        `duplicate_of`, because the latter means "the sender retried and we
+        deliberately did not route it" — the opposite of what happened here. No
+        `dedup_key` is set on the copy either, or the room's deduplication rule
+        would make the redelivery a duplicate of itself and never route it.
+
+        Omitted fields are inherited from the original; headers are merged over
+        the stored ones rather than replaced.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body:
+                  description: |
+                    Structured body. Sent as JSON, so `raw_body` and the `jsonb`
+                    column cannot disagree. Takes precedence over `raw_body`.
+                  oneOf:
+                    - type: object
+                    - type: array
+                raw_body:
+                  type: string
+                  description: Verbatim body, for a non-JSON delivery.
+                method:
+                  type: string
+                  example: POST
+                path:
+                  type: string
+                endpoint:
+                  type: string
+                  description: Defaults to the original endpoint.
+                query:
+                  type: object
+                  additionalProperties: true
+                headers:
+                  type: object
+                  additionalProperties:
+                    type: string
+                content_type:
+                  type: string
+            examples:
+              correctedJson:
+                value:
+                  body:
+                    type: payment
+                    amount: 99
+      responses:
+        '202':
+          description: The copy is stored and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        description: Id of the new row.
+                      replayed_from:
+                        type: integer
+                        description: Id of the original request.
+                      received_at:
+                        type: string
+                        format: date-time
+                      queued:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
   /api/requests/{id}/preview:
     parameters:
       - $ref: '#/components/parameters/RequestId'
@@ -2510,6 +2690,13 @@ components:
           description: |
             Set when this delivery repeated a `dedup_header` value already seen in
             the room. Such a row is stored for the audit log but never queued.
+        replayed_from:
+          type: integer
+          nullable: true
+          description: |
+            Set when a human sent this row as a corrected copy of another request
+            (`POST /api/requests/{id}/redeliver`). Unlike `duplicate_of` this row
+            **is** routed: it is a real delivery, just not one the sender made.
         body:
           description: Present only with `?include=body`. NULL for a non-JSON payload.
           nullable: true

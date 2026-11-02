@@ -73,9 +73,17 @@ $router->add('GET', '/api/requests', fn (Request $r) => $requests->index($r));
 // Before `/api/requests/{id}`: that pattern matches any single segment, so
 // "export" would be read as a request id and answered with 404.
 $router->add('GET', '/api/requests/export', fn (Request $r) => $requests->export($r));
+// Before `/api/requests/{id}` again: `bulk` is a literal segment. The list of
+// ids is explicit, never the current filter, so one mis-click cannot delete a
+// search result nobody counted.
+$router->add('POST', '/api/requests/bulk', fn (Request $r) => $requests->bulk($r));
 $router->add('GET', '/api/requests/{id}', fn (Request $r, array $p) => $requests->show($r, $p));
 $router->add('DELETE', '/api/requests/{id}', fn (Request $r, array $p) => $requests->destroy($r, $p));
 $router->add('POST', '/api/requests/{id}/replay', fn (Request $r, array $p) => $requests->replay($r, $p));
+// Replays a *corrected copy*: the stored row stays the record of what the
+// sender actually sent, so a run's step log never describes a payload that
+// never arrived.
+$router->add('POST', '/api/requests/{id}/redeliver', fn (Request $r, array $p) => $requests->redeliver($r, $p));
 // Dry run: "what would routing do", without queueing or sending anything.
 $router->add('POST', '/api/requests/{id}/preview', fn (Request $r, array $p) => $requests->preview($r, $p));
 $router->add('GET', '/api/requests/{id}/body', fn (Request $r, array $p) => $requests->body($r, $p));

@@ -1,0 +1,37 @@
+$kind: http-request
+name: Bulk replay
+method: POST
+url: '{{base_url}}/api/requests/bulk'
+order: 5600
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "action": "replay",
+      "ids": [{{request_id}}]
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Nothing ingested means nothing to replay; the placeholder id would turn a
+      // setup problem into a confusing 404 from the API.
+      if (!pm.collectionVariables.get('request_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // An explicit id list, never the current filter: the answer reports what was
+      // actually touched, what was skipped and what no longer exists.
+      pm.test('bulk replay reports per-call counts', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json().data;
+        pm.expect(body.action).to.eql('replay');
+        pm.expect(body.count).to.be.a('number');
+        pm.expect(body.skipped).to.be.an('array');
+        pm.expect(body.missing).to.be.an('array');
+      });

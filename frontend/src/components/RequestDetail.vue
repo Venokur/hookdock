@@ -4,6 +4,9 @@ import JsonViewer from './JsonViewer.vue'
 import MethodBadge from './MethodBadge.vue'
 import StatusPill from './StatusPill.vue'
 import AppSpinner from './ui/AppSpinner.vue'
+import AppInput from './ui/AppInput.vue'
+import AppSelect from './ui/AppSelect.vue'
+import AppTextarea from './ui/AppTextarea.vue'
 import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { notify } from '../composables/dialog'
@@ -14,7 +17,7 @@ const props = defineProps({
   runs: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['close', 'delete', 'replay', 'retry'])
+const emit = defineEmits(['close', 'delete', 'replay', 'retry', 'redelivered'])
 
 // The store, not a prop: every mutating control in the app asks the same question,
 // and threading a boolean through three components would drift.
@@ -105,6 +108,104 @@ const payload = computed(() => {
   return props.request.raw_body || null
 })
 
+/**
+ * "Send it again with corrections."
+ *
+ * `replay` re-routes the payload that is stored — right for "the rule was wrong",
+ * useless for "the payload was wrong". This panel edits a *copy*: the original
+ * row stays exactly as the sender sent it, because the log is the evidence and a
+ * run's step log must never describe a payload that never arrived.
+ *
+ * The draft starts from the stored payload and is only populated when the panel
+ * opens, so a failed save does not leave the operator's edits behind in the next
+ * request they open.
+ */
+const redeliverOpen = ref(false)
+const redelivering = ref(false)
+const redeliverError = ref('')
+const redelivery = ref({ body: '', endpoint: '', method: 'POST', path: '' })
+
+const redeliveryIsJson = computed(() => isJsonBody(props.request.content_type))
+
+function isJsonBody(contentType) {
+  const type = String(contentType || '').toLowerCase().split(';')[0].trim()
+
+  return type === 'application/json' || type.endsWith('+json')
+}
+
+function openRedeliver() {
+  redeliverError.value = ''
+  redelivery.value = {
+    body: props.request.raw_body ?? '',
+    endpoint: props.request.endpoint ?? '',
+    method: props.request.method ?? 'POST',
+    path: props.request.path ?? '',
+  }
+  redeliverOpen.value = true
+}
+
+function closeRedeliver() {
+  redeliverOpen.value = false
+  redeliverError.value = ''
+}
+
+/**
+ * Sends the corrected copy and hands the new id back to the list, which opens it.
+ *
+ * JSON is validated here rather than on the server: the API answers 422 with a
+ * generic message, and "ожидался JSON" next to the field the operator is typing
+ * in is the only place that sentence is useful.
+ */
+async function submitRedeliver() {
+  redeliverError.value = ''
+
+  const body = redelivery.value.body
+  if (redeliveryIsJson.value && body.trim() !== '') {
+    try {
+      JSON.parse(body)
+    } catch {
+      redeliverError.value = 'Тело не является корректным JSON'
+      return
+    }
+  }
+
+  redelivering.value = true
+
+  try {
+    const draft = {
+      raw_body: body,
+      endpoint: redelivery.value.endpoint.trim(),
+      method: redelivery.value.method,
+      path: redelivery.value.path.trim(),
+    }
+
+    // A JSON body travels as a structure, so the stored jsonb and the raw text
+    // cannot disagree: `raw_body` alone would leave `body` NULL and the rules
+    // that read `body.*` would see nothing.
+    if (redeliveryIsJson.value && body.trim() !== '') {
+      draft.body = JSON.parse(body)
+      delete draft.raw_body
+    }
+
+    const data = await api.redeliverRequest(props.request.id, draft)
+    const created = data.data
+
+    notify(
+      created.queued > 0
+        ? `Создан запрос #${created.id}, поставлено в очередь: ${created.queued}`
+        : `Создан запрос #${created.id}, активных сценариев нет`,
+      { tone: 'info' },
+    )
+
+    redeliverOpen.value = false
+    emit('redelivered', created.id)
+  } catch (e) {
+    redeliverError.value = e.message
+  } finally {
+    redelivering.value = false
+  }
+}
+
 const curl = computed(() => {
   const request = props.request
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
@@ -136,6 +237,13 @@ const metaRows = computed(() => {
   // routed. Naming the original is the only way to tell the two apart later.
   if (props.request.duplicate_of) {
     rows.push(['Повтор доставки', `#${props.request.duplicate_of} — сценарии не запускались`])
+  }
+
+  // A corrected copy is a real delivery and was routed, so it is not a repeat.
+  // Naming its origin is still what makes the log readable: "where did this come
+  // from" is the question a redelivery row raises.
+  if (props.request.replayed_from) {
+    rows.push(['Отправлен с правками из', `#${props.request.replayed_from}`])
   }
 
   return rows
@@ -180,6 +288,11 @@ async function copyCurl() {
               class="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
               :title="`Повтор доставки #${request.duplicate_of}`"
             >повтор</span>
+            <span
+              v-if="request.replayed_from"
+              class="rounded bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-indigo-700 dark:text-indigo-300"
+              :title="`Копия запроса #${request.replayed_from}, отправленная с правками`"
+            >с правками</span>
           </div>
           <p class="mt-2 break-all font-mono text-sm text-ink">{{ request.path }}</p>
           <p class="mt-1 text-xs text-ink-mute">
@@ -393,6 +506,15 @@ async function copyCurl() {
         >
           Повторить маршрутизацию
         </button>
+        <button
+          v-if="auth.canWrite"
+          type="button"
+          class="btn"
+          title="Отправить копию запроса с исправленной полезной нагрузкой"
+          @click="redeliverOpen ? closeRedeliver() : openRedeliver()"
+        >
+          {{ redeliverOpen ? 'Скрыть правку' : 'Отправить с правками' }}
+        </button>
       </div>
       <button
         v-if="auth.canWrite"
@@ -403,5 +525,87 @@ async function copyCurl() {
         Удалить запрос
       </button>
     </footer>
+
+    <!-- The editor sits under the actions rather than in a modal: the payload it
+         edits is a tab above it, and covering that tab to fix a field makes the
+         operator retype what they were looking at. -->
+    <section
+      v-if="redeliverOpen"
+      class="border-t border-line bg-surface-2/60 p-4"
+      aria-label="Отправка с правками"
+    >
+      <div class="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <p class="text-sm font-medium text-ink">Отправить копию с правками</p>
+          <p class="mt-0.5 text-[11px] text-ink-mute">
+            Исходный запрос #{{ request.id }} останется в журнале как есть — сценарии выполнятся
+            для новой копии.
+          </p>
+        </div>
+        <button
+          type="button"
+          class="text-[11px] text-ink-mute underline-offset-2 hover:text-ink hover:underline"
+          @click="closeRedeliver"
+        >
+          Отмена
+        </button>
+      </div>
+
+      <div class="mt-3 grid gap-2 sm:grid-cols-2">
+        <label class="block">
+          <span class="text-[11px] uppercase tracking-wider text-ink-mute">Метод</span>
+          <AppSelect
+            v-model="redelivery.method"
+            :options="['POST', 'PUT', 'PATCH', 'GET', 'DELETE', 'OPTIONS'].map((m) => ({ value: m, label: m }))"
+            size="sm"
+            aria-label="Метод копии"
+            class="mt-1"
+          />
+        </label>
+        <label class="block">
+          <span class="text-[11px] uppercase tracking-wider text-ink-mute">Эндпоинт</span>
+          <AppInput
+            v-model="redelivery.endpoint"
+            size="sm"
+            class="mt-1"
+            aria-label="Эндпоинт копии"
+          />
+        </label>
+        <label class="block sm:col-span-2">
+          <span class="text-[11px] uppercase tracking-wider text-ink-mute">Путь</span>
+          <AppInput v-model="redelivery.path" size="sm" class="mt-1" aria-label="Путь копии" />
+        </label>
+        <label class="block sm:col-span-2">
+          <span class="text-[11px] uppercase tracking-wider text-ink-mute">
+            Тело {{ redeliveryIsJson ? '(JSON)' : '' }}
+          </span>
+          <AppTextarea
+            v-model="redelivery.body"
+            :rows="8"
+            size="sm"
+            class="mt-1 font-mono"
+            placeholder="Тело запроса"
+            aria-label="Тело копии"
+          />
+        </label>
+      </div>
+
+      <p
+        v-if="redeliverError"
+        class="mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300"
+      >
+        {{ redeliverError }}
+      </p>
+
+      <div class="mt-3 flex items-center justify-end gap-2">
+        <button type="button" class="btn" :disabled="redelivering" @click="closeRedeliver">
+          Отмена
+        </button>
+        <button type="button" class="btn-primary" :disabled="redelivering" @click="submitRedeliver">
+          <AppSpinner v-if="redelivering" size="xs" />
+          {{ redelivering ? 'Отправляем…' : 'Отправить копию' }}
+        </button>
+      </div>
+    </section>
   </div>
 </template>
