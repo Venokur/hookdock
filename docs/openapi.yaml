@@ -18,7 +18,9 @@ info:
       room with an HMAC secret only accepts requests carrying
       `X-Hookdock-Signature`, optionally bound to a `X-Hookdock-Timestamp` so a
       captured request cannot be replayed. A room can also deduplicate deliveries
-      by one header, so a retried event runs the room's rules once.
+      by one header, so a retried event runs the room's rules once, and restrict
+      the sender addresses it accepts (`ip_allowlist`), so a payload copied from a
+      log cannot be replayed from an unrelated host.
 
     Scopes: a login token carries `scope: api` and may do anything; a token from
     `POST /api/auth/read-token` carries `scope: read` and is refused with `403` on
@@ -28,7 +30,12 @@ info:
     role and a scope answer different questions and both are enforced — the scope
     limits the credential, the role limits the person — so a `viewer` is refused
     every write no matter which token they hold, and only an `admin` may manage
-    accounts or grant roles.
+    accounts, grant roles or issue a token.
+
+    Long-lived tokens: `POST /api/tokens` issues a `hd_…` key with the same
+    `scope` vocabulary, for a script that cannot hold a 12h session. It is stored
+    as a SHA-256 hash and can be revoked, which is the difference between it and
+    a JWT. Its role still comes from the account that issued it.
   license:
     name: MIT
 servers:
@@ -44,9 +51,9 @@ tags:
   - name: Workflows
   - name: Access
     description: |
-      Accounts, their roles, and the journal of who changed what. Role changes take
-      effect on the next request because the role lives on the user, not in the
-      token.
+      Accounts, their roles, the journal of who changed what, and the long-lived
+      tokens scripts authenticate with. A role change takes effect on the next
+      request because the role lives on the user, not in the token.
   - name: Delivery
     description: |
       Forward targets the circuit breaker is skipping, and moving a room's rule
@@ -440,6 +447,130 @@ paths:
         '422':
           $ref: '#/components/responses/Invalid'
 
+  /api/tokens:
+    get:
+      tags: [Tokens]
+      summary: List long-lived API tokens
+      description: |
+        Never returns the token itself — only `prefix`, which tells two keys apart
+        and is useless as a credential. `revoked` and `expired` are derived from
+        `revoked_at` / `expires_at` at read time, so the list cannot go stale.
+
+        Admin-only: a token acts as its account, so seeing which keys exist is the
+        same privilege as creating one.
+      responses:
+        '200':
+          description: Every token of the installation, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ApiToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+    post:
+      tags: [Tokens]
+      summary: Issue a token
+      description: |
+        The plaintext is returned **once**, in the `201`, like a room's HMAC
+        secret. The owner is the account that issued it — there is no `user_id` in
+        the body, because a key that belongs to somebody else makes "who used this"
+        unanswerable.
+
+        `scope` defaults to `read`: the safer credential is the one you get when
+        you do not ask. `expires_at` is an absolute moment; an omitted value means
+        the key does not expire, which is what an integration nobody plans to
+        rotate needs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 120
+                  example: Ночной экспорт
+                scope:
+                  type: string
+                  enum: [api, read]
+                  default: read
+                expires_at:
+                  type: string
+                  nullable: true
+                  description: |
+                    ISO-8601 moment (`2027-01-31T00:00:00Z`) or a bare date
+                    (`2027-01-31`, meaning the end of that day). A moment in the
+                    past is `422`, not a dead key that looks active.
+                  example: '2027-01-31T00:00:00Z'
+      responses:
+        '201':
+          description: Issued. `token` is present only here.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/ApiToken'
+                      - type: object
+                        properties:
+                          token:
+                            type: string
+                            description: Shown exactly once.
+                            example: hd_e855cf57688dc8d7…
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/tokens/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    delete:
+      tags: [Tokens]
+      summary: Revoke a token
+      description: |
+        The row is kept and `revoked_at` is set: a revoked key fails on the next
+        request, and `last_used_at` still answers "was the leaked key used before
+        we noticed". Revoking an already-revoked token is a `200` no-op with
+        `already: true`; an id that never existed is `404`.
+      responses:
+        '200':
+          description: Revoked (or already was).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  revoked:
+                    type: boolean
+                  already:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/audit:
     get:
       tags: [Access]
@@ -645,6 +776,15 @@ paths:
                   type: boolean
                   default: false
                   description: Require `X-Hookdock-Timestamp`; meaningful only with a secret.
+                ip_allowlist:
+                  type: array
+                  maxItems: 64
+                  description: |
+                    Sender ranges. Omitted or empty accepts everyone. An entry that
+                    is not an address or CIDR answers `422` naming the value, so
+                    the operator does not have to guess which of twenty is wrong.
+                  items:
+                    type: string
       responses:
         '201':
           description: Created. `secret` is present only when a signature was requested.
@@ -696,8 +836,11 @@ paths:
         integrations already use the address; an explicitly empty value asks for a
         fresh random one. An omitted `endpoint` keeps the current value.
 
-        `dedup_header` and `require_timestamp` follow the same rule: omitted keeps
-        the stored value, `dedup_header: ""` turns deduplication off.
+        `dedup_header`, `require_timestamp` and `ip_allowlist` follow the same
+        rule: omitted keeps the stored value, `dedup_header: ""` turns
+        deduplication off, and `ip_allowlist: []` opens the room to every sender.
+        For the allowlist the rule is load-bearing: a rename form that does not
+        show the field must not silently disable it.
       requestBody:
         required: true
         content:
@@ -717,6 +860,12 @@ paths:
                   maxLength: 64
                 require_timestamp:
                   type: boolean
+                ip_allowlist:
+                  type: array
+                  maxItems: 64
+                  items:
+                    type: string
+                  description: Omitted keeps the current list; `[]` disables it.
       responses:
         '200':
           description: Updated.
@@ -2707,10 +2856,72 @@ components:
           description: |
             Requires `X-Hookdock-Timestamp` and a signature over `"<ts>.<body>"`.
             Only has an effect together with a secret.
+        ip_allowlist:
+          type: array
+          description: |
+            Sender ranges allowed to deliver to this room, as canonical CIDRs
+            (`203.0.113.0/24`, `2001:db8::/32`); a bare address is stored as
+            `/32` or `/128`. Match is on packed bytes, so `::1` and
+            `::ffff:127.0.0.1` are the same sender.
+
+            An **empty list accepts everyone** — that is what every room did
+            before the setting existed, and an upgrade must not stop the
+            installation's integrations. A non-empty list refuses any address
+            outside it with `403` **before** the row is stored, so a refused
+            delivery is neither logged nor routed.
+          items:
+            type: string
+          maxItems: 64
+          default: []
+          example: ['203.0.113.0/24']
         created_at:
           type: string
           format: date-time
         updated_at:
+          type: string
+          format: date-time
+
+    ApiToken:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        user_email:
+          type: string
+          description: Present on the list; the owner of the key.
+        name:
+          type: string
+        prefix:
+          type: string
+          description: |
+            The lookup half of the token. Not a secret: it is what the request
+            finds its row by, and it is what the list shows so two keys can be
+            told apart.
+          example: hd_e855cf57688d
+        scope:
+          type: string
+          enum: [api, read]
+        revoked:
+          type: boolean
+        expired:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: '`null` means the key does not expire.'
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Written at most once a minute, so it answers "used recently", not "used at 12:00:03".
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
           type: string
           format: date-time
 

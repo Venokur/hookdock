@@ -1,0 +1,22 @@
+$kind: http-request
+name: List tokens
+method: GET
+url: '{{base_url}}/api/tokens'
+order: 7000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Administrator only, and the response must never carry a token value: the
+      // list is what an operator reads after a leak to decide which key to revoke.
+      pm.test('the token list is readable and hides every secret', function () {
+        pm.response.to.have.status(200);
+        const tokens = pm.response.json().data;
+        pm.expect(tokens).to.be.an('array');
+        tokens.forEach((token) => {
+          pm.expect(token).to.not.have.property('token');
+          pm.expect(token).to.not.have.property('token_hash');
+          pm.expect(token.prefix).to.be.a('string');
+          pm.expect(token.scope).to.be.oneOf(['api', 'read']);
+        });
+      });

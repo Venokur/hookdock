@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import { confirm } from '../composables/dialog'
 import AppInput from './ui/AppInput.vue'
 import AppCheckbox from './ui/AppCheckbox.vue'
+import AppTextarea from './ui/AppTextarea.vue'
 import { randomEndpoint, isValidEndpoint } from '../utils/endpoint'
 import { randomSlug, isValidSlug } from '../utils/slug'
 
@@ -28,6 +29,9 @@ const form = reactive({
   dedupHeader: props.room?.dedup_header ?? '',
   // Only meaningful together with a secret: there is nothing to sign otherwise.
   requireTimestamp: Boolean(props.room?.require_timestamp),
+  // One entry per line rather than a comma-separated field: ranges are pasted from
+  // a provider's documentation, and a line break is what that page already uses.
+  allowlist: (props.room?.ip_allowlist ?? []).join('\n'),
 })
 const saving = ref(false)
 const error = ref('')
@@ -203,11 +207,20 @@ async function submit() {
   try {
     // The slug is sent only for a new room: an edit must not silently change an
     // address integrations already use, so the server keeps the current one.
+    // Parsed here rather than by splitting on every comma: the textarea is a list
+    // of lines, and an empty textarea is an explicit `[]` — the operator clearing
+    // the field means "accept anyone", not "keep whatever was there".
+    const allowlist = form.allowlist
+      .split(/\r?\n|,/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== '')
+
     const payload = {
       name: form.name.trim(),
       endpoint,
       dedup_header: form.dedupHeader.trim(),
       require_timestamp: form.requireTimestamp,
+      ip_allowlist: allowlist,
     }
     if (!isEdit.value) {
       payload.slug = slug
@@ -379,6 +392,22 @@ function close() {
               <p class="mt-1 text-[11px] text-ink-mute">
                 Значение этого заголовка считается идентификатором доставки. Повтор с тем же
                 значением сохраняется в логе, но не запускает сценарии второй раз. Пусто — выключено.
+              </p>
+
+              <label class="mt-3 block">
+                <span class="mb-1.5 block text-[11px] text-ink-mute">Разрешённые адреса отправителей</span>
+                <AppTextarea
+                  v-model="form.allowlist"
+                  :rows="3"
+                  size="sm"
+                  class="font-mono"
+                  placeholder="203.0.113.0/24&#10;198.51.100.7"
+                  aria-label="Разрешённые адреса отправителей"
+                />
+              </label>
+              <p class="mt-1 text-[11px] text-ink-mute">
+                По одному адресу или маске CIDR в строке. Запрос с чужого адреса получает
+                <code class="font-mono">403</code> и не попадает в лог. Пусто — принимаем со всех адресов.
               </p>
 
               <div class="mt-3">

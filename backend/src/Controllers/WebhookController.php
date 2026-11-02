@@ -11,6 +11,7 @@ use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
 use App\Support\RateLimiter;
+use App\Support\IpAllowlist;
 use App\Support\Signature;
 
 final class WebhookController
@@ -26,6 +27,7 @@ final class WebhookController
 
         [$room, $endpoint] = $this->resolveTarget($request, $params);
         $this->verifySignature($request, $room);
+        $this->enforceAllowlist($request, $room);
 
         $raw = $request->rawBody;
         $decoded = $raw !== '' ? json_decode($raw, true) : null;
@@ -204,6 +206,36 @@ final class WebhookController
         header('Retry-After: ' . $result['retry_after']);
 
         Response::error('Слишком много входящих запросов, повторите позже', 429);
+    }
+
+    /**
+     * The room's IP allowlist, when it has one.
+     *
+     * Runs next to `verifySignature` and for the same reason: before the `INSERT`,
+     * so a delivery from a refused address is neither stored nor queued. A room
+     * without a list accepts everyone — that is what every room did before the
+     * feature, and turning that into "deny all" on upgrade would stop every
+     * integration at once.
+     *
+     * The signature is checked first on purpose: a forged request should be
+     * answered with the reason it was forged, and telling a stranger "your address
+     * is not allowed" when the payload was also unsigned would confirm which
+     * addresses are close to being trusted.
+     *
+     * @param array<string, mixed> $room
+     */
+    private function enforceAllowlist(Request $request, array $room): void
+    {
+        $allowlist = IpAllowlist::fromColumn($room['ip_allowlist'] ?? null);
+        if ($allowlist === []) {
+            return;
+        }
+
+        if (IpAllowlist::allows($allowlist, $request->ip)) {
+            return;
+        }
+
+        Response::error(IpAllowlist::reason($allowlist, $request->ip), 403);
     }
 
     /**

@@ -58,6 +58,13 @@ const router = createRouter({
       name: 'room-users',
       component: () => import('../views/UsersView.vue'),
     },
+    {
+      // Also installation-wide and admin-only, next to accounts: a token acts as
+      // an account, so issuing one is the same kind of decision as creating one.
+      path: '/rooms/:slug/tokens',
+      name: 'room-tokens',
+      component: () => import('../views/TokensView.vue'),
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

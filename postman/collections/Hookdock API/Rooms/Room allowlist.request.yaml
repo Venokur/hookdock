@@ -1,0 +1,98 @@
+$kind: http-request
+name: Room allowlist
+method: PUT
+url: '{{base_url}}/api/rooms/{{room_id}}'
+order: 2600
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "ip_allowlist": ["203.0.113.0/24", " 198.51.100.7 ", "2001:db8::/32"]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Entries are normalized to the network address: `10.0.0.1/8` and
+      // `10.0.0.0/8` cannot both sit in the list unmasked, and a bare address is
+      // stored as `/32` or `/128` so what the operator sees is what is matched.
+      pm.test('the allowlist is stored in canonical form', function () {
+        pm.response.to.have.status(200);
+        const room = pm.response.json().data;
+        pm.expect(room.ip_allowlist).to.eql([
+          '203.0.113.0/24',
+          '198.51.100.7/32',
+          '2001:db8::/32'
+        ]);
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The runner reaches the catcher from this stack's own nginx address, which
+      // is not in the list — so a real delivery proves the refusal happens before
+      // the row is stored, rather than a unit-test-shaped claim about the matcher.
+      pm.sendRequest(
+        {
+          url: pm.collectionVariables.get('base_url') + '/hook/' + pm.collectionVariables.get('room_slug') + '/allowlist-probe',
+          method: 'POST',
+          header: { 'Content-Type': 'application/json' },
+          body: { mode: 'raw', raw: JSON.stringify({ probe: true }) }
+        },
+        function (err, res) {
+          pm.test('a delivery from outside the list is refused with 403', function () {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(403);
+            pm.expect(res.json().error.message).to.be.a('string');
+          });
+        }
+      );
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Cleared again so the rest of the collection (and the next run) can deliver.
+      // `[]` is the explicit "off": an omitted key would keep the list, and this
+      // request is the one place where that distinction is easy to get wrong.
+      pm.sendRequest(
+        {
+          url: pm.collectionVariables.get('base_url') + '/api/rooms/' + pm.collectionVariables.get('room_id'),
+          method: 'PUT',
+          header: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + pm.collectionVariables.get('token')
+          },
+          body: { mode: 'raw', raw: JSON.stringify({ ip_allowlist: [] }) }
+        },
+        function (err, res) {
+          pm.test('an explicit empty list opens the room again', function () {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(200);
+            pm.expect(res.json().data.ip_allowlist).to.eql([]);
+          });
+        }
+      );
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // An entry that is not an address or CIDR is a 422 naming the value: "неверный
+      // формат" in a list of twenty ranges does not say which one to fix.
+      pm.sendRequest(
+        {
+          url: pm.collectionVariables.get('base_url') + '/api/rooms/' + pm.collectionVariables.get('room_id'),
+          method: 'PUT',
+          header: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + pm.collectionVariables.get('token')
+          },
+          body: { mode: 'raw', raw: JSON.stringify({ ip_allowlist: ['not-an-address'] }) }
+        },
+        function (err, res) {
+          pm.test('an unparseable entry is refused', function () {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+            pm.expect(res.json().error.message).to.include('not-an-address');
+          });
+        }
+      );

@@ -1,0 +1,40 @@
+$kind: http-request
+name: Create token
+method: POST
+url: '{{base_url}}/api/tokens'
+order: 7100
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "postman {{run_suffix}}",
+      "scope": "read"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The token name includes the run suffix so a failed cleanup is visible in
+      // the list rather than blending into "postman".
+      if (!pm.collectionVariables.get('run_suffix')) {
+        pm.collectionVariables.set('run_suffix', 'postman-' + Date.now().toString(36));
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The plaintext is returned here and nowhere else. `scope` defaults to read
+      // when it is omitted, which is the credential a script should get unless it
+      // asks for more.
+      pm.test('the token is issued once with a read scope', function () {
+        pm.response.to.have.status(201);
+        const token = pm.response.json().data;
+        pm.expect(token.scope).to.eql('read');
+        pm.expect(token.token).to.be.a('string');
+        pm.expect(token.token.startsWith('hd_')).to.eql(true);
+        pm.expect(token.revoked).to.eql(false);
+        pm.collectionVariables.set('api_token_id', String(token.id));
+        pm.collectionVariables.set('api_token_value', token.token);
+      });

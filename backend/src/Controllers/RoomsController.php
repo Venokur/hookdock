@@ -10,6 +10,8 @@ use App\Http\Request;
 use App\Http\Response;
 use App\Services\Audit;
 use App\Services\Realtime;
+use App\Support\IpAllowlist;
+use App\Support\JsonColumns;
 use App\Support\Signature;
 
 /**
@@ -81,7 +83,7 @@ final class RoomsController
         $stmt = Database::pdo()->prepare(
             "SELECT r.id, r.name, r.slug, r.endpoint, r.created_at, r.updated_at,
                     (r.secret IS NOT NULL) AS has_secret,
-                    r.dedup_header, r.require_timestamp,
+                    r.dedup_header, r.require_timestamp, r.ip_allowlist,
                     COALESCE(req.total, 0)::int AS requests_total,
                     COALESCE(req.last_24h, 0)::int AS requests_last_24h,
                     req.last_received_at,
@@ -90,7 +92,8 @@ final class RoomsController
                     COALESCE(fail.total, 0)::int AS failed_runs_24h
              FROM (
                  SELECT id, name, slug, endpoint, created_at, updated_at, secret,
-                        dedup_header, require_timestamp
+                        dedup_header, require_timestamp,
+                        to_json(ip_allowlist) AS ip_allowlist
                    FROM rooms r" . $clause . "
                   ORDER BY " . $order . "
                   LIMIT " . $limit . "
@@ -119,7 +122,9 @@ final class RoomsController
              ORDER BY " . $order
         );
         $stmt->execute($params);
-        $rows = $stmt->fetchAll();
+        // `to_json(ip_allowlist)` keeps the column readable through PDO, which
+        // hands a `TEXT[]` back as the Postgres literal rather than an array.
+        $rows = JsonColumns::decodeMany($stmt->fetchAll(), ['ip_allowlist']);
 
         $countStmt = Database::pdo()->prepare('SELECT count(*) FROM rooms r' . $clause);
         $countStmt->execute($params);
@@ -178,15 +183,18 @@ final class RoomsController
 
         $dedupHeader = $this->validDedupHeader($payload['dedup_header'] ?? null);
         $requireTimestamp = filter_var($payload['require_timestamp'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $allowlist = $this->validAllowlist($payload['ip_allowlist'] ?? null);
 
         try {
-            $row = $this->insert($name, $slug, $endpoint, $secret, $dedupHeader, $requireTimestamp);
+            $row = $this->insert($name, $slug, $endpoint, $secret, $dedupHeader, $requireTimestamp, $allowlist);
         } catch (\PDOException $e) {
             if ($e->getCode() === '23505') {
                 Response::error(self::SLUG_TAKEN, 422);
             }
             throw $e;
         }
+
+        $row = JsonColumns::decode($row, ['ip_allowlist']);
 
         Realtime::publish('room.changed', ['id' => (int) $row['id'], 'slug' => $row['slug'], 'action' => 'created']);
 
@@ -204,6 +212,7 @@ final class RoomsController
                 'slug' => [null, $row['slug']],
                 'endpoint' => [null, $row['endpoint']],
                 'has_secret' => [null, $secret !== null],
+                'ip_allowlist' => [null, $row['ip_allowlist']],
             ],
         ], $request);
 
@@ -264,15 +273,26 @@ final class RoomsController
             $requireTimestamp = filter_var($payload['require_timestamp'], FILTER_VALIDATE_BOOLEAN);
         }
 
+        // Same convention as the two settings above, and for a sharper reason: an
+        // omitted list keeps the current one, so a rename form that does not show
+        // the allowlist cannot silently open the room to everyone. An explicit `[]`
+        // is how an operator turns it off, and it means exactly that — not "keep".
+        $allowlist = IpAllowlist::fromColumn($existing['ip_allowlist'] ?? null);
+        if (array_key_exists('ip_allowlist', $payload)) {
+            $allowlist = $this->validAllowlist($payload['ip_allowlist']);
+        }
+
         $stmt = Database::pdo()->prepare(
             'UPDATE rooms
                 SET name = :name, slug = :slug, endpoint = :endpoint,
                     dedup_header = :dedup_header, require_timestamp = :require_timestamp,
+                    ip_allowlist = :ip_allowlist,
                     updated_at = now()
               WHERE id = :id
               RETURNING id, name, slug, endpoint, created_at, updated_at,
                         (secret IS NOT NULL) AS has_secret,
-                        dedup_header, require_timestamp'
+                        dedup_header, require_timestamp,
+                        to_json(ip_allowlist) AS ip_allowlist'
         );
 
         try {
@@ -283,6 +303,7 @@ final class RoomsController
                 'endpoint' => $endpoint,
                 'dedup_header' => $dedupHeader,
                 'require_timestamp' => $requireTimestamp ? 'true' : 'false',
+                'ip_allowlist' => $this->pgTextArray($allowlist),
             ]);
         } catch (\PDOException $e) {
             // The unique index can still win a race against the check above.
@@ -292,7 +313,7 @@ final class RoomsController
             throw $e;
         }
 
-        $row = $stmt->fetch();
+        $row = JsonColumns::decode($stmt->fetch(), ['ip_allowlist']);
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
 
         Audit::record([
@@ -304,7 +325,7 @@ final class RoomsController
             'room_slug' => (string) $row['slug'],
             'summary' => 'Изменена комната «' . $row['name'] . '»',
             'changes' => Audit::diff($existing, $row, [
-                'name', 'slug', 'endpoint', 'dedup_header', 'require_timestamp',
+                'name', 'slug', 'endpoint', 'dedup_header', 'require_timestamp', 'ip_allowlist',
             ]),
         ], $request);
 
@@ -429,13 +450,14 @@ final class RoomsController
         $stmt = Database::pdo()->prepare(
             'SELECT id, name, slug, endpoint, created_at, updated_at,
                     (secret IS NOT NULL) AS has_secret,
-                    dedup_header, require_timestamp
+                    dedup_header, require_timestamp,
+                    to_json(ip_allowlist) AS ip_allowlist
                FROM rooms WHERE id = :id'
         );
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
 
-        return $row === false ? null : $row;
+        return $row === false ? null : JsonColumns::decode($row, ['ip_allowlist']);
     }
 
     private function validName(string $value): string
@@ -515,18 +537,20 @@ final class RoomsController
         ?string $secret = null,
         ?string $dedupHeader = null,
         bool $requireTimestamp = false,
+        array $allowlist = [],
     ): array {
         // Two statements instead of one with `CASE WHEN :secret IS NULL`: native
         // prepared statements make Postgres infer the parameter type, and a bare
         // `:secret IS NULL` fails with "could not determine data type".
-        $columns = 'name, slug, endpoint, dedup_header, require_timestamp';
-        $values = ':name, :slug, :endpoint, :dedup_header, :require_timestamp';
+        $columns = 'name, slug, endpoint, dedup_header, require_timestamp, ip_allowlist';
+        $values = ':name, :slug, :endpoint, :dedup_header, :require_timestamp, :ip_allowlist';
         $params = [
             'name' => $name,
             'slug' => $slug,
             'endpoint' => $endpoint,
             'dedup_header' => $dedupHeader,
             'require_timestamp' => $requireTimestamp ? 'true' : 'false',
+            'ip_allowlist' => $this->pgTextArray($allowlist),
         ];
 
         if ($secret !== null) {
@@ -539,11 +563,12 @@ final class RoomsController
             'INSERT INTO rooms (' . $columns . ') VALUES (' . $values . ')
              RETURNING id, name, slug, endpoint, created_at, updated_at,
                        (secret IS NOT NULL) AS has_secret,
-                       dedup_header, require_timestamp'
+                       dedup_header, require_timestamp,
+                       to_json(ip_allowlist) AS ip_allowlist'
         );
         $stmt->execute($params);
 
-        return $stmt->fetch();
+        return JsonColumns::decode($stmt->fetch(), ['ip_allowlist']);
     }
 
     /**
@@ -567,6 +592,54 @@ final class RoomsController
         }
 
         return $header;
+    }
+
+    /**
+     * The room's allowlist as a validated list of canonical CIDRs.
+     *
+     * `IpAllowlist::normalizeAll` returns the offending entry, because "неверный
+     * формат" in a list of twenty ranges tells the operator nothing about which one
+     * to fix.
+     *
+     * @param mixed $value
+     * @return list<string>
+     */
+    private function validAllowlist(mixed $value): array
+    {
+        if ($value === null) {
+            return [];
+        }
+
+        [$list, $problem] = IpAllowlist::normalizeAll($value);
+        if ($problem !== null) {
+            Response::error($problem, 422);
+        }
+
+        return $list;
+    }
+
+    /**
+     * Encodes a list for a `TEXT[]` column.
+     *
+     * A PHP array cannot be bound to an array column, so the Postgres array
+     * literal is built here. Entries are canonical addresses produced by
+     * `IpAllowlist::normalize`, so they cannot contain a quote or a backslash;
+     * escaping them anyway keeps this safe if the producer ever changes.
+     *
+     * @param list<string> $values
+     */
+    private function pgTextArray(array $values): string
+    {
+        if ($values === []) {
+            return '{}';
+        }
+
+        $escaped = array_map(
+            static fn (string $value): string => '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $value) . '"',
+            $values,
+        );
+
+        return '{' . implode(',', $escaped) . '}';
     }
 
     private function assertSlugFree(string $slug, ?int $ignoreId = null): void

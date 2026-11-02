@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Controllers\AnalyticsController;
+use App\Controllers\ApiTokensController;
 use App\Controllers\AuthController;
 use App\Controllers\AuditController;
 use App\Controllers\BreakersController;
@@ -23,6 +24,7 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 $router = new Router();
 
 $analytics = new AnalyticsController();
+$apiTokens = new ApiTokensController();
 $auth = new AuthController();
 $audit = new AuditController();
 $breakers = new BreakersController();
@@ -55,6 +57,13 @@ $router->add('GET', '/api/users', fn (Request $r) => $users->index($r));
 $router->add('POST', '/api/users', fn (Request $r) => $users->store($r));
 $router->add('PUT', '/api/users/{id}', fn (Request $r, array $p) => $users->update($r, $p));
 $router->add('DELETE', '/api/users/{id}', fn (Request $r, array $p) => $users->destroy($r, $p));
+
+// Long-lived keys for scripts and CI. Admin-only like `/api/users*`: a token acts
+// as its account, so minting one is a privilege grant rather than a preference.
+// Revoking keeps the row — `last_used_at` is the answer to "was it used first".
+$router->add('GET', '/api/tokens', fn (Request $r) => $apiTokens->index($r));
+$router->add('POST', '/api/tokens', fn (Request $r) => $apiTokens->store($r));
+$router->add('DELETE', '/api/tokens/{id}', fn (Request $r, array $p) => $apiTokens->destroy($r, $p));
 
 // "Who changed what". Reading is open to every role; the journal is written by the
 // mutating handlers themselves, so there is no write endpoint here.

@@ -1,0 +1,42 @@
+$kind: http-request
+name: Revoke token
+method: DELETE
+url: '{{base_url}}/api/tokens/{{api_token_id}}'
+order: 7300
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('api_token_id')) {
+        console.log('No token was issued by this run — nothing to revoke.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Revoking keeps the row: `last_used_at` still answers "was the key used
+      // before we noticed", and a deleted row would erase that.
+      pm.test('the token is revoked and the row is kept', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().revoked).to.eql(true);
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A revoked key must stop working on its very next request — that is the
+      // whole difference between a token and a JWT.
+      pm.sendRequest(
+        {
+          url: pm.collectionVariables.get('base_url') + '/api/rooms',
+          method: 'GET',
+          header: { Authorization: 'Bearer ' + pm.collectionVariables.get('api_token_value') }
+        },
+        function (err, res) {
+          pm.test('a revoked token is refused immediately', function () {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(401);
+          });
+        }
+      );
+      pm.collectionVariables.unset('api_token_value');
+      pm.collectionVariables.unset('api_token_id');

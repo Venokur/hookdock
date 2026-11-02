@@ -30,7 +30,12 @@ const nav = computed(() => {
     { name: 'room-audit', label: 'Аудит', hint: 'Кто и что менял' },
     // Only for an administrator: the API refuses the page to anyone else, and a
     // nav item that answers 403 is worse than no item.
-    ...(auth.canAdmin ? [{ name: 'room-users', label: 'Пользователи', hint: 'Роли и доступы' }] : []),
+    ...(auth.canAdmin
+      ? [
+          { name: 'room-users', label: 'Пользователи', hint: 'Роли и доступы' },
+          { name: 'room-tokens', label: 'Токены', hint: 'Ключи для скриптов' },
+        ]
+      : []),
   ]
 })
 

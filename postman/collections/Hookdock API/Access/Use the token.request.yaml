@@ -1,0 +1,32 @@
+$kind: http-request
+name: Use the token
+method: GET
+url: '{{base_url}}/api/auth/me'
+order: 7200
+auth:
+  type: bearer
+  credentials:
+    - key: token
+      value: '{{api_token_value}}'
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // No token, no request: sending the placeholder would answer 401 and the
+      // failure would look like a broken endpoint rather than a skipped step.
+      if (!pm.collectionVariables.get('api_token_value')) {
+        console.log('No token was issued by this run — nothing to authenticate with.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The scope comes from the row, not from the credential's contents, so a
+      // read key reports `read` even when its owner is an administrator. The role
+      // still comes from the account: scope and role are separate limits.
+      pm.test('the token authenticates and reports its scope', function () {
+        pm.response.to.have.status(200);
+        const user = pm.response.json().user;
+        pm.expect(user.scope).to.eql('read');
+        pm.expect(user.can_write).to.eql(false);
+      });

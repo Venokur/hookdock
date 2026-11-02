@@ -16,6 +16,9 @@ final class Auth
     /** @var string|null scope of the token behind `$cachedUser` */
     private static ?string $cachedScope = null;
 
+    /** @var int|null id of the `api_tokens` row behind `$cachedUser`, for the audit log */
+    private static ?int $cachedTokenId = null;
+
     /**
      * Scopes a REST token may carry.
      *
@@ -62,6 +65,13 @@ final class Auth
             return self::$cachedUser = null;
         }
 
+        // A long-lived token is a row, not a signature: it can be revoked, it can
+        // expire, and its scope is fixed when it is issued. It is tried first so a
+        // `hd_…` value never has to look like a JWT.
+        if (str_starts_with($matches[1], 'hd_')) {
+            return self::userFromApiToken($matches[1]);
+        }
+
         $claims = Jwt::decode($matches[1]);
         if ($claims === null || !isset($claims['sub'])) {
             return self::$cachedUser = null;
@@ -81,6 +91,40 @@ final class Auth
         $user = $stmt->fetch();
 
         self::$cachedScope = $scope;
+
+        return self::$cachedUser = ($user === false ? null : $user);
+    }
+
+    /**
+     * Authenticates a long-lived `hd_…` token.
+     *
+     * The scope comes from the row, not from the credential's contents, so
+     * revoking a token or narrowing its scope takes effect on the next request
+     * instead of when the token would have expired. The role still comes from
+     * `users`: a read token held by an admin is still read-only, and a viewer's
+     * full token is still refused on writes.
+     *
+     * @return array<string, mixed>|null
+     */
+    private static function userFromApiToken(string $plain): ?array
+    {
+        $token = ApiToken::resolve($plain);
+        if ($token === null) {
+            return self::$cachedUser = null;
+        }
+
+        // Same allowlist as a JWT: a future scope must not silently authenticate
+        // here because nobody remembered to add it to the refusal list.
+        if (!in_array($token['scope'], [self::SCOPE_API, self::SCOPE_READ], true)) {
+            return self::$cachedUser = null;
+        }
+
+        $stmt = Database::pdo()->prepare('SELECT id, email, role, created_at, last_login_at FROM users WHERE id = :id');
+        $stmt->execute(['id' => $token['user_id']]);
+        $user = $stmt->fetch();
+
+        self::$cachedScope = $token['scope'];
+        self::$cachedTokenId = $token['id'];
 
         return self::$cachedUser = ($user === false ? null : $user);
     }
@@ -180,5 +224,15 @@ final class Auth
     public static function scope(): string
     {
         return self::$cachedScope ?? self::SCOPE_API;
+    }
+
+    /**
+     * The `api_tokens` row that authenticated the current request, or null for a
+     * JWT. Lets a handler answer "was this done with a long-lived key" without
+     * parsing the header a second time.
+     */
+    public static function tokenId(): ?int
+    {
+        return self::$cachedTokenId;
     }
 }
