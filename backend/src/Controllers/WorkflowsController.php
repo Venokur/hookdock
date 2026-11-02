@@ -8,9 +8,12 @@ use App\Auth\Auth;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Audit;
 use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
+use App\Services\WorkflowHistory;
+use App\Support\Canonical;
 use App\Support\JsonColumns;
 use PDO;
 
@@ -112,7 +115,7 @@ final class WorkflowsController
             Response::error('Сценарий не найден', 404);
         }
 
-        $row = $this->present(JsonColumns::decode($row, ['conditions', 'actions']));
+        $decoded = JsonColumns::decode($row, ['conditions', 'actions']);
 
         Realtime::publish('workflow.changed', [
             'id' => (int) $row['id'],
@@ -120,7 +123,23 @@ final class WorkflowsController
             'action' => 'created',
         ]);
 
-        Response::json(['data' => $row], 201);
+        // A copy is a new rule, so it starts its own history at version 1 rather
+        // than inheriting the source's.
+        WorkflowHistory::snapshot($decoded, 'created', $request);
+
+        $source = $this->find($id);
+        Audit::record([
+            'action' => 'workflow.duplicated',
+            'object_type' => 'workflow',
+            'object_id' => (int) $decoded['id'],
+            'object_label' => (string) $decoded['name'],
+            'room_id' => (int) $decoded['room_id'],
+            'room_slug' => $this->roomSlug((int) $decoded['room_id']),
+            'summary' => 'Создана копия сценария «' . ($source['name'] ?? '#' . $id) . '»',
+            'changes' => ['enabled' => [null, false]],
+        ], $request);
+
+        Response::json(['data' => $this->present($decoded)], 201);
     }
 
     public function store(Request $request): void
@@ -151,6 +170,22 @@ final class WorkflowsController
             'room_id' => (int) $row['room_id'],
             'action' => 'created',
         ]);
+
+        WorkflowHistory::snapshot($row, 'created', $request);
+        Audit::record([
+            'action' => 'workflow.created',
+            'object_type' => 'workflow',
+            'object_id' => (int) $row['id'],
+            'object_label' => (string) $row['name'],
+            'room_id' => (int) $row['room_id'],
+            'room_slug' => $this->roomSlug((int) $row['room_id']),
+            'summary' => 'Создан сценарий «' . $row['name'] . '»',
+            'changes' => [
+                'endpoint' => [null, $row['endpoint']],
+                'enabled' => [null, self::isTrue($row['enabled'] ?? false)],
+                'priority' => [null, (int) $row['priority']],
+            ],
+        ], $request);
 
         Response::json(['data' => $this->present($row)], 201);
     }
@@ -216,6 +251,31 @@ final class WorkflowsController
             'action' => 'updated',
         ]);
 
+        WorkflowHistory::snapshot($decoded, 'update', $request);
+
+        // The diff describes what the operator meant to change. Nested structures
+        // are summarized rather than copied: a condition tree is reported as its
+        // leaf count and joiner, an action list as its size, so a rename does not
+        // paste the whole rule into the journal. Both sides went through
+        // `redactActions()` first, so a signature secret cannot reach it.
+        $changes = Audit::diff(
+            $this->auditable($existing),
+            $this->auditable($decoded),
+            ['name', 'endpoint', 'enabled', 'conditions', 'actions', 'priority', 'stop_processing', 'actions_version']
+        );
+
+        Audit::record([
+            'action' => 'workflow.updated',
+            'object_type' => 'workflow',
+            'object_id' => (int) $decoded['id'],
+            'object_label' => (string) $decoded['name'],
+            'room_id' => (int) $decoded['room_id'],
+            'room_slug' => $this->roomSlug((int) $decoded['room_id']),
+            'summary' => 'Изменён сценарий «' . $decoded['name'] . '»'
+                . ($changes === [] ? ' (без изменений)' : ''),
+            'changes' => $changes,
+        ], $request);
+
         Response::json(['data' => $this->present($decoded)]);
     }
 
@@ -250,6 +310,24 @@ final class WorkflowsController
             'action' => 'toggled',
         ]);
 
+        // A toggle is a configuration change like any other: it decides whether the
+        // rule sends anything, so it belongs in the history and in the journal.
+        $stored = $this->find((int) $row['id']);
+        if ($stored !== null) {
+            WorkflowHistory::snapshot($stored, 'toggle', $request);
+            Audit::record([
+                'action' => 'workflow.toggled',
+                'object_type' => 'workflow',
+                'object_id' => (int) $row['id'],
+                'object_label' => (string) $stored['name'],
+                'room_id' => (int) $row['room_id'],
+                'room_slug' => $this->roomSlug((int) $row['room_id']),
+                'summary' => (self::isTrue($row['enabled'] ?? false) ? 'Включён' : 'Выключен')
+                    . ' сценарий «' . $stored['name'] . '»',
+                'changes' => ['enabled' => [null, self::isTrue($row['enabled'] ?? false)]],
+            ], $request);
+        }
+
         Response::json(['data' => ['id' => (int) $row['id'], 'enabled' => $row['enabled']]]);
     }
 
@@ -258,6 +336,11 @@ final class WorkflowsController
         Auth::requireUser($request, true);
 
         $id = (int) ($params['id'] ?? 0);
+
+        // Read before the delete: the journal has to name what was removed, and
+        // after the row is gone there is nothing left to read.
+        $existing = $this->find($id);
+
         $stmt = Database::pdo()->prepare('DELETE FROM workflows WHERE id = :id RETURNING room_id');
         $stmt->execute(['id' => $id]);
 
@@ -268,6 +351,20 @@ final class WorkflowsController
                 'room_id' => (int) $deleted['room_id'],
                 'action' => 'deleted',
             ]);
+
+            Audit::record([
+                'action' => 'workflow.deleted',
+                'object_type' => 'workflow',
+                'object_id' => $id,
+                'object_label' => (string) ($existing['name'] ?? ''),
+                'room_id' => (int) $deleted['room_id'],
+                'room_slug' => $this->roomSlug((int) $deleted['room_id']),
+                'summary' => 'Удалён сценарий «' . ($existing['name'] ?? '#' . $id) . '»',
+                'changes' => $existing === null ? null : [
+                    'endpoint' => [$existing['endpoint'], null],
+                    'priority' => [(int) $existing['priority'], null],
+                ],
+            ], $request);
         }
 
         Response::json(['ok' => true, 'deleted' => $deleted !== false]);
@@ -418,7 +515,7 @@ final class WorkflowsController
                         (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
                      VALUES
                         (:room_id, :name, :endpoint, :enabled, :conditions, :actions, 1, :priority, :stop_processing)
-                     RETURNING id, name'
+                     RETURNING id, room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing'
                 );
                 $insert->execute([
                     'room_id' => $workflow['room_id'],
@@ -434,6 +531,10 @@ final class WorkflowsController
                 $row = $insert->fetch();
                 $created[] = ['id' => (int) $row['id'], 'name' => (string) $row['name']];
                 $names[mb_strtolower((string) $row['name'])] = true;
+
+                // Inside the transaction: a rolled-back import must not leave
+                // history rows for rules that do not exist.
+                WorkflowHistory::snapshot($row, 'import', $request);
             }
 
             $pdo->commit();
@@ -451,6 +552,20 @@ final class WorkflowsController
             'action' => 'imported',
         ]);
 
+        Audit::record([
+            'action' => 'workflow.imported',
+            'object_type' => 'room',
+            'object_id' => (int) $room['id'],
+            'object_label' => (string) $room['name'],
+            'room_id' => (int) $room['id'],
+            'room_slug' => (string) $room['slug'],
+            'summary' => 'Импортировано сценариев: ' . count($created),
+            'changes' => [
+                'created' => [0, count($created)],
+                'secrets_not_imported' => [null, $unsigned],
+            ],
+        ], $request);
+
         Response::json([
             'data' => [
                 'created' => count($created),
@@ -460,6 +575,185 @@ final class WorkflowsController
                 'secrets_not_imported' => $unsigned,
             ],
         ], 201);
+    }
+
+    /**
+     * The saved configurations of one rule, newest first.
+     *
+     * Read-only and available to every role: seeing what changed is the point of
+     * keeping the history, and an editor who cannot read it would go back to
+     * guessing.
+     */
+    public function versions(Request $request, array $params): void
+    {
+        Auth::requireUser($request);
+
+        $id = (int) ($params['id'] ?? 0);
+        $existing = $this->find($id);
+        if ($existing === null) {
+            Response::error('Сценарий не найден', 404);
+        }
+
+        $stmt = Database::pdo()->prepare(
+            'SELECT id, version, actions_version, name, endpoint, enabled, priority,
+                    stop_processing, actor_email, change, created_at
+               FROM workflow_versions
+              WHERE workflow_id = :workflow_id
+              ORDER BY version DESC
+              LIMIT 100'
+        );
+        $stmt->execute(['workflow_id' => $id]);
+
+        $rows = $stmt->fetchAll();
+        foreach ($rows as &$row) {
+            $row['id'] = (int) $row['id'];
+            $row['version'] = (int) $row['version'];
+            $row['actions_version'] = (int) $row['actions_version'];
+            $row['priority'] = (int) $row['priority'];
+            $row['enabled'] = self::isTrue($row['enabled'] ?? false);
+            $row['stop_processing'] = self::isTrue($row['stop_processing'] ?? false);
+        }
+        unset($row);
+
+        Response::json([
+            'data' => $rows,
+            'meta' => [
+                'workflow_id' => $id,
+                'current_version' => (int) ($rows[0]['version'] ?? 0),
+                'actions_version' => (int) $existing['actions_version'],
+            ],
+        ]);
+    }
+
+    /**
+     * One saved configuration, as it would be restored.
+     *
+     * The snapshot goes through `present()`-style redaction so a version cannot be
+     * the one endpoint that leaks a signature secret: the stored value is needed
+     * for a rollback, not for a read.
+     */
+    public function version(Request $request, array $params): void
+    {
+        Auth::requireUser($request);
+
+        $id = (int) ($params['id'] ?? 0);
+        $version = (int) ($params['version'] ?? 0);
+
+        if ($this->find($id) === null) {
+            Response::error('Сценарий не найден', 404);
+        }
+
+        $snapshot = WorkflowHistory::find($id, $version);
+        if ($snapshot === null) {
+            Response::error('Версия не найдена', 404);
+        }
+
+        $snapshot['id'] = (int) $snapshot['id'];
+        $snapshot['workflow_id'] = (int) $snapshot['workflow_id'];
+        $snapshot['version'] = (int) $snapshot['version'];
+        $snapshot['conditions'] = WorkflowEngine::normalizeTree($snapshot['conditions'] ?? []);
+        $snapshot['actions'] = $this->redactActions($snapshot['actions'] ?? []);
+
+        Response::json(['data' => $snapshot]);
+    }
+
+    /**
+     * Restores a saved configuration.
+     *
+     * A rollback is a new save, not a rewrite of history: the current state is
+     * snapshotted first (so the rollback itself can be undone), and the restored
+     * configuration becomes the newest version. Deleting the versions in between
+     * would make "who put this back and when" unanswerable, which is the reason the
+     * history exists.
+     *
+     * `actions_version` follows the same rule as a normal save: it only grows when
+     * the action list actually changes, so restoring a version that differs only in
+     * a name does not invalidate another tab's draft.
+     */
+    public function rollback(Request $request, array $params): void
+    {
+        Auth::requireUser($request, true);
+
+        $id = (int) ($params['id'] ?? 0);
+        $version = (int) ($params['version'] ?? 0);
+
+        $existing = $this->find($id);
+        if ($existing === null) {
+            Response::error('Сценарий не найден', 404);
+        }
+
+        $snapshot = WorkflowHistory::find($id, $version);
+        if ($snapshot === null) {
+            Response::error('Версия не найдена', 404);
+        }
+
+        $actionsVersion = (int) $existing['actions_version'];
+        if (!WorkflowHistory::sameActions($snapshot, $existing)) {
+            $actionsVersion++;
+        }
+
+        $stmt = Database::pdo()->prepare(
+            'UPDATE workflows
+                SET name = :name, endpoint = :endpoint, enabled = :enabled,
+                    conditions = :conditions, actions = :actions,
+                    actions_version = :actions_version, priority = :priority,
+                    stop_processing = :stop_processing, updated_at = now()
+              WHERE id = :id
+              RETURNING *'
+        );
+        $stmt->execute([
+            'id' => $id,
+            'name' => (string) $snapshot['name'],
+            'endpoint' => (string) $snapshot['endpoint'],
+            'enabled' => self::isTrue($snapshot['enabled'] ?? false) ? 'true' : 'false',
+            'conditions' => $this->encode(
+                WorkflowEngine::normalizeTree($snapshot['conditions'] ?? [])
+            ),
+            'actions' => $this->encode(is_array($snapshot['actions'] ?? null) ? $snapshot['actions'] : []),
+            'actions_version' => $actionsVersion,
+            'priority' => (int) $snapshot['priority'],
+            'stop_processing' => self::isTrue($snapshot['stop_processing'] ?? false) ? 'true' : 'false',
+        ]);
+
+        $row = JsonColumns::decode($stmt->fetch(), ['conditions', 'actions']);
+
+        if (self::isTrue($row['enabled'] ?? false)) {
+            // Restoring an enabled rule is also the operator saying "this should
+            // work", so the failure streak of the replaced configuration goes away.
+            $reset = Database::pdo()->prepare(
+                'UPDATE workflows
+                    SET consecutive_failures = 0, disabled_reason = NULL, disabled_at = NULL
+                  WHERE id = :id'
+            );
+            $reset->execute(['id' => $id]);
+            $row['consecutive_failures'] = 0;
+            $row['disabled_reason'] = null;
+            $row['disabled_at'] = null;
+        }
+
+        Realtime::publish('workflow.changed', [
+            'id' => $id,
+            'room_id' => (int) $row['room_id'],
+            'action' => 'updated',
+        ]);
+
+        WorkflowHistory::snapshot($row, 'rollback', $request);
+
+        Audit::record([
+            'action' => 'workflow.rolled_back',
+            'object_type' => 'workflow',
+            'object_id' => $id,
+            'object_label' => (string) $row['name'],
+            'room_id' => (int) $row['room_id'],
+            'room_slug' => $this->roomSlug((int) $row['room_id']),
+            'summary' => 'Сценарий «' . $row['name'] . '» возвращён к версии ' . $version,
+            'changes' => ['version' => [(int) $existing['actions_version'], $actionsVersion]],
+        ], $request);
+
+        Response::json([
+            'data' => $this->present($row),
+            'meta' => ['restored_from' => $version],
+        ]);
     }
 
     /**
@@ -519,6 +813,54 @@ final class WorkflowsController
         $row['actions'] = $this->redactActions($row['actions'] ?? []);
 
         return $row;
+    }
+
+    /**
+     * The shape a diff is allowed to see: secrets removed, trees and lists reduced
+     * to something a human reads in one line.
+     *
+     * `Audit::diff` already summarizes arrays, but it summarizes an *unredacted*
+     * one — an action carrying `secret` would be compared (and, on a mismatch,
+     * journalled) with its value in it. Redacting first makes the credential
+     * unable to reach the table at all, rather than relying on the shape.
+     *
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
+    private function auditable(array $row): array
+    {
+        return [
+            'name' => (string) ($row['name'] ?? ''),
+            'endpoint' => (string) ($row['endpoint'] ?? ''),
+            'enabled' => self::isTrue($row['enabled'] ?? false),
+            // The normalized tree, not a leaf counter: `Audit::shape()` keeps a
+            // small structure verbatim, so the entry can say which condition changed
+            // instead of only that the count stayed the same.
+            'conditions' => WorkflowEngine::normalizeTree($row['conditions'] ?? []),
+            'actions' => Audit::redactActions(
+                is_array($row['actions'] ?? null) ? array_values($row['actions']) : []
+            ),
+            'priority' => (int) ($row['priority'] ?? 0),
+            'stop_processing' => self::isTrue($row['stop_processing'] ?? false),
+            'actions_version' => (int) ($row['actions_version'] ?? 1),
+        ];
+    }
+
+    /**
+     * The room slug for a journal entry, or null when the room is already gone.
+     *
+     * The value is copied into `audit_log` on purpose: the record has to stay
+     * readable after the room is deleted, which a join could not do.
+     */
+    private function roomSlug(int $roomId): ?string
+    {
+        if ($roomId <= 0) {
+            return null;
+        }
+
+        $room = RoomResolver::findById($roomId);
+
+        return $room === null ? null : (string) $room['slug'];
     }
 
     /**

@@ -3,11 +3,13 @@
 declare(strict_types=1);
 
 use App\Controllers\AuthController;
+use App\Controllers\AuditController;
 use App\Controllers\BreakersController;
 use App\Controllers\HealthController;
 use App\Controllers\RequestsController;
 use App\Controllers\RoomsController;
 use App\Controllers\RunsController;
+use App\Controllers\UsersController;
 use App\Controllers\WebhookController;
 use App\Controllers\WorkflowsController;
 use App\Http\Request;
@@ -19,11 +21,13 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 $router = new Router();
 
 $auth = new AuthController();
+$audit = new AuditController();
 $breakers = new BreakersController();
 $health = new HealthController();
 $requests = new RequestsController();
 $rooms = new RoomsController();
 $runs = new RunsController();
+$users = new UsersController();
 $workflows = new WorkflowsController();
 $webhook = new WebhookController();
 
@@ -37,6 +41,20 @@ $router->add('POST', '/api/auth/logout', fn () => $auth->logout());
 $router->add('GET', '/api/auth/config', fn () => $auth->config());
 $router->add('POST', '/api/ws/ticket', fn (Request $r) => $auth->wsTicket($r));
 $router->add('POST', '/api/auth/read-token', fn (Request $r) => $auth->readToken($r));
+// Own password only: no admin role needed, but the current password is required,
+// because a stolen token must not be a permanent account takeover.
+$router->add('POST', '/api/auth/password', fn (Request $r) => $users->changePassword($r));
+
+// Accounts. Every handler is admin-only (`Auth::requireAdmin`): an editor who could
+// grant themselves `admin` would make the roles decorative.
+$router->add('GET', '/api/users', fn (Request $r) => $users->index($r));
+$router->add('POST', '/api/users', fn (Request $r) => $users->store($r));
+$router->add('PUT', '/api/users/{id}', fn (Request $r, array $p) => $users->update($r, $p));
+$router->add('DELETE', '/api/users/{id}', fn (Request $r, array $p) => $users->destroy($r, $p));
+
+// "Who changed what". Reading is open to every role; the journal is written by the
+// mutating handlers themselves, so there is no write endpoint here.
+$router->add('GET', '/api/audit', fn (Request $r) => $audit->index($r));
 
 $router->add('GET', '/api/rooms', fn (Request $r) => $rooms->index($r));
 $router->add('POST', '/api/rooms', fn (Request $r) => $rooms->store($r));
@@ -74,6 +92,11 @@ $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflo
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
 $router->add('POST', '/api/workflows/{id}/duplicate', fn (Request $r, array $p) => $workflows->duplicate($r, $p));
+// Saved configurations of one rule. Reads are open to every role; a rollback is a
+// write and passes the same `$write` flag as any other mutation.
+$router->add('GET', '/api/workflows/{id}/versions', fn (Request $r, array $p) => $workflows->versions($r, $p));
+$router->add('GET', '/api/workflows/{id}/versions/{version}', fn (Request $r, array $p) => $workflows->version($r, $p));
+$router->add('POST', '/api/workflows/{id}/versions/{version}/restore', fn (Request $r, array $p) => $workflows->rollback($r, $p));
 // A room's rules as a file, and the way back. Both live under /api/workflows so
 // the collection and the spec keep one subject; the room is a path parameter
 // because an export of "everything" is not the use case.

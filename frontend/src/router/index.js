@@ -36,6 +36,21 @@ const router = createRouter({
       name: 'room-delivery',
       component: () => import('../views/DeliveryView.vue'),
     },
+    {
+      // The feed is room-scoped by default but also answers "everything on this
+      // installation", so it lives with the other room pages rather than becoming
+      // a second shell.
+      path: '/rooms/:slug/audit',
+      name: 'room-audit',
+      component: () => import('../views/AuditView.vue'),
+    },
+    {
+      // Accounts are installation-wide, like breakers. It sits under the room so
+      // the shell, the sidebar and the deep-link resolution keep working.
+      path: '/rooms/:slug/users',
+      name: 'room-users',
+      component: () => import('../views/UsersView.vue'),
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

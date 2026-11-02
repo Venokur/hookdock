@@ -8,6 +8,7 @@ use App\Auth\Auth;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Audit;
 use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
@@ -163,6 +164,15 @@ final class RequestsController
                 'id' => $id,
                 'room_id' => (int) $deleted['room_id'],
             ]);
+
+            Audit::record([
+                'action' => 'request.deleted',
+                'object_type' => 'request',
+                'object_id' => $id,
+                'object_label' => '#' . $id,
+                'room_id' => (int) $deleted['room_id'],
+                'summary' => 'Удалён пойманный запрос #' . $id,
+            ], $request);
         }
 
         Response::json(['ok' => true, 'deleted' => $deleted !== false]);
@@ -349,6 +359,16 @@ final class RequestsController
             'room_id' => (int) $row['room_id'],
         ]);
 
+        Audit::record([
+            'action' => 'request.replayed',
+            'object_type' => 'request',
+            'object_id' => $id,
+            'object_label' => '#' . $id,
+            'room_id' => (int) $row['room_id'],
+            'summary' => 'Повторная маршрутизация запроса #' . $id . ', в очередь: ' . $queued,
+            'changes' => ['queued' => [null, $queued]],
+        ], $request);
+
         Response::json([
             'data' => ['id' => $id, 'queued' => $queued],
         ], 202);
@@ -389,6 +409,16 @@ final class RequestsController
             'id' => (int) $run['request_id'],
             'room_id' => (int) $run['room_id'],
         ]);
+
+        Audit::record([
+            'action' => 'run.retried',
+            'object_type' => 'workflow_run',
+            'object_id' => $newId,
+            'object_label' => '#' . $newId,
+            'room_id' => (int) $run['room_id'],
+            'summary' => 'Повторный запуск сценария для запроса #' . $run['request_id'],
+            'changes' => ['replaces' => [(int) $run['id'], $newId]],
+        ], $request);
 
         Response::json([
             'data' => ['id' => $newId, 'request_id' => (int) $run['request_id'], 'queued' => 1],

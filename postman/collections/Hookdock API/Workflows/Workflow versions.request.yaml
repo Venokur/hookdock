@@ -1,0 +1,32 @@
+$kind: http-request
+name: Workflow versions
+method: GET
+url: '{{base_url}}/api/workflows/{{workflow_id}}/versions'
+order: 3200
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Every save writes the whole configuration as a version, so "put back the
+      // one that worked yesterday" is a read and an update instead of a copy-paste
+      // from memory. `actions_version` protects two open tabs; it says nothing to
+      // the operator who saved a wrong rule before the weekend.
+      pm.test('the rule has a version list with a restorable snapshot', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array').that.is.not.empty;
+        pm.expect(body.meta.current_version).to.be.a('number');
+
+        const versions = body.data.map((version) => version.version);
+        pm.expect(versions).to.eql([...versions].sort((a, b) => b - a));
+      });
+
+      // The oldest entry is `baseline` (written by the migration for rules that
+      // predate history) or `created`. Either must be there, or a rollback has
+      // nowhere to go.
+      const oldest = pm.response.json().data.at(-1);
+      pm.test('the oldest version is a baseline or the creation', function () {
+        pm.expect(oldest.change).to.be.oneOf(['baseline', 'created']);
+      });
+
+      pm.collectionVariables.set('workflow_version', String(oldest.version));

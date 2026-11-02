@@ -23,6 +23,12 @@ info:
     Scopes: a login token carries `scope: api` and may do anything; a token from
     `POST /api/auth/read-token` carries `scope: read` and is refused with `403` on
     every mutating endpoint.
+
+    Roles: the account itself is `admin`, `editor` or `viewer` (`/api/users`). A
+    role and a scope answer different questions and both are enforced — the scope
+    limits the credential, the role limits the person — so a `viewer` is refused
+    every write no matter which token they hold, and only an `admin` may manage
+    accounts or grant roles.
   license:
     name: MIT
 servers:
@@ -36,6 +42,11 @@ tags:
   - name: Requests
   - name: Runs
   - name: Workflows
+  - name: Access
+    description: |
+      Accounts, their roles, and the journal of who changed what. Role changes take
+      effect on the next request because the role lives on the user, not in the
+      token.
   - name: Delivery
     description: |
       Forward targets the circuit breaker is skipping, and moving a room's rule
@@ -180,6 +191,11 @@ paths:
                             description: |
                               What this token may do. `read` means every mutating
                               endpoint will answer `403`.
+                          can_write:
+                            type: boolean
+                            description: Role and scope folded into one flag.
+                          can_admin:
+                            type: boolean
         '401':
           $ref: '#/components/responses/Unauthorized'
 
@@ -231,6 +247,274 @@ paths:
                   ok:
                     type: boolean
                     example: true
+
+  /api/auth/password:
+    post:
+      tags: [Auth]
+      summary: Change your own password
+      description: |
+        Requires the current password: a stolen token must not be a permanent
+        account takeover. Needs no `admin` role — every account may rotate its own
+        credential — but a `scope: read` token is refused with `403`, because
+        changing a password is a write.
+
+        Length is the only rule (8–72 bytes). Composition requirements («one digit,
+        one symbol») are a documented way to make passwords worse, and bcrypt
+        silently truncates at 72 bytes, so the upper bound is not cosmetic.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, password]
+              properties:
+                current_password:
+                  type: string
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 72
+      responses:
+        '200':
+          description: Changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/users:
+    get:
+      tags: [Access]
+      summary: List accounts
+      description: |
+        Administrator only. Accounts carry a role (`admin`, `editor`, `viewer`)
+        that decides what the person may do; a token scope decides what the
+        credential may do, and both are enforced — `scope: read` refuses every
+        write no matter the role, and `viewer` refuses every write no matter the
+        scope.
+
+        The role lives on the user, not in the token, so a demotion takes effect on
+        the next request instead of when the 12h token expires.
+      responses:
+        '200':
+          description: Every account, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+    post:
+      tags: [Access]
+      summary: Create an account
+      description: |
+        Administrator only. The password is hashed on the server; a client cannot
+        send a pre-hashed value. `role` defaults to `editor`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 72
+                role:
+                  $ref: '#/components/schemas/Role'
+      responses:
+        '201':
+          description: The new account.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    put:
+      tags: [Access]
+      summary: Rename an account or change its role
+      description: |
+        Administrator only, and omitting a field keeps it.
+
+        Two guards keep an installation recoverable: nobody can drop their own
+        `admin` role, and the last administrator cannot be demoted or deleted —
+        either would leave no account able to grant roles again, which no endpoint
+        could undo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                  format: email
+                role:
+                  $ref: '#/components/schemas/Role'
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 72
+                  description: |
+                    Optional reset. Only the fact that it changed is journalled,
+                    never the hash or the value.
+      responses:
+        '200':
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+    delete:
+      tags: [Access]
+      summary: Delete an account
+      description: |
+        Administrator only. Deleting yourself is refused, and so is deleting the
+        last administrator. Journal entries about the account stay: `actor_email`
+        and `object_label` are copies, so the log still explains what it did.
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/audit:
+    get:
+      tags: [Access]
+      summary: Who changed what
+      description: |
+        The journal of changes made through the dashboard, newest first. Readable
+        by every role — an editor who cannot see why a rule changed is left
+        guessing — and writable by nobody: the entries are appended by the
+        mutating handlers themselves.
+
+        It is installation-wide by default and narrowed with `?room=`, because
+        "what happened in this room" and "what did this person do" are different
+        questions. `room` also matches the copied `room_slug`, so the entries of a
+        deleted room stay findable after its `room_id` was set to `NULL`.
+
+        `changes` is `{field: [before, after]}`. Signature secrets never appear:
+        both sides of a diff are redacted first. A diff larger than 4 KB is
+        replaced by a size marker instead of a misleading excerpt.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - name: room
+          in: query
+          schema:
+            type: string
+          description: Room slug. Omitted = every room.
+        - name: action
+          in: query
+          schema:
+            type: string
+            example: workflow.updated
+          description: |
+            Exact action (`room.created`, `workflow.updated`, `user.deleted`, …).
+            `all` and an empty value mean "any".
+        - name: object_type
+          in: query
+          schema:
+            type: string
+            enum: [room, workflow, request, workflow_run, user, forward_target]
+        - name: actor
+          in: query
+          schema:
+            type: string
+          description: Substring of the actor's email.
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Substring of the summary or the object label.
+      responses:
+        '200':
+          description: A page of the journal.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEntry'
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/Pagination'
+                      - type: object
+                        properties:
+                          actions:
+                            type: array
+                            items:
+                              type: string
+                            description: The known action names, for the filter dropdown.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Invalid'
 
   /api/ws/ticket:
     post:
@@ -1312,6 +1596,115 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/workflows/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+    get:
+      tags: [Workflows]
+      summary: Saved configurations of a rule
+      description: |
+        `actions_version` protects two editors from each other; it says nothing to
+        the operator who saved a wrong rule yesterday. Every save therefore stores
+        the whole configuration as a version here, newest first (the list returns the
+        newest 100; the rows themselves are kept, so a rollback target is never
+        destroyed by housekeeping).
+
+        Readable by every role: seeing what changed is the reason the history is
+        kept. A version is stored with its signature secrets intact — otherwise a
+        restore would silently start sending unsigned requests — but reads pass
+        through the same `redactActions()` as reads of the rule, so the value still
+        never leaves the API.
+      responses:
+        '200':
+          description: Versions of this rule.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WorkflowVersion'
+                  meta:
+                    type: object
+                    properties:
+                      workflow_id:
+                        type: integer
+                      current_version:
+                        type: integer
+                        description: The newest stored version, or `0` for none.
+                      actions_version:
+                        type: integer
+                        description: The lock value the rule currently carries.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/workflows/{id}/versions/{version}:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+      - $ref: '#/components/parameters/WorkflowVersion'
+    get:
+      tags: [Workflows]
+      summary: One saved configuration
+      responses:
+        '200':
+          description: The snapshot, as it would be restored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WorkflowVersionSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/workflows/{id}/versions/{version}/restore:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+      - $ref: '#/components/parameters/WorkflowVersion'
+    post:
+      tags: [Workflows]
+      summary: Roll a rule back to a saved configuration
+      description: |
+        A rollback is a **new save**, not a rewrite of history: the current state is
+        snapshotted first (so the rollback itself can be undone), and the restored
+        configuration becomes the newest version. Deleting the versions in between
+        would make "who put this back and when" unanswerable, which is the reason
+        the history exists.
+
+        `actions_version` follows the same rule as a normal save — it only grows
+        when the action list actually differs, so restoring a version that changed
+        only a name does not invalidate another tab's draft. Restoring an enabled
+        rule also clears the failure streak, because that is the operator saying
+        "this should work".
+      responses:
+        '200':
+          description: The rule after the rollback.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Workflow'
+                  meta:
+                    type: object
+                    properties:
+                      restored_from:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/breakers:
     get:
       tags: [Delivery]
@@ -1673,6 +2066,20 @@ components:
       required: true
       schema:
         type: integer
+    WorkflowVersion:
+      name: version
+      in: path
+      required: true
+      description: The `version` number from the history list.
+      schema:
+        type: integer
+        minimum: 1
+    UserId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
     Page:
       name: page
       in: query
@@ -1700,7 +2107,10 @@ components:
             error:
               message: Требуется авторизация
     ReadOnly:
-      description: The token is read-only.
+      description: |
+        The write was refused: the token has `scope: read`, or the account's role
+        is `viewer`. A role and a scope are separate limits and both are checked,
+        so either one is enough.
       content:
         application/json:
           schema:
@@ -1708,6 +2118,18 @@ components:
           example:
             error:
               message: 'Токен только для чтения: изменение данных недоступно'
+    AdminOnly:
+      description: |
+        The operation needs the `admin` role — managing accounts, granting roles.
+        Editors are refused too, because an editor who could grant themselves
+        `admin` would make the roles decorative.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              message: 'Нужна роль «администратор»'
     NotFound:
       description: No such record, or an unknown room slug.
       content:
@@ -1839,6 +2261,164 @@ components:
         email:
           type: string
           format: email
+        role:
+          $ref: '#/components/schemas/Role'
+        scope:
+          type: string
+          enum: [api, read]
+          description: |
+            What the presented credential may do. A `read` token refuses every
+            mutating endpoint regardless of the role.
+        can_write:
+          type: boolean
+          description: |
+            Role and scope folded into the one question the UI asks. A convenience:
+            the API enforces the same rule, so hiding a button is never what
+            protects the data.
+        can_admin:
+          type: boolean
+
+    Role:
+      type: string
+      enum: [admin, editor, viewer]
+      description: |
+        - `admin` — everything, including accounts, roles and the audit log.
+        - `editor` — the product: rooms, rules, replay, retry, breakers.
+        - `viewer` — reads, exports, previews and the run journal only.
+
+        Enforced on the server, not only in the UI. The default for an existing
+        row is `admin`, so an upgrade cannot lock the operator out of the page that
+        grants roles.
+
+    Account:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    AuditEntry:
+      type: object
+      description: |
+        One line of the journal. Denormalized on purpose: `actor_email`,
+        `room_slug` and `object_label` are copies, so an entry stays readable after
+        the account was renamed and the room was deleted.
+      properties:
+        id:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        actor_id:
+          type: integer
+          nullable: true
+        actor_email:
+          type: string
+        actor_role:
+          type: string
+        action:
+          type: string
+          example: workflow.updated
+        object_type:
+          type: string
+          example: workflow
+        object_id:
+          type: integer
+          nullable: true
+        object_label:
+          type: string
+          description: The name the object had at the time, or `#<id>`.
+        room_id:
+          type: integer
+          nullable: true
+          description: |
+            `null` for an entry that is not room-scoped, and for a room that has
+            since been deleted (`ON DELETE SET NULL`).
+        room_slug:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          description: A sentence for the feed, already localized.
+        changes:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            `{field: [before, after]}`. A small nested value (a condition tree) is
+            kept verbatim so the entry can say *what* changed; a large one is
+            summarized as `{count}`. Over 4 KB the whole diff becomes
+            `{"_truncated": "<n> bytes"}`. Secrets are removed before the diff is
+            built.
+        ip:
+          type: string
+          nullable: true
+
+    WorkflowVersion:
+      type: object
+      description: |
+        One saved configuration of a rule, as listed in the history.
+      properties:
+        id:
+          type: integer
+        version:
+          type: integer
+        actions_version:
+          type: integer
+        name:
+          type: string
+        endpoint:
+          type: string
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+        stop_processing:
+          type: boolean
+        actor_email:
+          type: string
+          description: Empty for a baseline row or a change made by a script.
+        change:
+          type: string
+          enum: [baseline, created, update, toggle, import, rollback]
+          description: |
+            `baseline` is the snapshot migration `013` wrote for rules that existed
+            before history did; `rollback` is a restore, which is a new version
+            rather than a rewrite.
+        created_at:
+          type: string
+          format: date-time
+
+    WorkflowVersionSnapshot:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowVersion'
+        - type: object
+          properties:
+            workflow_id:
+              type: integer
+            room_id:
+              type: integer
+            conditions:
+              $ref: '#/components/schemas/ConditionTree'
+            actions:
+              type: array
+              items:
+                $ref: '#/components/schemas/Action'
+              description: |
+                Redacted like any other read — a signed forward reads
+                `signed: true`, never the secret. The stored snapshot keeps it, so
+                a restore still signs.
 
     Room:
       type: object

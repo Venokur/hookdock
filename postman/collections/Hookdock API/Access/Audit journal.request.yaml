@@ -1,0 +1,29 @@
+$kind: http-request
+name: Audit journal
+method: GET
+url: '{{base_url}}/api/audit?per_page=10'
+order: 6000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Readable by every role — an editor who cannot see why a rule changed is
+      // left guessing. The previous requests in this run create entries, so the
+      // page is not expected to be empty.
+      pm.test('the journal is a page and reports its action names', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta.actions).to.include('workflow.updated');
+        pm.expect(body.meta.actions).to.include('user.created');
+      });
+
+      // The diff is `{field: [before, after]}` and both sides are redacted before
+      // it is built, so a signature secret cannot reach the page.
+      const leaks = pm.response.json().data.filter((entry) => {
+        const encoded = JSON.stringify(entry.changes || {});
+        return encoded.includes('shared-hmac-secret');
+      });
+      pm.test('a signature secret never reaches the journal', function () {
+        pm.expect(leaks).to.be.an('array').that.is.empty;
+      });

@@ -1,0 +1,23 @@
+$kind: http-request
+name: List users
+method: GET
+url: '{{base_url}}/api/users'
+order: 1000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Administrator only: an editor who could grant themselves `admin` would make
+      // the roles decorative. `admin_id` is captured so the self-demote test can
+      // try to remove the role of the account that is running this collection.
+      pm.test('the accounts list is readable by an administrator', function () {
+        pm.response.to.have.status(200);
+        const users = pm.response.json().data;
+        pm.expect(users).to.be.an('array').that.is.not.empty;
+        users.forEach((user) => pm.expect(user.role).to.be.oneOf(['admin', 'editor', 'viewer']));
+      });
+
+      const me = pm.response.json().data.find((user) => user.email === 'admin@hookdock.local');
+      if (me) {
+        pm.collectionVariables.set('admin_id', String(me.id));
+      }

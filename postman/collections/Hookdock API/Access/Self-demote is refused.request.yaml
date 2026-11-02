@@ -1,0 +1,25 @@
+$kind: http-request
+name: Self-demote is refused
+method: PUT
+url: '{{base_url}}/api/users/{{admin_id}}'
+order: 4000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "role": "editor"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The guard is not "you are the last admin" but "you are you": demoting
+      // yourself is a single click that removes the role page from the very person
+      // who needs it to undo the mistake. A different admin may demote you.
+      pm.test('dropping your own admin role is refused', function () {
+        pm.response.to.have.status(422);
+        pm.expect(pm.response.json().error.message).to.include('самого себя');
+      });

@@ -8,6 +8,7 @@ use App\Auth\Auth;
 use App\Database;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Audit;
 use App\Services\Realtime;
 use App\Support\Signature;
 
@@ -189,6 +190,23 @@ final class RoomsController
 
         Realtime::publish('room.changed', ['id' => (int) $row['id'], 'slug' => $row['slug'], 'action' => 'created']);
 
+        // The room's own secret is never journalled; `has_secret` is the fact that
+        // matters and the value cannot be recovered anyway.
+        Audit::record([
+            'action' => 'room.created',
+            'object_type' => 'room',
+            'object_id' => (int) $row['id'],
+            'object_label' => (string) $row['name'],
+            'room_id' => (int) $row['id'],
+            'room_slug' => (string) $row['slug'],
+            'summary' => 'Создана комната «' . $row['name'] . '»',
+            'changes' => [
+                'slug' => [null, $row['slug']],
+                'endpoint' => [null, $row['endpoint']],
+                'has_secret' => [null, $secret !== null],
+            ],
+        ], $request);
+
         // The secret is shown exactly once, here and in `rotateSecret`: reads of a
         // room return only `has_secret`. Attaching it to the `201` lets the create
         // form display it without a second round trip (and without a window in
@@ -277,6 +295,19 @@ final class RoomsController
         $row = $stmt->fetch();
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
 
+        Audit::record([
+            'action' => 'room.updated',
+            'object_type' => 'room',
+            'object_id' => $id,
+            'object_label' => (string) $row['name'],
+            'room_id' => $id,
+            'room_slug' => (string) $row['slug'],
+            'summary' => 'Изменена комната «' . $row['name'] . '»',
+            'changes' => Audit::diff($existing, $row, [
+                'name', 'slug', 'endpoint', 'dedup_header', 'require_timestamp',
+            ]),
+        ], $request);
+
         Response::json(['data' => $row]);
     }
 
@@ -294,6 +325,17 @@ final class RoomsController
         }
 
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'deleted']);
+
+        // `room_id` is left NULL here on purpose: the FK is SET NULL anyway, and
+        // the copied slug is what keeps the entry findable afterwards.
+        Audit::record([
+            'action' => 'room.deleted',
+            'object_type' => 'room',
+            'object_id' => $id,
+            'object_label' => (string) $row['slug'],
+            'room_slug' => (string) $row['slug'],
+            'summary' => 'Удалена комната «' . $row['slug'] . '» со всеми запросами и сценариями',
+        ], $request);
 
         Response::json(['ok' => true, 'deleted' => true]);
     }
@@ -326,6 +368,16 @@ final class RoomsController
 
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
 
+        Audit::record([
+            'action' => 'room.secret_issued',
+            'object_type' => 'room',
+            'object_id' => $id,
+            'object_label' => (string) $row['slug'],
+            'room_id' => $id,
+            'room_slug' => (string) $row['slug'],
+            'summary' => 'Выпущен новый секрет подписи комнаты «' . $row['slug'] . '»',
+        ], $request);
+
         Response::json(['data' => ['secret' => $secret, 'has_secret' => true]]);
     }
 
@@ -351,6 +403,16 @@ final class RoomsController
         $row = $stmt->fetch();
 
         Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
+
+        Audit::record([
+            'action' => 'room.secret_cleared',
+            'object_type' => 'room',
+            'object_id' => $id,
+            'object_label' => (string) $row['slug'],
+            'room_id' => $id,
+            'room_slug' => (string) $row['slug'],
+            'summary' => 'Комната «' . $row['slug'] . '» снова принимает неподписанные вебхуки',
+        ], $request);
 
         Response::json(['data' => ['has_secret' => false]]);
     }

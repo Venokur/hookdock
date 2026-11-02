@@ -1,0 +1,27 @@
+$kind: http-request
+name: Cleanup user
+method: DELETE
+url: '{{base_url}}/api/users/{{created_user_id}}'
+order: 2000
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The "Access" folder creates an account per run; leaving one behind for
+      // every run buries the real accounts. Skipping when nothing was created also
+      // means a failed "Create user" cannot delete an existing one.
+      if (!pm.collectionVariables.get('created_user_id')) {
+        console.log('No account was created by this run — nothing to clean up.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The journal keeps explaining what the account did: `actor_email` and
+      // `object_label` are copies, and the FK is `SET NULL`, so deleting the row
+      // does not erase the record.
+      pm.test('the account is deleted and its journal stays', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().deleted).to.eql(true);
+      });
+      pm.collectionVariables.unset('created_user_id');

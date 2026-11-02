@@ -1,0 +1,42 @@
+$kind: http-request
+name: Create user
+method: POST
+url: '{{base_url}}/api/users'
+order: 2000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{run_suffix}}@hookdock.local",
+      "password": "postman-pass-1",
+      "role": "viewer"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // A unique address per run: the collection is meant to be repeatable, and a
+      // fixed one would answer 422 on the second run, leaving "Change role" with
+      // nothing to promote.
+      if (!pm.collectionVariables.get('run_suffix')) {
+        pm.collectionVariables.set('run_suffix', 'postman-' + Date.now().toString(36));
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The password is hashed on the server and never returned.
+      pm.test('a viewer account is created', function () {
+        pm.response.to.have.status(201);
+      });
+
+      const user = pm.response.json().data;
+      pm.test('the created account carries its role and no hash', function () {
+        pm.expect(user.role).to.eql('viewer');
+        pm.expect(user).to.not.have.property('password_hash');
+        pm.expect(user).to.not.have.property('password');
+      });
+
+      pm.collectionVariables.set('created_user_id', String(user.id));

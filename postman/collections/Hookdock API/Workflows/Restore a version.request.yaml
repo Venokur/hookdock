@@ -1,0 +1,32 @@
+$kind: http-request
+name: Restore a version
+method: POST
+url: '{{base_url}}/api/workflows/{{workflow_id}}/versions/{{workflow_version}}/restore'
+order: 3300
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Nothing to restore until the list above has captured a version number.
+      if (!pm.collectionVariables.get('workflow_version')) {
+        console.log('No version captured by "Workflow versions" — nothing to restore.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A rollback is a NEW version, not a rewrite: the current state was
+      // snapshotted first, so the rollback itself can be undone from the same
+      // list. The answer says which version it came from.
+      pm.test('the version is restored as a new save', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.meta.restored_from).to.be.a('number');
+        pm.expect(body.data.id).to.be.a('number');
+        pm.expect(body.data.actions).to.be.an('array');
+      });
+
+      // The restored action list is redacted like any other read: a signed forward
+      // reads `signed: true`, never the secret that signs it.
+      const signed = pm.response.json().data.actions.filter((action) => action.signed === true);
+      signed.forEach((action) => pm.expect(action).to.not.have.property('secret'));

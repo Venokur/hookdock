@@ -148,6 +148,16 @@ export const api = {
   breakers: () => request('/api/breakers'),
   resetBreaker: (address) => request('/api/breakers/reset', { method: 'POST', body: { address } }),
   readToken: () => request('/api/auth/read-token', { method: 'POST' }),
+  changePassword: (body) => request('/api/auth/password', { method: 'POST', body }),
+  users: () => request('/api/users'),
+  createUser: (body) => request('/api/users', { method: 'POST', body }),
+  updateUser: (id, body) => request(`/api/users/${id}`, { method: 'PUT', body }),
+  deleteUser: (id) => request(`/api/users/${id}`, { method: 'DELETE' }),
+  audit: (params = {}) => request(`/api/audit${query(params)}`),
+  workflowVersions: (id) => request(`/api/workflows/${id}/versions`),
+  workflowVersion: (id, version) => request(`/api/workflows/${id}/versions/${version}`),
+  restoreWorkflowVersion: (id, version) =>
+    request(`/api/workflows/${id}/versions/${version}/restore`, { method: 'POST' }),
   runs: (params = {}) => request(`/api/runs${query(params)}`),
   deleteWorkflow: (id) => request(`/api/workflows/${id}`, { method: 'DELETE' }),
 }

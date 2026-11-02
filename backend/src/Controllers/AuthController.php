@@ -44,7 +44,7 @@ final class AuthController
             'Слишком много попыток входа для этой учётной записи. Повторите через %d с.',
         );
 
-        $stmt = Database::pdo()->prepare('SELECT id, email, password_hash FROM users WHERE lower(email) = :email');
+        $stmt = Database::pdo()->prepare('SELECT id, email, role, password_hash FROM users WHERE lower(email) = :email');
         $stmt->execute(['email' => $email]);
         $user = $stmt->fetch();
 
@@ -70,6 +70,13 @@ final class AuthController
             'user' => [
                 'id' => (int) $user['id'],
                 'email' => $user['email'],
+                'role' => \App\Auth\Auth::roleOf($user),
+                // The SPA reads this straight from the login response, so the nav
+                // does not flicker between "everything" and "reads only" while
+                // `me` is still in flight.
+                'can_write' => \App\Auth\Auth::roleOf($user) !== \App\Auth\Auth::ROLE_VIEWER,
+                'can_admin' => \App\Auth\Auth::roleOf($user) === \App\Auth\Auth::ROLE_ADMIN,
+                'scope' => \App\Auth\Auth::SCOPE_API,
             ],
         ]);
     }
@@ -78,16 +85,10 @@ final class AuthController
     {
         $user = \App\Auth\Auth::requireUser($request);
 
-        Response::json([
-            'user' => [
-                'id' => (int) $user['id'],
-                'email' => $user['email'],
-                'last_login_at' => $user['last_login_at'],
-                // The SPA hides destructive controls for a read-only token instead
-                // of letting the operator click something the API will refuse.
-                'scope' => \App\Auth\Auth::scope(),
-            ],
-        ]);
+        $described = \App\Auth\Auth::describe($user);
+        $described['last_login_at'] = $user['last_login_at'];
+
+        Response::json(['user' => $described]);
     }
 
     /**

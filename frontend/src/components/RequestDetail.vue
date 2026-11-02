@@ -5,6 +5,7 @@ import MethodBadge from './MethodBadge.vue'
 import StatusPill from './StatusPill.vue'
 import AppSpinner from './ui/AppSpinner.vue'
 import { api } from '../api/client'
+import { useAuthStore } from '../stores/auth'
 import { notify } from '../composables/dialog'
 import { formatBytes, formatTime } from '../utils/format'
 
@@ -14,6 +15,10 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close', 'delete', 'replay', 'retry'])
+
+// The store, not a prop: every mutating control in the app asks the same question,
+// and threading a boolean through three components would drift.
+const auth = useAuthStore()
 
 const tab = ref('payload')
 const copied = ref(false)
@@ -314,7 +319,7 @@ async function copyCurl() {
             <!-- A fresh run, not a reset: the failed row keeps its attempts and
                  steps, and every action runs again. -->
             <button
-              v-if="run.status === 'failed' || run.status === 'skipped'"
+              v-if="auth.canWrite && (run.status === 'failed' || run.status === 'skipped')"
               type="button"
               class="btn shrink-0 px-2.5 py-1 text-[11px]"
               @click="emit('retry', run.id)"
@@ -379,11 +384,22 @@ async function copyCurl() {
           <AppSpinner v-if="downloading" size="xs" />
           {{ downloading ? 'Скачиваем…' : 'Скачать тело' }}
         </button>
-        <button type="button" class="btn" title="Запустить активные сценарии комнаты заново" @click="emit('replay')">
+        <button
+          v-if="auth.canWrite"
+          type="button"
+          class="btn"
+          title="Запустить активные сценарии комнаты заново"
+          @click="emit('replay')"
+        >
           Повторить маршрутизацию
         </button>
       </div>
-      <button type="button" class="btn-danger py-2" @click="emit('delete', request.id)">
+      <button
+        v-if="auth.canWrite"
+        type="button"
+        class="btn-danger py-2"
+        @click="emit('delete', request.id)"
+      >
         Удалить запрос
       </button>
     </footer>

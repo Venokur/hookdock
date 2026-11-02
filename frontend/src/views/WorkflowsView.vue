@@ -6,13 +6,15 @@ import AppSpinner from '../components/ui/AppSpinner.vue'
 import AppToggle from '../components/ui/AppToggle.vue'
 import WorkflowEditor from '../components/WorkflowEditor.vue'
 import { api } from '../api/client'
-import { confirm } from '../composables/dialog'
+import { confirm, notify } from '../composables/dialog'
 import { retain, subscribe } from '../composables/realtime'
 import { useRefresh } from '../composables/useRefresh'
+import { useAuthStore } from '../stores/auth'
 import { useRoomsStore } from '../stores/rooms'
 import { formatClock, timeAgo } from '../utils/format'
 
 const route = useRoute()
+const auth = useAuthStore()
 const rooms = useRoomsStore()
 
 const slug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
@@ -28,6 +30,23 @@ const error = ref('')
 const editorOpen = ref(false)
 const editorWorkflow = ref(null)
 const copiedId = ref(null)
+
+// Version history panel: which rule, its versions, and the one being previewed.
+const historyOpen = ref(false)
+const historyWorkflow = ref(null)
+const versions = ref([])
+const historyLoading = ref(false)
+const historyError = ref('')
+const restoring = ref(null)
+
+const changeLabels = {
+  baseline: 'исходное состояние',
+  created: 'создание',
+  update: 'правка',
+  toggle: 'включение/выключение',
+  import: 'импорт',
+  rollback: 'откат',
+}
 
 let releaseLive = null
 let offRealtime = null
@@ -124,6 +143,70 @@ async function closeEditor() {
 async function onSaved() {
   await closeEditor()
   await load()
+}
+
+/**
+ * Opens the saved configurations of one rule.
+ *
+ * The list is loaded on open rather than with the cards: a room with twenty rules
+ * would otherwise fetch twenty histories to show none of them.
+ */
+async function openHistory(workflow) {
+  historyWorkflow.value = workflow
+  historyOpen.value = true
+  versions.value = []
+  historyError.value = ''
+  historyLoading.value = true
+
+  try {
+    const data = await api.workflowVersions(workflow.id)
+    if (historyWorkflow.value?.id !== workflow.id) {
+      return
+    }
+    versions.value = data.data
+  } catch (e) {
+    historyError.value = e.message
+  } finally {
+    if (historyWorkflow.value?.id === workflow.id) {
+      historyLoading.value = false
+    }
+  }
+}
+
+function closeHistory() {
+  historyOpen.value = false
+  historyWorkflow.value = null
+  versions.value = []
+}
+
+/**
+ * A rollback is a new save, not a rewrite: the current state is snapshotted first
+ * by the server, so the rollback itself can be undone from the same list.
+ */
+async function restoreVersion(version) {
+  const confirmed = await confirm({
+    title: 'Вернуть эту версию?',
+    message: `Сценарий вернётся к состоянию «${version.name}» (версия ${version.version}, ${formatTime(version.created_at)}). Текущее состояние останется в истории.`,
+    confirmLabel: 'Вернуть версию',
+    tone: 'primary',
+  })
+
+  if (!confirmed) {
+    return
+  }
+
+  restoring.value = version.version
+
+  try {
+    await api.restoreWorkflowVersion(historyWorkflow.value.id, version.version)
+    notify(`Сценарий возвращён к версии ${version.version}`, { tone: 'success' })
+    await load()
+    await openHistory(historyWorkflow.value)
+  } catch (e) {
+    notify(e.message, { tone: 'error' })
+  } finally {
+    restoring.value = null
+  }
 }
 
 async function toggleWorkflow(workflow) {
@@ -325,7 +408,9 @@ onUnmounted(() => {
             <AppSpinner v-if="refreshing" size="xs" />
             {{ refreshing ? 'Обновляем…' : 'Обновить' }}
           </button>
-          <button type="button" class="btn-primary" @click="createWorkflow">+ Новый сценарий</button>
+          <button v-if="auth.canWrite" type="button" class="btn-primary" @click="createWorkflow">
+            + Новый сценарий
+          </button>
         </div>
       </header>
 
@@ -386,7 +471,7 @@ onUnmounted(() => {
           <p class="mx-auto mt-1 max-w-sm text-xs text-ink-mute">
             Сначала поймайте запрос, затем пересылайте его в Slack, CRM или другой API, когда поле JSON совпадёт.
           </p>
-          <button type="button" class="btn-primary mt-5" @click="createWorkflow">
+          <button v-if="auth.canWrite" type="button" class="btn-primary mt-5" @click="createWorkflow">
             Создать первый сценарий
           </button>
         </section>
@@ -523,7 +608,17 @@ onUnmounted(() => {
               </span>
 
               <div class="flex items-center gap-1">
+                <!-- History is readable by every role: seeing what changed is the
+                     reason it is kept, and a viewer is exactly who needs it. -->
                 <button
+                  type="button"
+                  class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
+                  @click="openHistory(workflow)"
+                >
+                  История
+                </button>
+                <button
+                  v-if="auth.canWrite"
                   type="button"
                   class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
                   @click="duplicateWorkflow(workflow)"
@@ -531,6 +626,7 @@ onUnmounted(() => {
                   Дублировать
                 </button>
                 <button
+                  v-if="auth.canWrite"
                   type="button"
                   class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
                   @click="editWorkflow(workflow)"
@@ -538,6 +634,7 @@ onUnmounted(() => {
                   Изменить
                 </button>
                 <button
+                  v-if="auth.canWrite"
                   type="button"
                   class="rounded-lg px-2 py-1 text-xs text-rose-600/80 transition hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-300/80 dark:hover:text-rose-300"
                   @click="removeWorkflow(workflow)"
@@ -565,5 +662,111 @@ onUnmounted(() => {
       @close="closeEditor"
       @saved="onSaved"
     />
+
+    <!-- Version history. A drawer rather than a route: it belongs to one card,
+         and leaving the list to read history would lose the operator's place. -->
+    <Teleport to="body">
+      <Transition name="fade">
+        <div
+          v-if="historyOpen"
+          class="fixed inset-0 z-40 bg-slate-900/30 backdrop-blur-sm dark:bg-slate-950/70"
+          @click="closeHistory"
+        ></div>
+      </Transition>
+
+      <Transition name="fade">
+        <aside
+          v-if="historyOpen"
+          class="fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col border-l border-line bg-surface shadow-2xl"
+        >
+          <header class="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
+            <div class="min-w-0">
+              <p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-300">
+                История версий
+              </p>
+              <h2 class="mt-1 truncate text-base font-semibold text-ink">
+                {{ historyWorkflow?.name || 'сценарий' }}
+              </h2>
+              <p class="mt-1 text-[11px] text-ink-mute">
+                Каждое сохранение — отдельная запись. Откат не стирает историю: он становится новой версией.
+              </p>
+            </div>
+            <button
+              type="button"
+              class="rounded-lg p-1.5 text-ink-mute transition hover:bg-surface-2 hover:text-ink"
+              aria-label="Закрыть историю"
+              @click="closeHistory"
+            >
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
+          </header>
+
+          <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            <p
+              v-if="historyError"
+              class="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300"
+            >
+              {{ historyError }}
+            </p>
+
+            <div v-else-if="historyLoading" class="flex items-center justify-center gap-2 py-10 text-xs text-ink-soft">
+              <AppSpinner size="sm" />
+              Загружаем версии…
+            </div>
+
+            <p v-else-if="versions.length === 0" class="py-10 text-center text-xs text-ink-mute">
+              Версий пока нет.
+            </p>
+
+            <ol v-else class="space-y-2">
+              <li
+                v-for="version in versions"
+                :key="version.version"
+                class="rounded-xl border border-line bg-surface-2 px-3 py-2.5"
+              >
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-mono text-[11px] text-ink-mute">v{{ version.version }}</span>
+                  <span class="text-[11px] font-medium text-ink-soft">
+                    {{ changeLabels[version.change] || version.change }}
+                  </span>
+                  <span
+                    class="rounded-full px-1.5 py-0.5 text-[10px] ring-1 ring-inset"
+                    :class="version.enabled
+                      ? 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300'
+                      : 'bg-ink/5 text-ink-mute ring-ink/10'"
+                  >
+                    {{ version.enabled ? 'включён' : 'выключен' }}
+                  </span>
+                  <span v-if="version.version === versions[0]?.version" class="text-[10px] text-indigo-600 dark:text-indigo-300">
+                    текущая
+                  </span>
+                </div>
+
+                <p class="mt-1 truncate text-[12px] text-ink">{{ version.name }}</p>
+
+                <p class="mt-1 text-[11px] text-ink-mute">
+                  {{ formatTime(version.created_at) }}
+                  · {{ version.actor_email || 'система' }}
+                  · действий: v{{ version.actions_version }}
+                </p>
+
+                <button
+                  v-if="auth.canWrite && version.version !== versions[0]?.version"
+                  type="button"
+                  class="btn mt-2 px-2.5 py-1 text-[11px]"
+                  :disabled="restoring !== null"
+                  @click="restoreVersion(version)"
+                >
+                  <AppSpinner v-if="restoring === version.version" size="xs" />
+                  {{ restoring === version.version ? 'Возвращаем…' : 'Вернуть эту версию' }}
+                </button>
+              </li>
+            </ol>
+          </div>
+        </aside>
+      </Transition>
+    </Teleport>
   </AppShell>
 </template>

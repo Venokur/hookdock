@@ -9,6 +9,10 @@ import AppSpinner from './ui/AppSpinner.vue'
 import RoomFormModal from './RoomFormModal.vue'
 
 const roomsStore = useRoomsStore()
+
+// Hiding the controls is a convenience, not the permission: the API refuses the
+// same calls for a viewer or a read token.
+const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 
@@ -156,6 +160,7 @@ onUnmounted(() => {
     <div class="flex items-center justify-between gap-2">
       <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink-mute">Комнаты</p>
       <button
+        v-if="auth.canWrite"
         type="button"
         class="rounded-lg px-1.5 py-0.5 text-xs font-medium text-indigo-600 transition hover:bg-indigo-500/10 dark:text-indigo-300"
         @click="openCreate"
@@ -212,6 +217,7 @@ onUnmounted(() => {
           </RouterLink>
 
           <button
+            v-if="auth.canWrite"
             type="button"
             class="hidden shrink-0 rounded-md p-1 text-ink-mute transition hover:bg-surface-2 hover:text-ink group-hover:block"
             :aria-label="`Изменить комнату ${room.name}`"
@@ -223,6 +229,7 @@ onUnmounted(() => {
           </button>
 
           <button
+            v-if="auth.canWrite"
             type="button"
             class="hidden shrink-0 rounded-md p-1 text-ink-mute transition hover:bg-rose-500/10 hover:text-rose-600 group-hover:block dark:hover:text-rose-300"
             :aria-label="`Удалить комнату ${room.name}`"

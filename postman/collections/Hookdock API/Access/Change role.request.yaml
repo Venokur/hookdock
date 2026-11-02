@@ -1,0 +1,37 @@
+$kind: http-request
+name: Change role
+method: PUT
+url: '{{base_url}}/api/users/{{created_user_id}}'
+order: 3000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "role": "editor"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Nothing to promote when "Create user" hit an existing account and captured
+      // no id. Skipping beats sending `{{created_user_id}}` verbatim.
+      if (!pm.collectionVariables.get('created_user_id')) {
+        console.log('No account was created by this run — nothing to promote.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A role lives on the user, not in the token: the change applies on the
+      // account's next request instead of when its 12h token expires.
+      pm.test('the role is changed and omitting email keeps it', function () {
+        pm.response.to.have.status(200);
+        const user = pm.response.json().data;
+        pm.expect(user.role).to.eql('editor');
+        pm.expect(user.email).to.eql(
+          pm.collectionVariables.get('run_suffix') + '@hookdock.local'
+        );
+      });

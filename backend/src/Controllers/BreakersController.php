@@ -7,6 +7,7 @@ namespace App\Controllers;
 use App\Auth\Auth;
 use App\Http\Request;
 use App\Http\Response;
+use App\Services\Audit;
 use App\Services\CircuitBreaker;
 
 /**
@@ -45,6 +46,15 @@ final class BreakersController
         }
 
         $removed = CircuitBreaker::reset($address);
+
+        Audit::record([
+            'action' => 'breaker.reset',
+            'object_type' => 'forward_target',
+            'object_label' => $address,
+            'summary' => $removed
+                ? 'Сброшен предохранитель адреса ' . $address
+                : 'Сброс предохранителя: у адреса ' . $address . ' не было состояния',
+        ], $request);
 
         Response::json(['ok' => true, 'reset' => $removed]);
     }
