@@ -1,0 +1,14 @@
+$kind: http-request
+name: Current user
+method: GET
+url: '{{base_url}}/api/auth/me'
+order: 3000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `scope` is what the SPA uses to hide controls the API would refuse.
+      pm.test('me reports the token scope', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().user.scope).to.be.oneOf(['api', 'read']);
+      });

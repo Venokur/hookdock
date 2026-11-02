@@ -9,6 +9,7 @@ use App\Database;
 use App\Http\Request;
 use App\Http\Response;
 use App\Services\Realtime;
+use App\Support\Signature;
 
 /**
  * Rooms isolate incoming requests and workflows. A webhook addressed to
@@ -19,19 +20,78 @@ final class RoomsController
 {
     private const SLUG_TAKEN = 'Slug комнаты уже занят, сгенерируйте новый';
 
+    /** Rooms the sidebar loads without a search: the latest ones. */
+    private const PAGE_SIZE = 20;
+
+    /** A search may legitimately return more than the sidebar page. */
+    private const SEARCH_LIMIT = 50;
+
+    /**
+     * The sidebar must stay fast with hundreds of rooms, so it never asks for
+     * "everything": it loads the latest page and searches the rest by name/slug.
+     *
+     * `?slug=` is an exact lookup used to resolve a deep link to a room that is
+     * older than the page — it answers 200 with an empty list for an unknown
+     * slug, because the caller is asking "does this exist", not filtering a log.
+     */
     public function index(Request $request): void
     {
         Auth::requireUser($request);
 
-        $rows = Database::pdo()->query(
+        $q = trim((string) ($request->query['q'] ?? ''));
+        $slug = strtolower(trim((string) ($request->query['slug'] ?? '')));
+
+        $requestedLimit = (int) ($request->query['limit'] ?? 0);
+        if ($requestedLimit <= 0) {
+            $requestedLimit = $q === '' ? self::PAGE_SIZE : self::SEARCH_LIMIT;
+        }
+        // Clamped and cast: the value is interpolated below, never bound.
+        $limit = min(100, max(1, $requestedLimit));
+
+        $where = [];
+        $params = [];
+
+        if ($q !== '') {
+            // `%` and `_` are LIKE wildcards, so a literal "50%" would otherwise
+            // match every room containing "50". Backslash is Postgres' default
+            // LIKE escape; a literal `ESCAPE` clause breaks PDO's placeholder
+            // parser (see the request log filter).
+            $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+            $where[] = '(r.name ILIKE :q_name OR r.slug ILIKE :q_slug)';
+            $params['q_name'] = $like;
+            $params['q_slug'] = $like;
+        }
+
+        if ($slug !== '') {
+            $where[] = 'lower(r.slug) = :slug';
+            $params['slug'] = $slug;
+        }
+
+        $clause = $where === [] ? '' : ' WHERE ' . implode(' AND ', $where);
+
+        // Newest first: the sidebar holds only the latest page, so the order has
+        // to make it obvious which rooms were left out. A search keeps the
+        // familiar alphabetical order instead.
+        $order = $q === '' ? 'r.id DESC' : 'lower(r.name), r.id';
+
+        // The LIMIT lives in a subquery on purpose. The counter laterals below are
+        // the expensive part, and a top-level LIMIT would still evaluate them for
+        // every room before sorting and discarding the rest.
+        $stmt = Database::pdo()->prepare(
             "SELECT r.id, r.name, r.slug, r.endpoint, r.created_at, r.updated_at,
+                    (r.secret IS NOT NULL) AS has_secret,
                     COALESCE(req.total, 0)::int AS requests_total,
                     COALESCE(req.last_24h, 0)::int AS requests_last_24h,
                     req.last_received_at,
                     COALESCE(wf.active, 0)::int AS workflows_active,
                     COALESCE(wf.total, 0)::int AS workflows_total,
                     COALESCE(fail.total, 0)::int AS failed_runs_24h
-             FROM rooms r
+             FROM (
+                 SELECT id, name, slug, endpoint, created_at, updated_at, secret
+                   FROM rooms r" . $clause . "
+                  ORDER BY " . $order . "
+                  LIMIT " . $limit . "
+             ) r
              LEFT JOIN LATERAL (
                  SELECT count(*) AS total,
                         count(*) FILTER (WHERE received_at >= now() - interval '24 hours') AS last_24h,
@@ -53,10 +113,24 @@ final class RoomsController
                    AND wr.status = 'failed'
                    AND wr.created_at >= now() - interval '24 hours'
              ) fail ON TRUE
-             ORDER BY lower(r.name), r.id"
-        )->fetchAll();
+             ORDER BY " . $order
+        );
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll();
 
-        Response::json(['data' => $rows]);
+        $countStmt = Database::pdo()->prepare('SELECT count(*) FROM rooms r' . $clause);
+        $countStmt->execute($params);
+        $total = (int) $countStmt->fetchColumn();
+
+        Response::json([
+            'data' => $rows,
+            'meta' => [
+                'total' => $total,
+                'limit' => $limit,
+                'returned' => count($rows),
+                'has_more' => $total > count($rows),
+            ],
+        ]);
     }
 
     public function show(Request $request, array $params): void
@@ -73,7 +147,7 @@ final class RoomsController
 
     public function store(Request $request): void
     {
-        Auth::requireUser($request);
+        Auth::requireUser($request, true);
         $payload = $request->json() ?? [];
 
         $name = $this->validName((string) ($payload['name'] ?? ''));
@@ -92,8 +166,15 @@ final class RoomsController
         // client sees 422 and has to generate a new slug explicitly.
         $this->assertSlugFree($slug);
 
+        // Turning the signature on at creation is one INSERT, not "create, then
+        // POST /secret": a failed second call would leave a room that is already
+        // visible in the sidebar but silently public. `filter_var` is what makes
+        // the JSON string "false" false — a plain cast would accept it as true.
+        $withSecret = filter_var($payload['require_signature'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $secret = $withSecret ? Signature::generate() : null;
+
         try {
-            $row = $this->insert($name, $slug, $endpoint);
+            $row = $this->insert($name, $slug, $endpoint, $secret);
         } catch (\PDOException $e) {
             if ($e->getCode() === '23505') {
                 Response::error(self::SLUG_TAKEN, 422);
@@ -103,12 +184,20 @@ final class RoomsController
 
         Realtime::publish('room.changed', ['id' => (int) $row['id'], 'slug' => $row['slug'], 'action' => 'created']);
 
+        // The secret is shown exactly once, here and in `rotateSecret`: reads of a
+        // room return only `has_secret`. Attaching it to the `201` lets the create
+        // form display it without a second round trip (and without a window in
+        // which the room exists without its signature).
+        if ($secret !== null) {
+            $row['secret'] = $secret;
+        }
+
         Response::json(['data' => $row], 201);
     }
 
     public function update(Request $request, array $params): void
     {
-        Auth::requireUser($request);
+        Auth::requireUser($request, true);
         $id = (int) ($params['id'] ?? 0);
 
         $existing = $this->find($id);
@@ -142,7 +231,8 @@ final class RoomsController
         $stmt = Database::pdo()->prepare(
             'UPDATE rooms SET name = :name, slug = :slug, endpoint = :endpoint, updated_at = now()
              WHERE id = :id
-             RETURNING id, name, slug, endpoint, created_at, updated_at'
+             RETURNING id, name, slug, endpoint, created_at, updated_at,
+                       (secret IS NOT NULL) AS has_secret'
         );
 
         try {
@@ -163,7 +253,7 @@ final class RoomsController
 
     public function destroy(Request $request, array $params): void
     {
-        Auth::requireUser($request);
+        Auth::requireUser($request, true);
         $id = (int) ($params['id'] ?? 0);
 
         $stmt = Database::pdo()->prepare('DELETE FROM rooms WHERE id = :id RETURNING id, slug');
@@ -180,6 +270,63 @@ final class RoomsController
     }
 
     /**
+     * Issues a new HMAC secret for the room.
+     *
+     * The value is returned exactly once, in this response: later reads expose
+     * only `has_secret`, so the operator has to copy it into the sender now.
+     * Rotating silently breaks every integration still signing with the old
+     * secret, which is why the SPA asks for confirmation first.
+     */
+    public function rotateSecret(Request $request, array $params): void
+    {
+        Auth::requireUser($request, true);
+        $id = (int) ($params['id'] ?? 0);
+
+        if ($this->find($id) === null) {
+            Response::error('Комната не найдена', 404);
+        }
+
+        $secret = Signature::generate();
+        $stmt = Database::pdo()->prepare(
+            'UPDATE rooms SET secret = :secret, secret_set_at = now(), updated_at = now()
+              WHERE id = :id
+              RETURNING slug'
+        );
+        $stmt->execute(['id' => $id, 'secret' => $secret]);
+        $row = $stmt->fetch();
+
+        Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
+
+        Response::json(['data' => ['secret' => $secret, 'has_secret' => true]]);
+    }
+
+    /**
+     * Removes the secret, so the room accepts unsigned webhooks again. The old
+     * secret stops working immediately: there is nothing to keep it for.
+     */
+    public function clearSecret(Request $request, array $params): void
+    {
+        Auth::requireUser($request, true);
+        $id = (int) ($params['id'] ?? 0);
+
+        if ($this->find($id) === null) {
+            Response::error('Комната не найдена', 404);
+        }
+
+        $stmt = Database::pdo()->prepare(
+            'UPDATE rooms SET secret = NULL, secret_set_at = NULL, updated_at = now()
+              WHERE id = :id
+              RETURNING slug'
+        );
+        $stmt->execute(['id' => $id]);
+        $row = $stmt->fetch();
+
+        Realtime::publish('room.changed', ['id' => $id, 'slug' => $row['slug'], 'action' => 'updated']);
+
+        Response::json(['data' => ['has_secret' => false]]);
+    }
+
+    /**
      * @return array<string, mixed>|null
      */
     private function find(int $id): ?array
@@ -189,7 +336,9 @@ final class RoomsController
         }
 
         $stmt = Database::pdo()->prepare(
-            'SELECT id, name, slug, endpoint, created_at, updated_at FROM rooms WHERE id = :id'
+            'SELECT id, name, slug, endpoint, created_at, updated_at,
+                    (secret IS NOT NULL) AS has_secret
+               FROM rooms WHERE id = :id'
         );
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
@@ -267,13 +416,27 @@ final class RoomsController
     /**
      * @return array<string, mixed>
      */
-    private function insert(string $name, string $slug, string $endpoint): array
+    private function insert(string $name, string $slug, string $endpoint, ?string $secret = null): array
     {
+        // Two statements instead of one with `CASE WHEN :secret IS NULL`: native
+        // prepared statements make Postgres infer the parameter type, and a bare
+        // `:secret IS NULL` fails with "could not determine data type".
+        $columns = 'name, slug, endpoint';
+        $values = ':name, :slug, :endpoint';
+        $params = ['name' => $name, 'slug' => $slug, 'endpoint' => $endpoint];
+
+        if ($secret !== null) {
+            $columns .= ', secret, secret_set_at';
+            $values .= ', :secret, now()';
+            $params['secret'] = $secret;
+        }
+
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO rooms (name, slug, endpoint) VALUES (:name, :slug, :endpoint)
-             RETURNING id, name, slug, endpoint, created_at, updated_at'
+            'INSERT INTO rooms (' . $columns . ') VALUES (' . $values . ')
+             RETURNING id, name, slug, endpoint, created_at, updated_at,
+                       (secret IS NOT NULL) AS has_secret'
         );
-        $stmt->execute(['name' => $name, 'slug' => $slug, 'endpoint' => $endpoint]);
+        $stmt->execute($params);
 
         return $stmt->fetch();
     }

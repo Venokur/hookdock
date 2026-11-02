@@ -1,0 +1,50 @@
+$kind: http-request
+name: Run journal
+method: GET
+url: '{{base_url}}/api/runs?room={{room_slug}}&page=1&per_page=25'
+order: 1000
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: page
+    value: '1'
+  - key: per_page
+    value: '25'
+  - key: status
+    value: failed
+    disabled: true
+    description: 'Narrow the journal to one outcome: pending, running, success, failed, skipped.'
+  - key: workflow_id
+    value: ''
+    disabled: true
+    description: Only runs of one rule.
+  - key: q
+    value: ''
+    disabled: true
+    description: Substring of the run message, the workflow name or the request path.
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // "What failed in the last hour" is the question this page answers; the
+      // request is context, the run is the subject. Enable the `status` query
+      // param to look at one outcome only.
+      pm.test('the journal lists runs of the room', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta.statuses).to.include('failed');
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Capture a run for `Retry run`. A failed run is the interesting one, but a
+      // fresh room may have none, so fall back to the newest run of any status:
+      // retrying a finished run answers 202, and a still-queued one answers 422.
+      const rows = pm.response.json().data || [];
+      const failed = rows.filter((run) => run.status === 'failed');
+      const picked = failed[0] || rows[0];
+      if (picked) {
+        pm.collectionVariables.set('run_id', String(picked.id));
+        pm.collectionVariables.set('workflow_id', String(picked.workflow_id));
+      }

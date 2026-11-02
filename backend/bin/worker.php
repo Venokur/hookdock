@@ -31,6 +31,7 @@ require dirname(__DIR__) . '/src/autoload.php';
 
 use App\Config;
 use App\Database;
+use App\Services\Heartbeat;
 use App\Services\Realtime;
 use App\Services\Retention;
 use App\Services\WorkflowEngine;
@@ -145,7 +146,11 @@ while ($running) {
     // in the idle branch — a busy worker would otherwise never get to it.
     $lastPrune = pruneIfDue($lastPrune);
 
+    // One upsert per pass with the number of runs just taken: an idle pass is
+    // 250 ms, so `beat_at` tracks the process rather than the queue, and
+    // `/api/health` can tell "idle" from "dead".
     $runs = WorkflowEngine::claim(1, $workerId);
+    Heartbeat::beat($workerId, count($runs));
 
     if ($runs === []) {
         if ($once) {

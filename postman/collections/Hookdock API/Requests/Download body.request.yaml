@@ -1,0 +1,15 @@
+$kind: http-request
+name: Download body
+method: GET
+url: '{{base_url}}/api/requests/{{request_id}}/body'
+order: 4000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `raw_body` byte for byte, so a large payload opens in an editor instead of
+      // a copy-paste field.
+      pm.test('the stored body is served as a file', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.headers.get('Content-Disposition')).to.include('attachment');
+      });

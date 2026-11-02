@@ -1,0 +1,30 @@
+$kind: http-request
+name: List workflows
+method: GET
+url: '{{base_url}}/api/workflows?room={{room_slug}}'
+order: 1000
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Conditions arrive as a normalized tree plus a leaf count; a read never
+      // returns a forward's signature secret (only `signed: true`).
+      pm.test('rules come back as trees without secrets', function () {
+        pm.response.to.have.status(200);
+        const rows = pm.response.json().data;
+        pm.expect(rows).to.be.an('array');
+        rows.forEach((row) => {
+          pm.expect(row.conditions).to.have.property('mode');
+          pm.expect(row.condition_count).to.be.a('number');
+          (row.actions || []).forEach((action) => {
+            pm.expect(action).to.not.have.property('secret');
+          });
+        });
+      });
+      const rows = pm.response.json().data;
+      if (rows && rows.length) {
+        pm.collectionVariables.set('workflow_id', String(rows[0].id));
+      }

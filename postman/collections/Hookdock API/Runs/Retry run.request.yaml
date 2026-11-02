@@ -1,0 +1,30 @@
+$kind: http-request
+name: Retry run
+method: POST
+url: '{{base_url}}/api/runs/{{run_id}}/retry'
+order: 2000
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Nothing to retry until the journal above has seen a run. Skipping beats
+      // sending `{{run_id}}` verbatim and reporting a 404 that says nothing about
+      // the API.
+      if (!pm.collectionVariables.get('run_id')) {
+        console.log('No run captured by "Run journal" — send a webhook first.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A retry inserts a NEW run: the failed row keeps its attempts and step log
+      // as evidence, and every action is executed again instead of skipping the
+      // ones that succeeded before the failure.
+      pm.test('a finished run can be queued again', function () {
+        pm.expect(pm.response.code).to.be.oneOf([202, 422]);
+      });
+      if (pm.response.code === 422) {
+        pm.test('a run that is still queued refuses a retry', function () {
+          pm.expect(pm.response.json().error.message).to.be.a('string');
+        });
+      }

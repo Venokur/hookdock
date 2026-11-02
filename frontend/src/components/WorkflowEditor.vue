@@ -1,9 +1,11 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import AppCheckbox from './ui/AppCheckbox.vue'
 import AppInput from './ui/AppInput.vue'
 import AppSelect from './ui/AppSelect.vue'
+import AppSpinner from './ui/AppSpinner.vue'
 import AppTextarea from './ui/AppTextarea.vue'
+import ConditionGroup from './ConditionGroup.vue'
 import JsonPathPicker from './JsonPathPicker.vue'
 import { api } from '../api/client'
 
@@ -14,13 +16,69 @@ const props = defineProps({
 
 const emit = defineEmits(['close', 'saved'])
 
-function blankAction() {
-  return { type: 'forward', url: '', method: 'POST', payload: 'body', message: '', mappingText: '{}' }
+/** Mirrors `WorkflowsController::MAX_DEPTH`; the API refuses anything deeper. */
+const MAX_DEPTH = 5
+
+const KNOWN_PAYLOADS = ['body', 'transformed', 'raw']
+
+function blankAction(type = 'forward') {
+  return {
+    type,
+    url: '',
+    method: 'POST',
+    payload: 'body',
+    payloadText: '{\n  "id": "{{ body.id }}"\n}',
+    headers: [],
+    message: '',
+    mappingText: '{\n  "email": "body.user.email"\n}',
+    seconds: 5,
+    // The stored secret is never sent back by the API — only `signed: true`.
+    // Typing into the field replaces it; `clearSignature` removes it.
+    secret: '',
+    signed: false,
+    clearSignature: false,
+  }
+}
+
+/**
+ * Turns the stored tree into editable groups.
+ *
+ * The API normalizes everything to `{mode, rules}`, but a value can also arrive as
+ * a bare list (an old row, or a draft from a script), so a list is read as an
+ * `all` group instead of rendering an empty editor.
+ */
+function toTree(conditions) {
+  const source = Array.isArray(conditions) ? { mode: 'all', rules: conditions } : conditions
+  const rules = Array.isArray(source?.rules) ? source.rules : []
+
+  return {
+    mode: source?.mode === 'any' ? 'any' : 'all',
+    rules: rules.map((rule) => {
+      if (rule && Array.isArray(rule.rules)) {
+        return toTree(rule)
+      }
+
+      return {
+        path: rule?.path ?? '',
+        operator: rule?.operator ?? 'equals',
+        value: rule?.value ?? '',
+      }
+    }),
+  }
 }
 
 function toForm(workflow) {
   if (!workflow) {
-    return { id: null, name: '', endpoint: '*', enabled: true, conditions: [], actions: [blankAction()] }
+    return {
+      id: null,
+      name: '',
+      endpoint: '*',
+      enabled: true,
+      priority: 0,
+      stopProcessing: false,
+      conditions: { mode: 'all', rules: [] },
+      actions: [blankAction()],
+    }
   }
 
   return {
@@ -28,26 +86,40 @@ function toForm(workflow) {
     name: workflow.name,
     endpoint: workflow.endpoint,
     enabled: workflow.enabled,
-    conditions: (workflow.conditions ?? []).map((condition) => ({
-      path: condition.path,
-      operator: condition.operator,
-      value: condition.value ?? '',
-    })),
-    actions: (workflow.actions ?? []).map((action) => ({
-      type: action.type,
-      url: action.url ?? '',
-      method: action.method ?? 'POST',
-      payload: typeof action.payload === 'string' ? action.payload : 'body',
-      message: action.message ?? '',
-      mappingText: action.type === 'transform' ? JSON.stringify(action.mapping ?? {}, null, 2) : '{}',
-    })),
+    priority: Number(workflow.priority ?? 0),
+    stopProcessing: Boolean(workflow.stop_processing),
+    conditions: toTree(workflow.conditions),
+    actions: (workflow.actions ?? []).map((action) => {
+      const base = blankAction(action.type)
+      const payload = typeof action.payload === 'string' ? action.payload : null
+      const custom = payload !== null && !KNOWN_PAYLOADS.includes(payload)
+
+      return {
+        ...base,
+        type: action.type,
+        url: action.url ?? '',
+        method: action.method ?? 'POST',
+        payload: custom ? 'custom' : payload ?? 'body',
+        payloadText: custom ? payload : base.payloadText,
+        headers: Object.entries(action.headers ?? {}).map(([name, value]) => ({ name, value: String(value) })),
+        message: action.message ?? '',
+        mappingText:
+          action.type === 'transform' ? JSON.stringify(action.mapping ?? {}, null, 2) : base.mappingText,
+        seconds: Number(action.seconds ?? base.seconds),
+        signed: Boolean(action.signed),
+      }
+    }),
   }
 }
 
 const form = reactive(toForm(props.workflow))
 const saving = ref(false)
 const error = ref('')
-const pickerIndex = ref(null)
+const pickerTarget = ref(null)
+
+const previewing = ref(false)
+const preview = ref(null)
+const previewError = ref('')
 
 const operators = [
   ['equals', 'равно'],
@@ -67,6 +139,7 @@ const actionTypes = [
   ['forward', 'Переслать на URL'],
   ['log', 'Записать в лог'],
   ['transform', 'Трансформировать поля'],
+  ['delay', 'Подождать и продолжить'],
 ]
 
 const operatorOptions = operators.map(([value, label]) => ({ value, label }))
@@ -76,14 +149,50 @@ const payloadOptions = [
   { value: 'body', label: 'Исходное JSON-тело' },
   { value: 'transformed', label: 'Трансформированные поля' },
   { value: 'raw', label: 'Сырое тело' },
+  { value: 'custom', label: 'Свой JSON' },
 ]
 
-function addCondition() {
-  form.conditions.push({ path: '', operator: 'equals', value: '' })
+const conditionCount = computed(() => countLeaves(form.conditions))
+
+function countLeaves(group) {
+  return (group.rules ?? []).reduce(
+    (total, rule) => total + (Array.isArray(rule.rules) ? countLeaves(rule) : 1),
+    0,
+  )
 }
 
-function removeCondition(index) {
-  form.conditions.splice(index, 1)
+/**
+ * Drops half-filled rules instead of sending them.
+ *
+ * A row with an empty path is what an operator leaves behind after clicking "+"
+ * and changing their mind; the API would reject it, and the error would point at a
+ * condition that is not visibly wrong. An empty group is dropped too — it would
+ * otherwise read as "passes everything" inside an AND.
+ */
+function pruneTree(group, isRoot = false) {
+  const rules = []
+
+  for (const rule of group.rules ?? []) {
+    if (Array.isArray(rule.rules)) {
+      const nested = pruneTree(rule, false)
+      if (nested.rules.length > 0) {
+        rules.push(nested)
+      }
+      continue
+    }
+
+    if (String(rule.path ?? '').trim() === '') {
+      continue
+    }
+
+    rules.push({
+      path: String(rule.path).trim(),
+      operator: rule.operator,
+      value: rule.value,
+    })
+  }
+
+  return { mode: group.mode === 'any' ? 'any' : 'all', rules: isRoot ? rules : rules }
 }
 
 function addAction() {
@@ -94,16 +203,20 @@ function removeAction(index) {
   form.actions.splice(index, 1)
 }
 
-function needsValue(operator) {
-  return !['exists', 'not_exists'].includes(operator)
+function addHeader(action) {
+  action.headers.push({ name: '', value: '' })
 }
 
-function openPicker(index) {
-  pickerIndex.value = index
+function removeHeader(action, index) {
+  action.headers.splice(index, 1)
+}
+
+function openPicker(rule) {
+  pickerTarget.value = rule
 }
 
 function closePicker() {
-  pickerIndex.value = null
+  pickerTarget.value = null
 }
 
 /**
@@ -112,13 +225,13 @@ function closePicker() {
  * `equals` on them would need a hand-written JSON literal.
  */
 function applyPick(result) {
-  const condition = form.conditions[pickerIndex.value]
-  if (!condition) {
+  const rule = pickerTarget.value
+  if (!rule) {
     closePicker()
     return
   }
 
-  condition.path = result.path
+  rule.path = result.path
 
   if (result.pathOnly || result.value === undefined || result.value === null) {
     closePicker()
@@ -126,25 +239,31 @@ function applyPick(result) {
   }
 
   if (result.type === 'boolean') {
-    condition.operator = 'equals'
-    condition.value = result.value ? 'true' : 'false'
+    rule.operator = 'equals'
+    rule.value = result.value ? 'true' : 'false'
   } else if (result.type === 'array') {
-    condition.operator = 'contains'
-    condition.value = String(result.value)
+    rule.operator = 'contains'
+    rule.value = String(result.value)
   } else {
-    condition.operator = 'equals'
-    condition.value = String(result.value)
+    rule.operator = 'equals'
+    rule.value = String(result.value)
   }
 
   closePicker()
 }
 
-async function save() {
+/**
+ * Builds the request body once, for both "save" and "check".
+ *
+ * `check` must exercise the same actions that `save` would store — a preview of a
+ * different body is a preview of nothing.
+ */
+function buildPayload() {
   error.value = ''
 
   if (!form.name.trim()) {
     error.value = 'Укажите название сценария.'
-    return
+    return null
   }
 
   const actions = []
@@ -153,14 +272,49 @@ async function save() {
     if (action.type === 'forward') {
       if (!action.url.trim()) {
         error.value = 'Для действия пересылки нужен URL.'
-        return
+        return null
       }
-      actions.push({
+
+      // Validating the header list here, not only in the API: an empty name row is
+      // a leftover, a name with a colon can never be sent.
+      const headers = {}
+      for (const header of action.headers) {
+        const name = String(header.name ?? '').trim()
+        if (name === '') {
+          continue
+        }
+        if (name.includes(':')) {
+          error.value = `Недопустимое имя заголовка: ${name}`
+          return null
+        }
+        headers[name] = String(header.value ?? '')
+      }
+
+      const payload = action.payload === 'custom'
+        ? action.payloadText
+        : action.payload || 'body'
+
+      const body = {
         type: 'forward',
         url: action.url.trim(),
         method: action.method || 'POST',
-        payload: action.payload || 'body',
-      })
+        payload,
+        headers,
+      }
+
+      // The API never returns the secret, so an untouched signed forward must send
+      // nothing — an empty value means "keep the stored one". `clearSignature`
+      // removes it, and typing a value replaces it.
+      if (action.signed && !action.clearSignature && action.secret === '') {
+        // nothing: keep as is
+      } else if (action.secret !== '') {
+        body.secret = action.secret
+      }
+      if (action.clearSignature) {
+        body.clear_signature = true
+      }
+
+      actions.push(body)
       continue
     }
 
@@ -169,30 +323,43 @@ async function save() {
       continue
     }
 
+    if (action.type === 'delay') {
+      const seconds = Number(action.seconds)
+      if (!Number.isFinite(seconds) || seconds < 1) {
+        error.value = 'Задержка должна быть не меньше 1 секунды.'
+        return null
+      }
+      actions.push({ type: 'delay', seconds: Math.round(seconds) })
+      continue
+    }
+
     let mapping = {}
     try {
       mapping = action.mappingText.trim() ? JSON.parse(action.mappingText) : {}
     } catch {
       error.value = 'Маппинг трансформации должен быть корректным JSON.'
-      return
+      return null
     }
     actions.push({ type: 'transform', mapping })
   }
 
-  const payload = {
+  return {
     id: form.id,
     room_id: props.room?.id,
     name: form.name.trim(),
     endpoint: form.endpoint.trim() || '*',
     enabled: form.enabled,
-    conditions: form.conditions
-      .filter((condition) => condition.path.trim() !== '')
-      .map((condition) => ({
-        path: condition.path.trim(),
-        operator: condition.operator,
-        value: condition.value,
-      })),
+    priority: Math.min(1000, Math.max(0, Number(form.priority) || 0)),
+    stop_processing: form.stopProcessing,
+    conditions: pruneTree(form.conditions, true),
     actions,
+  }
+}
+
+async function save() {
+  const payload = buildPayload()
+  if (!payload) {
+    return
   }
 
   saving.value = true
@@ -204,6 +371,65 @@ async function save() {
     error.value = e.message
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * Runs the draft against the newest request of this endpoint.
+ *
+ * There is nothing else to check a rule against: a condition tree is only wrong
+ * for a particular payload, and the newest one is the reason the operator opened
+ * the editor. Nothing is queued and nothing is sent, so a typo in the URL costs
+ * one request to the API instead of one broken delivery.
+ */
+async function check() {
+  previewError.value = ''
+  preview.value = null
+
+  const payload = buildPayload()
+  if (!payload) {
+    return
+  }
+
+  if (!props.room?.slug) {
+    previewError.value = 'Проверка доступна внутри комнаты.'
+    return
+  }
+
+  previewing.value = true
+
+  try {
+    const endpoint = payload.endpoint === '*' ? '' : payload.endpoint
+    const list = await api.requests({
+      room: props.room.slug,
+      endpoint,
+      per_page: 1,
+      include: 'body',
+    })
+
+    const sample = list?.data?.[0]
+    if (!sample) {
+      previewError.value = 'В комнате ещё нет запросов — проверять не на чем.'
+      return
+    }
+
+    const result = await api.previewRequest(sample.id, {
+      conditions: payload.conditions,
+      actions: payload.actions,
+    })
+
+    preview.value = {
+      requestId: sample.id,
+      method: sample.method,
+      endpoint: sample.endpoint,
+      receivedAt: sample.received_at,
+      matched: Boolean(result?.data?.workflows?.[0]?.matched),
+      steps: result?.data?.workflows?.[0]?.steps ?? [],
+    }
+  } catch (e) {
+    previewError.value = e.message
+  } finally {
+    previewing.value = false
   }
 }
 </script>
@@ -265,58 +491,20 @@ async function save() {
             <div class="flex items-center gap-2">
               <span class="grid h-6 w-6 place-items-center rounded-full bg-indigo-500/10 text-[11px] font-semibold text-indigo-600 dark:text-indigo-300">2</span>
               <h3 class="text-sm font-semibold text-ink">Условия</h3>
-              <span class="text-[11px] text-ink-mute">все должны совпасть</span>
+              <span class="text-[11px] text-ink-mute">группы И / ИЛИ, вложенность до {{ MAX_DEPTH }}</span>
             </div>
-            <button type="button" class="btn px-2.5 py-1" @click="addCondition">+ Условие</button>
           </div>
 
-          <div class="mt-3 space-y-2 pl-8">
-            <p v-if="form.conditions.length === 0" class="rounded-xl border border-dashed border-line px-3 py-3 text-xs text-ink-mute">
-              Условий нет — сценарий сработает на каждый запрос этого эндпоинта.
+          <div class="mt-3 pl-8">
+            <ConditionGroup
+              :group="form.conditions"
+              :operators="operatorOptions"
+              :max-depth="MAX_DEPTH"
+              @pick="openPicker"
+            />
+            <p class="mt-2 text-[11px] text-ink-mute">
+              Условий: {{ conditionCount }} · вложенность: {{ MAX_DEPTH }} уровней
             </p>
-
-            <div
-              v-for="(condition, index) in form.conditions"
-              :key="index"
-              class="grid grid-cols-1 gap-2 rounded-xl border border-line bg-surface-2 p-3 sm:grid-cols-[1.4fr_1fr_1fr_auto]"
-            >
-              <div class="flex items-center gap-1">
-                <AppInput
-                  v-model="condition.path"
-                  size="sm"
-                  placeholder="body.event.type"
-                  aria-label="Путь к полю"
-                  class="font-mono"
-                />
-                <button
-                  type="button"
-                  class="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-surface font-mono text-[11px] text-ink-soft transition hover:bg-surface-2 hover:text-ink"
-                  aria-label="Выбрать путь из запроса"
-                  title="Выбрать путь из запроса"
-                  @click="openPicker(index)"
-                >
-                  { }
-                </button>
-              </div>
-              <AppSelect v-model="condition.operator" :options="operatorOptions" size="sm" />
-              <AppInput
-                v-if="needsValue(condition.operator)"
-                v-model="condition.value"
-                size="sm"
-                placeholder="значение"
-              />
-              <span v-else class="hidden sm:block"></span>
-              <button
-                type="button"
-                class="justify-self-start rounded-lg p-1.5 text-ink-mute transition hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300 sm:justify-self-end"
-                aria-label="Удалить условие"
-                @click="removeCondition(index)"
-              >
-                <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path stroke-linecap="round" d="M6 7h12M9 7V5h6v2m-8 0l1 13h8l1-13" />
-                </svg>
-              </button>
-            </div>
           </div>
         </section>
 
@@ -337,7 +525,7 @@ async function save() {
               class="rounded-xl border border-line bg-surface-2 p-3"
             >
               <div class="flex items-center justify-between gap-2">
-                <AppSelect v-model="action.type" :options="actionTypeOptions" size="sm" class="w-48" />
+                <AppSelect v-model="action.type" :options="actionTypeOptions" size="sm" class="w-52" />
                 <button
                   v-if="form.actions.length > 1"
                   type="button"
@@ -362,9 +550,81 @@ async function save() {
                   <AppSelect v-model="action.method" :options="methodOptions" size="sm" />
                   <AppSelect v-model="action.payload" :options="payloadOptions" size="sm" />
                 </div>
+
+                <AppTextarea
+                  v-if="action.payload === 'custom'"
+                  v-model="action.payloadText"
+                  :rows="5"
+                  size="sm"
+                  class="font-mono"
+                  aria-label="Своё тело запроса"
+                />
+                <p v-if="action.payload === 'custom'" class="text-[11px] text-ink-mute">
+                  Своё тело — шаблон. Подставляйте поля через
+                  <code class="font-mono text-ink-soft" v-pre>{{ body.event.type }}</code>, значение будет
+                  строкой; чтобы отправить число или объект, используйте действие «Трансформировать поля».
+                </p>
+
+                <div class="rounded-lg border border-line bg-surface p-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-[11px] font-medium text-ink-soft">Заголовки</span>
+                    <button type="button" class="btn px-2 py-0.5 text-[11px]" @click="addHeader(action)">
+                      + Заголовок
+                    </button>
+                  </div>
+
+                  <p v-if="action.headers.length === 0" class="mt-1 text-[11px] text-ink-mute">
+                    Кроме <code class="font-mono">Content-Type: application/json</code> заголовков нет.
+                  </p>
+
+                  <div
+                    v-for="(header, headerIndex) in action.headers"
+                    :key="headerIndex"
+                    class="mt-2 grid grid-cols-[1fr_1.4fr_auto] gap-1.5"
+                  >
+                    <AppInput v-model="header.name" size="sm" placeholder="X-Event" class="font-mono" />
+                    <AppInput v-model="header.value" size="sm" placeholder="payment" class="font-mono" />
+                    <button
+                      type="button"
+                      class="rounded-lg p-1.5 text-ink-mute transition hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300"
+                      aria-label="Удалить заголовок"
+                      @click="removeHeader(action, headerIndex)"
+                    >
+                      <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" d="M6 6l12 12M18 6L6 18" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="rounded-lg border border-line bg-surface p-2">
+                  <AppCheckbox
+                    v-model="action.clearSignature"
+                    :label="action.signed ? 'Убрать подпись исходящего запроса' : 'Убрать подпись (её нет)'"
+                    :disabled="!action.signed"
+                  />
+                  <p class="mt-1 text-[11px] text-ink-mute">
+                    <template v-if="action.signed && !action.clearSignature">
+                      Подпись включена. Поле ниже — чтобы заменить секрет; оставьте пустым, чтобы сохранить текущий.
+                    </template>
+                    <template v-else>
+                      Секрет подписи: запрос уйдёт с
+                      <code class="font-mono text-ink-soft">X-Hookdock-Signature</code> (HMAC-SHA256 тела).
+                    </template>
+                  </p>
+                  <AppInput
+                    v-model="action.secret"
+                    size="sm"
+                    type="password"
+                    class="mt-2 font-mono"
+                    :placeholder="action.signed ? 'оставьте пустым, чтобы сохранить' : 'секрет получателя'"
+                    :disabled="action.clearSignature"
+                  />
+                </div>
+
                 <p class="text-[11px] text-ink-mute">
                   Плейсхолдеры вида <code class="font-mono text-ink-soft" v-pre>{{ body.customer.email }}</code>
-                  работают в URL и заголовках.
+                  работают в URL, заголовках и своём теле.
                 </p>
               </div>
 
@@ -373,6 +633,17 @@ async function save() {
                 <p class="mt-1 text-[11px] text-ink-mute">
                   Поддерживаются шаблоны вида
                   <code class="font-mono text-ink-soft" v-pre>{{ body.customer.name }}</code>.
+                </p>
+              </div>
+
+              <div v-else-if="action.type === 'delay'" class="mt-3 space-y-2">
+                <label class="block">
+                  <span class="mb-1.5 block text-xs font-medium text-ink-soft">Подождать, секунд</span>
+                  <AppInput v-model.number="action.seconds" size="sm" type="number" min="1" max="86400" />
+                </label>
+                <p class="text-[11px] text-ink-mute">
+                  Остальные действия выполнятся позже. Пауза не расходует попытки и не повторяется при
+                  ретрае — это удобно, чтобы дождаться, пока источник данных обновится.
                 </p>
               </div>
 
@@ -392,9 +663,110 @@ async function save() {
           </div>
         </section>
 
-        <div class="ml-8">
-          <AppCheckbox v-model="form.enabled" label="Сценарий активен" />
-        </div>
+        <section>
+          <div class="flex items-center gap-2">
+            <span class="grid h-6 w-6 place-items-center rounded-full bg-indigo-500/10 text-[11px] font-semibold text-indigo-600 dark:text-indigo-300">4</span>
+            <h3 class="text-sm font-semibold text-ink">Порядок и остановка</h3>
+          </div>
+
+          <div class="mt-3 space-y-3 pl-8">
+            <div class="grid gap-3 sm:grid-cols-2">
+              <label class="block">
+                <span class="mb-1.5 block text-xs font-medium text-ink-soft">Приоритет</span>
+                <AppInput v-model.number="form.priority" type="number" min="0" max="1000" />
+              </label>
+              <div class="self-end">
+                <AppCheckbox v-model="form.enabled" label="Сценарий активен" />
+              </div>
+            </div>
+            <p class="text-[11px] text-ink-mute">
+              Сценарии с большим приоритетом выполняются первыми. При равном приоритете — по порядку
+              создания.
+            </p>
+
+            <AppCheckbox
+              v-model="form.stopProcessing"
+              label="Остановить остальные сценарии после успеха"
+            />
+            <p class="text-[11px] text-ink-mute">
+              Превращает набор сценариев в «срабатывает первое подходящее»: остальные правила этого
+              запроса перейдут в статус «пропущено» с пометкой, кто их остановил. Если это правило
+              упадёт, остальные всё равно выполнятся.
+            </p>
+          </div>
+        </section>
+
+        <section>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="text-sm font-semibold text-ink">Проверка</h3>
+              <p class="text-[11px] text-ink-mute">
+                Прогон на последнем запросе комнаты: ничего не отправляется и не ставится в очередь.
+              </p>
+            </div>
+            <button type="button" class="btn px-3 py-1.5" :disabled="previewing" @click="check">
+              <AppSpinner v-if="previewing" size="xs" />
+              <span>{{ previewing ? 'Проверяем…' : 'Проверить правила' }}</span>
+            </button>
+          </div>
+
+          <p
+            v-if="previewError"
+            class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          >
+            {{ previewError }}
+          </p>
+
+          <div v-if="preview" class="mt-3 space-y-2">
+            <p class="text-[11px] text-ink-mute">
+              Запрос #{{ preview.requestId }} · {{ preview.method }} · /{{ preview.endpoint }}
+            </p>
+
+            <p
+              class="rounded-xl border px-3 py-2 text-xs"
+              :class="preview.matched
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                : 'border-line bg-surface-2 text-ink-soft'"
+            >
+              {{ preview.matched
+                ? 'Условия совпали — сценарий выполнился бы.'
+                : 'Условия не совпали — на этом запросе сценарий пропущен.' }}
+            </p>
+
+            <div
+              v-for="step in preview.steps"
+              :key="step.index"
+              class="rounded-xl border border-line bg-surface-2 px-3 py-2 text-[11px]"
+            >
+              <p class="font-medium text-ink-soft">
+                {{ step.index + 1 }}. {{ step.type }}
+              </p>
+
+              <p v-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
+
+              <p v-else-if="step.type === 'delay'" class="mt-1 text-ink-mute">
+                пауза {{ step.seconds }} с, затем остальные действия
+              </p>
+
+              <template v-else-if="step.type === 'transform'">
+                <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ JSON.stringify(step.mapping, null, 2) }}</pre>
+              </template>
+
+              <template v-else-if="step.type === 'forward'">
+                <p class="mt-1 font-mono text-ink-mute break-all">{{ step.method }} {{ step.url }}</p>
+                <p
+                  v-if="!step.allowed"
+                  class="mt-1 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-600 dark:text-rose-300"
+                >
+                  Адрес будет отклонён: {{ step.reason || 'недопустимый URL' }}
+                </p>
+                <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ step.body }}</pre>
+              </template>
+
+              <p v-else class="mt-1 text-ink-mute">{{ step.message }}</p>
+            </div>
+          </div>
+        </section>
 
         <p v-if="error" class="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
           {{ error }}
@@ -410,7 +782,7 @@ async function save() {
     </div>
 
     <JsonPathPicker
-      v-if="pickerIndex !== null"
+      v-if="pickerTarget"
       :room="room"
       :endpoint="form.endpoint"
       @close="closePicker"

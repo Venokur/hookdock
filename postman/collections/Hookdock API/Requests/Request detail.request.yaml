@@ -1,0 +1,17 @@
+$kind: http-request
+name: Request detail
+method: GET
+url: '{{base_url}}/api/requests/{{request_id}}'
+order: 2000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Each run carries its step log, so the card answers "what happened" without
+      // a second round trip per rule.
+      pm.test('a request comes back with its runs and steps', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json().data;
+        pm.expect(body.request.id).to.be.a('number');
+        pm.expect(body.runs).to.be.an('array');
+      });

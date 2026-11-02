@@ -1,0 +1,31 @@
+$kind: http-request
+name: List rooms
+method: GET
+url: '{{base_url}}/api/rooms'
+order: 1000
+queryParams:
+  - key: q
+    value: ''
+    disabled: true
+    description: Case-insensitive substring of the name or slug.
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The list is a page: the sidebar loads the latest 20 and searches the rest.
+      pm.test('the rooms list is a page', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta).to.have.property('has_more');
+        pm.expect(body.meta).to.have.property('total');
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Capture a room so the room-scoped requests are runnable without editing.
+      const body = pm.response.json();
+      if (body.data && body.data.length) {
+        pm.collectionVariables.set('room_slug', body.data[0].slug);
+        pm.collectionVariables.set('room_id', String(body.data[0].id));
+      }

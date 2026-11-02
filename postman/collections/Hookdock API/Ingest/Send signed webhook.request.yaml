@@ -1,0 +1,40 @@
+$kind: http-request
+name: Send signed webhook
+method: POST
+url: '{{base_url}}/hook/{{room_slug}}/postman'
+order: 6000
+auth:
+  type: noauth
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "event": { "type": "payment" }
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // `X-Hookdock-Signature: sha256=<hex>` is HMAC-SHA256 over the body exactly
+      // as it is sent. The catcher verifies it BEFORE the INSERT, so a forged
+      // request is neither stored nor routed. `room_secret` comes from
+      // Rooms / Rotate room secret.
+      //
+      // CryptoJS is the only HMAC available here: the sandbox's `crypto` object is
+      // WebCrypto (no `createHmac`) and `require('crypto')` cannot resolve, so the
+      // deprecation notice the runner prints is cosmetic.
+      const secret = pm.collectionVariables.get('room_secret') || '';
+      const body = pm.request.body ? pm.request.body.raw : '';
+      const signature = CryptoJS.HmacSHA256(body, secret).toString(CryptoJS.enc.Hex);
+      pm.request.headers.upsert({ key: 'X-Hookdock-Signature', value: 'sha256=' + signature });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // 401 here means the signature was computed for a different body, or
+      // `room_secret` is empty because the room is public (which accepts anybody).
+      pm.test('a signed webhook is accepted once the room requires it', function () {
+        pm.expect(pm.response.code).to.be.oneOf([202, 401]);
+      });

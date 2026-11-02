@@ -1,0 +1,42 @@
+$kind: http-request
+name: Preview (dry run)
+method: POST
+url: '{{base_url}}/api/requests/{{request_id}}/preview'
+order: 3000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "conditions": {
+        "mode": "all",
+        "rules": [
+          { "path": "body.event.type", "operator": "equals", "value": "payment" },
+          {
+            "mode": "any",
+            "rules": [
+              { "path": "body.customer.name", "operator": "equals", "value": "Ada" },
+              { "path": "body.customer.name", "operator": "equals", "value": "Bob" }
+            ]
+          }
+        ]
+      },
+      "actions": [
+        { "type": "log", "message": "paid by {{ body.customer.name }}" }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A dry run describes what would happen; it never queues a run or sends a
+      // packet. Send `{}` instead to evaluate every enabled rule of the room.
+      pm.test('a draft preview reports a match and its steps', function () {
+        pm.response.to.have.status(200);
+        const data = pm.response.json().data;
+        pm.expect(data.mode).to.eql('draft');
+        pm.expect(data.workflows[0]).to.have.property('matched');
+        pm.expect(data.workflows[0].steps).to.be.an('array');
+      });

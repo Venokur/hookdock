@@ -1,0 +1,40 @@
+$kind: http-request
+name: Create room
+method: POST
+url: '{{base_url}}/api/rooms'
+order: 2000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "Postman room",
+      "require_signature": false
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The slug and endpoint are generated when omitted; nothing about the name
+      // determines the address, so renaming a room never breaks a webhook URL.
+      pm.test('a room is created with a generated address', function () {
+        pm.response.to.have.status(201);
+        const room = pm.response.json().data;
+        pm.expect(room.slug).to.be.a('string').and.not.empty;
+        pm.expect(room.endpoint).to.match(/^hook-/);
+        pm.expect(room.secret).to.be.undefined;
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `created_room_id` is what the teardown deletes. It is separate from
+      // `room_id` so "Cleanup room" can only ever remove the room this collection
+      // made, never one that already existed in the installation.
+      const room = pm.response.json().data;
+      if (room) {
+        pm.collectionVariables.set('room_slug', room.slug);
+        pm.collectionVariables.set('room_id', String(room.id));
+        pm.collectionVariables.set('created_room_id', String(room.id));
+      }

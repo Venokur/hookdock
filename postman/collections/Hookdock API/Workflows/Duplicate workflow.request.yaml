@@ -1,0 +1,18 @@
+$kind: http-request
+name: Duplicate workflow
+method: POST
+url: '{{base_url}}/api/workflows/{{workflow_id}}/duplicate'
+order: 3000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The copy is created paused, so experimenting with a live rule cannot
+      // double every forward while it is being edited.
+      pm.test('the copy starts paused and keeps the rule', function () {
+        pm.response.to.have.status(201);
+        const copy = pm.response.json().data;
+        pm.expect(copy.enabled).to.eql(false);
+        pm.expect(copy.name).to.include('копия');
+        pm.expect(copy.condition_count).to.be.a('number');
+      });

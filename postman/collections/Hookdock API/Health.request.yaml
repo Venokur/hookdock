@@ -1,0 +1,17 @@
+﻿$kind: http-request
+name: Health
+method: GET
+url: '{{base_url}}/api/health'
+auth:
+  type: noauth
+order: 1000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('health is public and answers with checks', function () {
+        pm.expect(pm.response.code).to.be.oneOf([200, 503]);
+        const body = pm.response.json();
+        pm.expect(body).to.have.property('checks');
+        pm.expect(body.checks).to.have.property('database');
+      });

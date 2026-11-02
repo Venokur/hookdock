@@ -1,0 +1,34 @@
+$kind: http-request
+name: Send webhook
+method: POST
+url: '{{base_url}}/hook/{{room_slug}}/postman'
+order: 5000
+auth:
+  type: noauth
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "event": { "type": "payment", "amount": 42 },
+      "customer": { "name": "Ada" }
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Ingestion is asynchronous: 202 with `queued: N` means the request is
+      // stored and the worker has work, not that anything was forwarded yet.
+      pm.test('the catcher stores the webhook and queues runs', function () {
+        pm.response.to.have.status(202);
+        const body = pm.response.json();
+        pm.expect(body.ok).to.eql(true);
+        pm.expect(body.queued).to.be.a('number');
+      });
+      const body = pm.response.json();
+      if (body.id) {
+        pm.collectionVariables.set('request_id', String(body.id));
+        pm.collectionVariables.set('last_queued', String(body.queued));
+      }

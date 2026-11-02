@@ -1,0 +1,26 @@
+$kind: http-request
+name: Cleanup room
+method: DELETE
+url: '{{base_url}}/api/rooms/{{created_room_id}}'
+order: 1000
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The collection is meant to be run repeatedly; leaving a "Postman room"
+      // per run buries the real rooms in the sidebar. Skipping when nothing was
+      // created also means a failed "Create room" cannot delete an existing one.
+      if (!pm.collectionVariables.get('created_room_id')) {
+        console.log('No room was created by this run — nothing to clean up.');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Deleting a room cascades to its requests, workflows, runs and steps, so
+      // this one request undoes everything the run created.
+      pm.test('the room and everything in it is deleted', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().deleted).to.eql(true);
+      });
+      pm.collectionVariables.unset('created_room_id');

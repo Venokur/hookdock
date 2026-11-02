@@ -1,0 +1,33 @@
+$kind: http-request
+name: Login
+method: POST
+url: '{{base_url}}/api/auth/login'
+auth:
+  type: noauth
+order: 1000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "admin@hookdock.local",
+      "password": "123456"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Every other request inherits the collection bearer auth, which reads
+      // `token`. Login is the only request with no auth of its own, so it has to
+      // hand the value over.
+      pm.test('login issues an api-scoped token', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.token).to.be.a('string').and.not.empty;
+      });
+      const body = pm.response.json();
+      if (body.token) {
+        pm.collectionVariables.set('token', body.token);
+      }

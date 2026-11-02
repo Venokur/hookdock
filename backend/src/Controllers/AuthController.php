@@ -83,6 +83,37 @@ final class AuthController
                 'id' => (int) $user['id'],
                 'email' => $user['email'],
                 'last_login_at' => $user['last_login_at'],
+                // The SPA hides destructive controls for a read-only token instead
+                // of letting the operator click something the API will refuse.
+                'scope' => \App\Auth\Auth::scope(),
+            ],
+        ]);
+    }
+
+    /**
+     * Issues a read-only token.
+     *
+     * The point is a credential that can be handed to a dashboard or a colleague
+     * without also handing over `DELETE /api/rooms/{id}`. It is deliberately not an
+     * endpoint with a TTL parameter: a read token is long-lived by nature (it is
+     * pasted into a config), so it uses the same `JWT_TTL` as login and is revoked
+     * the same way — by rotating `JWT_SECRET`.
+     *
+     * Issuing one requires a full `api` token: a read-only token must not mint
+     * another.
+     */
+    public function readToken(Request $request): void
+    {
+        $user = \App\Auth\Auth::requireUser($request, true);
+
+        Response::json([
+            'data' => [
+                'token' => Jwt::issue([
+                    'sub' => (int) $user['id'],
+                    'email' => $user['email'],
+                    'scope' => \App\Auth\Auth::SCOPE_READ,
+                ]),
+                'scope' => \App\Auth\Auth::SCOPE_READ,
             ],
         ]);
     }

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch: a force-push makes the previous run pointless, and the
+# e2e job below builds four images.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: SPA build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` instead of `npm install`: the lockfile is committed, and a build
+      # that resolves its own dependency tree is not the build that ships.
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      # Vite fails on an unresolved import or a Tailwind class the theme cannot
+      # resolve, which is the only "type check" this project has — there is no
+      # test or lint tooling, so the build is the gate.
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  e2e:
+    name: Stack + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `scripts/smoke.ps1` is the whole regression suite and it is PowerShell, so
+      # the Linux runner needs pwsh. It ships with the ubuntu images; failing here
+      # with a clear message beats a confusing "file not found" below.
+      - name: Check PowerShell
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            echo "::error::pwsh is missing from this runner image"
+            exit 1
+          fi
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+      # The images bake `backend/` and `frontend/dist`, so a rebuild is the only
+      # way the runner tests the commit it just checked out.
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      # `docker compose up -d` returns as soon as the containers exist. The api
+      # container is healthy only after its entrypoint has applied migrations, so
+      # waiting on `healthy` also waits for the schema.
+      - name: Wait for the stack
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            api=$(docker compose ps --format json api 2>/dev/null | tail -n1 || true)
+            web=$(docker compose ps --format json web 2>/dev/null | tail -n1 || true)
+            if echo "$api" | grep -q '"Health":"healthy"' \
+              && echo "$web" | grep -q '"State":"running"'; then
+              echo "stack is up after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the stack did not become healthy"
+          docker compose ps
+          docker compose logs --tail=200 api db worker ws web
+          exit 1
+
+      # The suite talks to http://localhost:8080 and asserts on routing that
+      # happens in the worker after the 202, so it waits for runs itself.
+      - name: Smoke
+        shell: pwsh
+        run: ./scripts/smoke.ps1 -BaseUrl http://localhost:8080
+
+      # A failure is only diagnosable with the container logs, and the step above
+      # has already stopped the job by then.
+      - name: Logs
+        if: failure()
+        run: docker compose logs --tail=300 api db worker ws web
+
+      - name: Shut down
+        if: always()
+        run: docker compose down -v

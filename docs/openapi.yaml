@@ -1,0 +1,1936 @@
+openapi: 3.0.3
+info:
+  title: Hookdock API
+  version: 1.0.0
+  description: |
+    Hookdock stores incoming webhooks in rooms and routes them through rules
+    («сценарии»). Ingestion is asynchronous: the catcher answers `202` with
+    `queued: N` and a separate worker performs the actions, so a slow forward
+    target never delays the sender.
+
+    Two audiences share this document:
+
+    * **The dashboard API** (`/api/...`) — everything under `/api` except the
+      catcher requires a Bearer token. Lists answer `{"data": …}` and add `meta`
+      for pagination. Errors are `{"error":{"message":"…"}}` with Russian text,
+      which is what the UI shows.
+    * **The catcher** (`/hook/...` and `/api/webhook/...`) — public by design. A
+      room with an HMAC secret only accepts requests carrying
+      `X-Hookdock-Signature`.
+
+    Scopes: a login token carries `scope: api` and may do anything; a token from
+    `POST /api/auth/read-token` carries `scope: read` and is refused with `403` on
+    every mutating endpoint.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: Local development stack (`docker compose up -d`)
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Rooms
+  - name: Requests
+  - name: Runs
+  - name: Workflows
+  - name: Ingest
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Readiness of the installation
+      description: |
+        Public on purpose: an uptime probe has no credentials, and the answer
+        carries no payloads, room names or secrets.
+
+        `503` means "not ready" — the database is unreachable, the oldest
+        `pending` run is older than `HEALTH_QUEUE_MAX_AGE`, or there is queued
+        work while no worker has beaten within `WORKER_STALE_SECONDS`. A worker
+        that never beat on an **empty** installation is not a failure: a fresh
+        volume is healthy before the first loop pass.
+      security: []
+      responses:
+        '200':
+          description: Everything is draining.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: At least one check failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Exchange email and password for a token
+      description: |
+        Rate limited per account (`LOGIN_MAX_ATTEMPTS`, 10/min) and, more
+        loosely, per address (`LOGIN_IP_MAX_ATTEMPTS`, 50/min). A refused attempt
+        answers `429` with `Retry-After`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: admin@hookdock.local
+                password:
+                  type: string
+                  format: password
+                  example: '123456'
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, user]
+                properties:
+                  token:
+                    type: string
+                    description: 'HS256 JWT with `scope: api`, valid for `JWT_TTL` (12 h).'
+                  user:
+                    $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/auth/config:
+    get:
+      tags: [Auth]
+      summary: What the login page may reveal
+      description: |
+        The demo account is returned only when `DEMO_LOGIN=1`, so credentials are
+        never baked into the JS bundle. `warnings` reports configuration that must
+        not reach production (`JWT_SECRET` left at its default, demo login on).
+      security: []
+      responses:
+        '200':
+          description: Public configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      demo:
+                        type: object
+                        nullable: true
+                        properties:
+                          email:
+                            type: string
+                          password:
+                            type: string
+                      warnings:
+                        type: array
+                        items:
+                          type: string
+
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user and token scope
+      responses:
+        '200':
+          description: The signed-in user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    allOf:
+                      - $ref: '#/components/schemas/User'
+                      - type: object
+                        properties:
+                          last_login_at:
+                            type: string
+                            format: date-time
+                            nullable: true
+                          scope:
+                            type: string
+                            enum: [api, read]
+                            description: |
+                              What this token may do. `read` means every mutating
+                              endpoint will answer `403`.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/auth/read-token:
+    post:
+      tags: [Auth]
+      summary: Issue a read-only token
+      description: |
+        For a dashboard, a script or a colleague who needs the log but must not be
+        able to `DELETE /api/rooms/{id}`.
+
+        Requires a full `api` token — a read token cannot mint another one. The
+        token lives as long as a login token (`JWT_TTL`) and is revoked by rotating
+        `JWT_SECRET`; there is no per-token revocation list.
+      responses:
+        '200':
+          description: A token that can only read.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                      scope:
+                        type: string
+                        enum: [read]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: No-op logout
+      description: Tokens are stateless; the client discards its copy.
+      responses:
+        '200':
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+
+  /api/ws/ticket:
+    post:
+      tags: [Auth]
+      summary: Short-lived ticket for the realtime socket
+      description: |
+        Browsers cannot send an `Authorization` header on `WebSocket()`, and the
+        12 h API token must not travel in a query string. The ticket is a
+        `scope: ws` JWT valid for `WS_TICKET_TTL` (60 s) and is accepted **only**
+        by the websocket handshake — it returns `401` on every REST route.
+      responses:
+        '200':
+          description: A single-use handshake credential.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      ticket:
+                        type: string
+                      expires_in:
+                        type: integer
+                        example: 60
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/rooms:
+    get:
+      tags: [Rooms]
+      summary: Page through rooms with their counters
+      description: |
+        A **page**, not the whole table: the sidebar loads the latest 20 and
+        searches the rest. A search returns up to 50 and keeps alphabetical order.
+
+        Counters (`requests_total`, `workflows_active`, `failed_runs_24h`, …) are
+        computed only for the returned page.
+
+        `?slug=` is an exact lookup used to resolve a deep link to a room older
+        than the page: it answers `200` with an empty list for an unknown slug,
+        because the caller asks "does this exist", not "filter a log".
+      parameters:
+        - name: q
+          in: query
+          description: Case-insensitive substring of the name or slug.
+          schema:
+            type: string
+        - name: slug
+          in: query
+          description: Exact slug lookup (case-insensitive).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Defaults to 20 without `q` and 50 with it; clamped to 100.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: A page of rooms.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RoomCounters'
+                  meta:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      limit:
+                        type: integer
+                      returned:
+                        type: integer
+                      has_more:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Rooms]
+      summary: Create a room
+      description: |
+        `slug` and `endpoint` are generated when omitted (`slug` is two 12-hex
+        groups, `endpoint` is `hook-` + 6 hex). A duplicate slug is never resolved
+        silently: the answer is `422` so the client draws a new one.
+
+        `require_signature: true` issues the HMAC secret inside the same `INSERT`
+        and returns it **once** in this response, so a room is never listed as
+        public after an operator asked for a signature.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 120
+                  example: Stripe
+                slug:
+                  type: string
+                  pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+                  description: Optional; generated when empty.
+                endpoint:
+                  type: string
+                  maxLength: 64
+                  description: Optional; generated when empty.
+                require_signature:
+                  type: boolean
+                  default: false
+      responses:
+        '201':
+          description: Created. `secret` is present only when a signature was requested.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Room'
+                      - type: object
+                        properties:
+                          secret:
+                            type: string
+                            description: Shown exactly once; reads expose `has_secret` instead.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/rooms/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [Rooms]
+      summary: Read one room
+      responses:
+        '200':
+          description: The room.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Room'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Rooms]
+      summary: Rename a room or change its advertised endpoint
+      description: |
+        The slug changes **only** when sent explicitly, because external
+        integrations already use the address; an explicitly empty value asks for a
+        fresh random one. An omitted `endpoint` keeps the current value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                slug:
+                  type: string
+                endpoint:
+                  type: string
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Room'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+    delete:
+      tags: [Rooms]
+      summary: Delete a room and everything in it
+      description: Requests, workflows, runs and steps are removed by `ON DELETE CASCADE`.
+      responses:
+        '200':
+          description: Deleted (or already gone).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/rooms/{id}/secret:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    post:
+      tags: [Rooms]
+      summary: Issue or rotate the room's HMAC secret
+      description: |
+        Rotating silently breaks every sender still signing with the old value,
+        which is why the SPA confirms first. The value is returned exactly once.
+      responses:
+        '200':
+          description: The new secret.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      secret:
+                        type: string
+                      has_secret:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Rooms]
+      summary: Remove the secret, making the room public again
+      responses:
+        '200':
+          description: The old secret stops working immediately.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      has_secret:
+                        type: boolean
+                        example: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/stats:
+    get:
+      tags: [Requests]
+      summary: Counters for the dashboard header
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+      responses:
+        '200':
+          description: Installation-wide counters, or one room's.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      requests_total:
+                        type: integer
+                      requests_last_hour:
+                        type: integer
+                      requests_last_24h:
+                        type: integer
+                      workflows_active:
+                        type: integer
+                      workflows_auto_paused:
+                        type: integer
+                        description: Rules the worker paused after repeated failures.
+                      failed_runs_24h:
+                        type: integer
+                      queued_runs:
+                        type: integer
+                        description: Runs accepted but not finished yet.
+                      endpoints:
+                        type: array
+                        description: The 15 most frequent endpoints, for the closed filter.
+                        items:
+                          type: object
+                          properties:
+                            endpoint:
+                              type: string
+                            total:
+                              type: integer
+                      endpoints_total:
+                        type: integer
+                      endpoints_limit:
+                        type: integer
+                        example: 15
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/endpoints:
+    get:
+      tags: [Requests]
+      summary: Search the room's endpoints
+      description: |
+        `stats` returns only the 15 most frequent, which is what the closed filter
+        shows. This route reaches the rest: the operator types into the same field
+        and gets matches from every endpoint, not only the visible page.
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+        - name: q
+          in: query
+          description: Case-insensitive substring.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 15
+      responses:
+        '200':
+          description: Matching endpoints with hit counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        endpoint:
+                          type: string
+                        total:
+                          type: integer
+                  meta:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      limit:
+                        type: integer
+                      returned:
+                        type: integer
+                      has_more:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/requests:
+    get:
+      tags: [Requests]
+      summary: Page through the captured log
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+        - name: method
+          in: query
+          schema:
+            type: string
+            example: POST
+        - name: endpoint
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          description: Substring of the path, endpoint or raw body.
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Inclusive lower bound on `received_at` (anything `DateTimeImmutable` parses).
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: Inclusive upper bound on `received_at`.
+          schema:
+            type: string
+        - name: include
+          in: query
+          description: |
+            `body` adds the parsed and raw payloads. The rule editor uses it to
+            build condition paths from a real request; the plain list stays lean.
+          schema:
+            type: string
+            enum: [body]
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+      responses:
+        '200':
+          description: A page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RequestSummary'
+                  meta:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/requests/export:
+    get:
+      tags: [Requests]
+      summary: Download the filtered log
+      description: |
+        Uses the same filters as the list, so a download matches the screen. The
+        response is a file (`Content-Disposition: attachment`), which is why the
+        SPA fetches it as a blob instead of using a link — the API needs a Bearer
+        header a navigation cannot send.
+
+        CSV is `;`-separated with a UTF-8 BOM (Excel in a Russian locale).
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+        - name: method
+          in: query
+          schema:
+            type: string
+        - name: endpoint
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+        - name: to
+          in: query
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [json, ndjson, csv]
+            default: json
+      responses:
+        '200':
+          description: The export.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename="hookdock-stripe-20260101-120000.json"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exported_at:
+                    type: string
+                    format: date-time
+                  requests:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RequestSummary'
+            application/x-ndjson:
+              schema:
+                type: string
+            text/csv:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/requests/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Requests]
+      summary: One request with its runs and step logs
+      responses:
+        '200':
+          description: The stored request and everything routing decided.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      request:
+                        $ref: '#/components/schemas/RequestFull'
+                      runs:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RunWithSteps'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Requests]
+      summary: Delete a request and its runs
+      responses:
+        '200':
+          description: Deleted, or already gone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+
+  /api/requests/{id}/body:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Requests]
+      summary: Download the stored body as a file
+      description: |
+        Returns `raw_body` byte for byte — the original text, including a
+        non-JSON payload. A 4 MB webhook belongs in an editor, not in a copy-paste
+        field. The filename carries the request id and the extension follows the
+        stored `Content-Type`.
+      responses:
+        '200':
+          description: The payload.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename="request-42.json"
+          content:
+            application/json:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/requests/{id}/replay:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Requests]
+      summary: Route a stored request again
+      description: |
+        Queues the room's matching workflows again for the stored row. No new
+        `incoming_requests` row is created, so the log keeps one entry per
+        delivery. Used when a rule was paused, wrong, or added after the webhook
+        arrived.
+      responses:
+        '202':
+          description: Runs queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      queued:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/requests/{id}/preview:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Requests]
+      summary: Dry run — what would routing do
+      description: |
+        Evaluates conditions against the stored payload and *describes* each
+        action (URL, method, headers, body, signature verdict). Nothing is queued
+        and nothing leaves the process.
+
+        * Empty body → every enabled rule of the room is evaluated (`mode: room`),
+          which is the question the request card asks.
+        * `workflow_id` → only that rule (`mode: workflow`).
+        * `{conditions, actions}` → an unsaved draft from the editor
+          (`mode: draft`).
+
+        A `forward` still passes `UrlGuard`: a preview that approves a target the
+        worker will refuse would be worse than no preview at all, so each forward
+        step carries `allowed` and, when refused, `reason`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                workflow_id:
+                  type: integer
+                conditions:
+                  $ref: '#/components/schemas/ConditionTree'
+                actions:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Action'
+            examples:
+              draft:
+                summary: An unsaved rule from the editor
+                value:
+                  conditions:
+                    mode: all
+                    rules:
+                      - path: body.event.type
+                        operator: equals
+                        value: payment
+                  actions:
+                    - type: log
+                      message: 'paid by {{ body.customer.name }}'
+              room:
+                summary: Every enabled rule of the room
+                value: {}
+      responses:
+        '200':
+          description: What the rules would do.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      request_id:
+                        type: integer
+                      mode:
+                        type: string
+                        enum: [draft, workflow, room]
+                      workflows:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            workflow_id:
+                              type: integer
+                              nullable: true
+                            name:
+                              type: string
+                            priority:
+                              type: integer
+                            matched:
+                              type: boolean
+                            steps:
+                              type: array
+                              items:
+                                type: object
+                                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/runs:
+    get:
+      tags: [Runs]
+      summary: The run journal
+      description: |
+        Answers "what failed in the last hour" without opening stored requests one
+        by one — the request is context, the run is the subject. Read-only; a
+        retry stays on `POST /api/runs/{id}/retry`.
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, success, failed, skipped, all]
+        - name: workflow_id
+          in: query
+          schema:
+            type: integer
+        - name: q
+          in: query
+          description: Substring of the run message, the workflow name or the request path.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+      responses:
+        '200':
+          description: A page of runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunRow'
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/Pagination'
+                      - type: object
+                        properties:
+                          statuses:
+                            type: array
+                            items:
+                              type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/runs/{id}/retry:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The run to repeat.
+        schema:
+          type: integer
+    post:
+      tags: [Runs]
+      summary: Repeat a finished run
+      description: |
+        Inserts a **new** run for the same workflow and request instead of
+        resetting the failed one. Resetting would make the engine skip the actions
+        that already succeeded, so «Повторить» would silently not repeat them; the
+        failed row keeps its attempts and step log as evidence.
+      responses:
+        '202':
+          description: A fresh run is queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      request_id:
+                        type: integer
+                      queued:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/workflows:
+    get:
+      tags: [Workflows]
+      summary: List rules
+      description: |
+        Conditions come back as a normalized tree plus `condition_count` (leaves,
+        not groups). Ordered by `priority` descending, then newest first — the same
+        order the engine uses. `auto_paused` is derived (`!enabled &&
+        disabled_reason`), so an automatic pause stays distinguishable from a
+        manual one.
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+      responses:
+        '200':
+          description: Rules, newest first within a priority.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Workflow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Workflows]
+      summary: Create a rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkflowInput'
+            examples:
+              orGroup:
+                summary: type = payment AND (name = Ada OR name = Bob)
+                value:
+                  room: stripe
+                  name: Paid by Ada or Bob
+                  endpoint: payments
+                  enabled: true
+                  priority: 100
+                  stop_processing: true
+                  conditions:
+                    mode: all
+                    rules:
+                      - path: body.event.type
+                        operator: equals
+                        value: payment
+                      - mode: any
+                        rules:
+                          - path: body.customer.name
+                            operator: equals
+                            value: Ada
+                          - path: body.customer.name
+                            operator: equals
+                            value: Bob
+                  actions:
+                    - type: forward
+                      url: https://example.com/hooks/paid
+                      method: POST
+                      payload: body
+                      headers:
+                        X-Event: '{{ body.event.type }}'
+                      secret: shared-hmac-secret
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Workflow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/workflows/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+    get:
+      tags: [Workflows]
+      summary: Read one rule
+      responses:
+        '200':
+          description: The rule.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Workflow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Workflows]
+      summary: Edit a rule
+      description: |
+        The room cannot change (`422`): moving a rule would silently change which
+        webhooks fire.
+
+        Saving with `enabled: true` is also the operator saying "this is fixed", so
+        the failure streak and the automatic-pause note are cleared.
+
+        **Signing a forward.** The stored secret is never returned; reads expose
+        `signed: true` instead. Because the editor cannot send back a value it
+        never saw, an action with an empty `secret` **keeps** the stored one — an
+        edit of the name must not silently unsign the forward. Clearing it is the
+        explicit `clear_signature: true`. The old secret is carried over only when
+        the action sits at the same index **and** has the same URL, so reordering
+        forwards cannot move one target's secret onto another.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkflowInput'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Workflow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+    delete:
+      tags: [Workflows]
+      summary: Delete a rule
+      responses:
+        '200':
+          description: Deleted, or already gone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+
+  /api/workflows/{id}/toggle:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+    post:
+      tags: [Workflows]
+      summary: Pause or resume a rule
+      description: |
+        Toggling clears `disabled_reason`, the streak and the automatic-pause note:
+        either state here is the operator's own decision, not a failure.
+      responses:
+        '200':
+          description: The new state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      enabled:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/workflows/{id}/duplicate:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+    post:
+      tags: [Workflows]
+      summary: Copy a rule
+      description: |
+        The copy lands in the same room, keeps conditions, actions, `priority` and
+        `stop_processing`, and is named «… (копия)». It is created **paused**, so a
+        copy cannot double every forward while it is being edited. Runs and steps
+        are not copied — the new rule has no history yet.
+      responses:
+        '201':
+          description: The copy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Workflow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /hook/{room}/{endpoint}:
+    post:
+      tags: [Ingest]
+      summary: Capture a webhook in a room
+      description: |
+        Public. Any method, any content type, and the endpoint may carry its own
+        path (`/hook/{room}/{endpoint}/a/b/c`).
+
+        The response is `202` **before** any action runs: the catcher stores the
+        request and queues one `pending` run per matching rule. A slow forward
+        target can therefore never hold the sender, and a failed action cannot
+        change an already-sent `202`.
+
+        A room with a secret requires `X-Hookdock-Signature: sha256=<hex>` where
+        the digest is `HMAC-SHA256(raw_body, secret)`. The check happens **before**
+        the `INSERT`, so a forged request is neither stored nor queued. A bare hex
+        digest without the prefix is accepted too, because some senders strip it.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RoomSlugPath'
+        - name: endpoint
+          in: path
+          required: true
+          description: Free-form slug; `*` rules match every endpoint of the room.
+          schema:
+            type: string
+        - name: X-Hookdock-Signature
+          in: header
+          required: false
+          description: Required only when the room has a secret.
+          schema:
+            type: string
+            example: sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+          text/plain:
+            schema:
+              type: string
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '202':
+          description: Stored and queued. `queued` counts the runs, not the requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, id, room, endpoint, received_at, queued]
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  id:
+                    type: integer
+                    example: 42
+                  room:
+                    type: string
+                    example: stripe
+                  endpoint:
+                    type: string
+                    example: payments
+                  received_at:
+                    type: string
+                    format: date-time
+                  queued:
+                    type: integer
+                    description: How many rule runs were queued.
+                    example: 2
+        '401':
+          description: The room requires a signature and none (or a wrong one) was sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /hook/{room}:
+    post:
+      tags: [Ingest]
+      summary: Capture a webhook in a room without naming an endpoint
+      description: |
+        Stores the request with `endpoint = "default"`. `/hook/{x}` is ambiguous
+        (room vs endpoint): a known room slug wins, otherwise the segment is
+        treated as an endpoint of the room `default`. An unknown room in a
+        two-segment URL is a `404` — never auto-created, never a fallback.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RoomSlugPath'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '202':
+          description: Stored and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    RoomId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+    RoomSlugPath:
+      name: room
+      in: path
+      required: true
+      description: Room slug (`/hook/{room}/...`).
+      schema:
+        type: string
+        example: stripe
+    RoomSlug:
+      name: room
+      in: query
+      required: false
+      description: |
+        Room slug. Omitted = installation-wide. An unknown slug is a `404`, not an
+        empty list.
+      schema:
+        type: string
+        example: stripe
+    RequestId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+    WorkflowId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PerPage:
+      name: per_page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              message: Требуется авторизация
+    ReadOnly:
+      description: The token is read-only.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              message: 'Токен только для чтения: изменение данных недоступно'
+    NotFound:
+      description: No such record, or an unknown room slug.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              message: Запрос не найден
+    Invalid:
+      description: The payload was rejected.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              message: Условия вложены слишком глубоко (максимум 5)
+    TooManyRequests:
+      description: Rate limited.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message]
+          properties:
+            message:
+              type: string
+
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        per_page:
+          type: integer
+        total:
+          type: integer
+        pages:
+          type: integer
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        time:
+          type: string
+          format: date-time
+        checks:
+          type: object
+          properties:
+            database:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [ok, fail]
+                message:
+                  type: string
+            queue:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [ok, fail]
+                pending:
+                  type: integer
+                running:
+                  type: integer
+                oldest_pending_seconds:
+                  type: integer
+                max_age_seconds:
+                  type: integer
+            worker:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [ok, fail]
+                workers:
+                  type: integer
+                last_beat_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+                stale_after_seconds:
+                  type: integer
+
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+          format: email
+
+    Room:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        slug:
+          type: string
+        endpoint:
+          type: string
+        has_secret:
+          type: boolean
+          description: Whether the room requires an HMAC signature. The secret itself is never returned.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RoomCounters:
+      allOf:
+        - $ref: '#/components/schemas/Room'
+        - type: object
+          properties:
+            requests_total:
+              type: integer
+            requests_last_24h:
+              type: integer
+            last_received_at:
+              type: string
+              format: date-time
+              nullable: true
+            workflows_active:
+              type: integer
+            workflows_total:
+              type: integer
+            failed_runs_24h:
+              type: integer
+
+    RequestSummary:
+      type: object
+      properties:
+        id:
+          type: integer
+        room_id:
+          type: integer
+        endpoint:
+          type: string
+        method:
+          type: string
+        path:
+          type: string
+        content_type:
+          type: string
+          nullable: true
+        body_bytes:
+          type: integer
+        ip:
+          type: string
+          nullable: true
+        received_at:
+          type: string
+          format: date-time
+        run_count:
+          type: integer
+        failed_runs:
+          type: integer
+        pending_runs:
+          type: integer
+        body:
+          description: Present only with `?include=body`. NULL for a non-JSON payload.
+          nullable: true
+        raw_body:
+          type: string
+          nullable: true
+
+    RequestFull:
+      allOf:
+        - $ref: '#/components/schemas/RequestSummary'
+        - type: object
+          properties:
+            query:
+              type: object
+              additionalProperties: true
+            headers:
+              type: object
+              additionalProperties: true
+
+    RunRow:
+      type: object
+      properties:
+        id:
+          type: integer
+        workflow_id:
+          type: integer
+        request_id:
+          type: integer
+        status:
+          type: string
+          enum: [pending, running, success, failed, skipped]
+        message:
+          type: string
+          nullable: true
+          description: Human-readable outcome, in Russian.
+        attempts:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        available_at:
+          type: string
+          format: date-time
+          description: When the run may be claimed (a `delay` action moves this forward).
+        workflow_name:
+          type: string
+        priority:
+          type: integer
+        room_id:
+          type: integer
+        method:
+          type: string
+        path:
+          type: string
+        endpoint:
+          type: string
+        steps:
+          type: integer
+
+    RunWithSteps:
+      allOf:
+        - $ref: '#/components/schemas/RunRow'
+        - type: object
+          properties:
+            steps:
+              type: array
+              items:
+                $ref: '#/components/schemas/RunStep'
+
+    RunStep:
+      type: object
+      properties:
+        id:
+          type: integer
+        run_id:
+          type: integer
+        attempt:
+          type: integer
+        action_index:
+          type: integer
+        type:
+          type: string
+          enum: [forward, log, transform, delay]
+        status:
+          type: string
+          enum: [success, failed]
+        message:
+          type: string
+          nullable: true
+        response_status:
+          type: integer
+          nullable: true
+        response_body:
+          type: string
+          nullable: true
+        duration_ms:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    Condition:
+      type: object
+      required: [path, operator]
+      properties:
+        path:
+          type: string
+          description: |
+            Dot path into the request context: `body.customer.email`,
+            `query.source`, `headers.x-github-event`, `meta.method`,
+            `transformed.*`.
+          example: body.event.type
+        operator:
+          type: string
+          enum: [equals, not_equals, contains, not_contains, exists, not_exists, gt, gte, lt, lte, regex]
+        value:
+          description: Compared against the resolved value. Ignored by `exists`/`not_exists`.
+
+    ConditionTree:
+      type: object
+      description: |
+        A group of conditions. `mode: all` requires every rule, `mode: any` one of
+        them; a rule may itself be a group, so
+        `type = payment AND (name = Ada OR name = Bob)` is directly expressible.
+        Depth ≤ 5, at most 40 leaves. A flat list is accepted and read as
+        `{mode: all, rules: [...]}`.
+      required: [mode, rules]
+      properties:
+        mode:
+          type: string
+          enum: [all, any]
+        rules:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/Condition'
+              - $ref: '#/components/schemas/ConditionTree'
+
+    Action:
+      type: object
+      description: |
+        One of four action types, discriminated by `type`. Executed in order.
+
+        * `forward` — HTTP call. `payload` is `body`, `transformed`, `raw` or a
+          template string / JSON object. `secret` signs the outgoing body
+          (`X-Hookdock-Signature`) and is never returned.
+        * `transform` — maps result keys to context paths, feeding a later
+          `payload: transformed`.
+        * `delay` — pauses 1–86400 seconds, then continues. The pause belongs to
+          the run, not the sender; it does not consume a retry, and a resumed run
+          does not wait again.
+        * `log` — records a message rendered from `{{ body.field }}` templates.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [forward, log, transform, delay]
+        url:
+          type: string
+          format: uri
+          description: '`forward` only. Must be http/https and pass the SSRF guard.'
+        method:
+          type: string
+          enum: [POST, PUT, PATCH, GET, DELETE]
+          default: POST
+        payload:
+          description: '`forward` only.'
+          oneOf:
+            - type: string
+              enum: [body, transformed, raw]
+            - type: object
+              additionalProperties: true
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        secret:
+          type: string
+          writeOnly: true
+          description: |
+            `forward` only. Empty means "keep the stored secret"; removing it is
+            `clear_signature: true`.
+        clear_signature:
+          type: boolean
+          writeOnly: true
+        signed:
+          type: boolean
+          readOnly: true
+          description: Present on read when the stored forward carries a secret.
+        mapping:
+          type: object
+          additionalProperties:
+            type: string
+          description: '`transform` only: result key → context path.'
+        seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: '`delay` only.'
+        message:
+          type: string
+          description: '`log` only. Supports `{{ body.field }}`.'
+
+    WorkflowInput:
+      type: object
+      required: [name, actions]
+      properties:
+        room:
+          type: string
+          description: Room slug. `room_id` is accepted instead.
+        room_id:
+          type: integer
+        name:
+          type: string
+          maxLength: 160
+        endpoint:
+          type: string
+          default: '*'
+          description: Endpoint slug within the room; `*` matches all of them.
+        enabled:
+          type: boolean
+          default: true
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          default: 0
+          description: Higher runs first. Queued with `ORDER BY priority DESC, id`.
+        stop_processing:
+          type: boolean
+          default: false
+          description: |
+            A **successful** run marks the request's other `pending` runs
+            `skipped`, with a message naming this rule. `failed` and `skipped`
+            never stop anything.
+        conditions:
+          $ref: '#/components/schemas/ConditionTree'
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/Action'
+
+    Workflow:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowInput'
+        - type: object
+          properties:
+            id:
+              type: integer
+            room_id:
+              type: integer
+            condition_count:
+              type: integer
+              description: Leaf conditions, not groups.
+            consecutive_failures:
+              type: integer
+              description: Terminal failures in a row; reset by a success or by enabling the rule.
+            disabled_reason:
+              type: string
+              nullable: true
+              description: Set only by the automatic pause.
+            disabled_at:
+              type: string
+              format: date-time
+              nullable: true
+            auto_paused:
+              type: boolean
+              description: Derived (`!enabled && disabled_reason`); never stored.
+            last_run_at:
+              type: string
+              format: date-time
+              nullable: true
+            last_run_status:
+              type: string
+              nullable: true
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time

@@ -34,9 +34,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <Teleport to="body">
     <Transition name="fade">
+      <!-- Above every surface that can raise a confirmation: a form modal and
+           the request drawer also sit at z-50, and equal z-index is resolved by
+           DOM order — the dialog is mounted first in App.vue, so it painted
+           *under* an open form. Above z-[60] (toasts) and z-[70] (AppSelect). -->
       <div
         v-if="dialog.open"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4 backdrop-blur-sm dark:bg-slate-950/80"
+        class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/30 p-4 backdrop-blur-sm dark:bg-slate-950/80"
         @click.self="answerConfirm(false)"
       >
         <div

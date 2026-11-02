@@ -1,0 +1,26 @@
+﻿$kind: collection
+name: Hookdock API
+description: |-
+  Runnable requests for the Hookdock webhook catcher and router.
+
+  Start with **Auth / Login** — its test script stores `token` and
+  `read_token`, which every other request inherits from the collection auth.
+  `base_url` points at the local compose stack; change it to target a deployed
+  installation.
+variables:
+  - key: base_url
+    value: 'http://localhost:8080'
+  - key: room_slug
+    value: 'default'
+    description: Room used by the room-scoped requests.
+  - key: request_id
+    value: '1'
+    description: An existing request id; fill it from the log first.
+  - key: workflow_id
+    value: '1'
+    description: An existing rule id.
+auth:
+  type: bearer
+  credentials:
+    - key: token
+      value: '{{token}}'

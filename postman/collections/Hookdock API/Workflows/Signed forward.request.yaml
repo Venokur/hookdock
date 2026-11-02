@@ -1,0 +1,40 @@
+$kind: http-request
+name: Signed forward
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 4000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman signed forward",
+      "endpoint": "postman-signed",
+      "enabled": false,
+      "actions": [
+        {
+          "type": "forward",
+          "url": "https://example.com/hooks/paid",
+          "method": "POST",
+          "payload": "body",
+          "headers": { "X-Event": "{{ body.event.type }}" },
+          "secret": "shared-hmac-secret"
+        }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The secret signs the outgoing body with `X-Hookdock-Signature` and is
+      // never echoed back: reads expose `signed: true` instead. An empty `secret`
+      // on an edit means "keep it"; removal is `clear_signature: true`.
+      pm.test('a signed forward never returns its secret', function () {
+        pm.response.to.have.status(201);
+        const action = pm.response.json().data.actions[0];
+        pm.expect(action.signed).to.eql(true);
+        pm.expect(action).to.not.have.property('secret');
+      });

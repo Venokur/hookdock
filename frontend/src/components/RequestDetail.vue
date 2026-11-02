@@ -3,6 +3,9 @@ import { computed, ref } from 'vue'
 import JsonViewer from './JsonViewer.vue'
 import MethodBadge from './MethodBadge.vue'
 import StatusPill from './StatusPill.vue'
+import AppSpinner from './ui/AppSpinner.vue'
+import { api } from '../api/client'
+import { notify } from '../composables/dialog'
 import { formatBytes, formatTime } from '../utils/format'
 
 const props = defineProps({
@@ -10,10 +13,16 @@ const props = defineProps({
   runs: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['close', 'delete'])
+const emit = defineEmits(['close', 'delete', 'replay', 'retry'])
 
 const tab = ref('payload')
 const copied = ref(false)
+
+const downloading = ref(false)
+
+const previewing = ref(false)
+const previewError = ref('')
+const preview = ref(null)
 
 const tabs = computed(() => {
   const list = [
@@ -27,8 +36,61 @@ const tabs = computed(() => {
     list.splice(3, 0, { key: 'runs', label: `Маршрутизация (${props.runs.length})` })
   }
 
+  list.push({ key: 'preview', label: 'Проверка правил' })
+
   return list
 })
+
+/**
+ * Dry run: which rules match this payload and what each of them would send.
+ *
+ * This is the question the routing tab cannot answer — it only shows what already
+ * happened. A rule added after the request arrived, or one that was paused, is
+ * invisible there, and checking it used to mean sending a real webhook to a real
+ * target. Nothing is queued here, so a wrong URL costs nothing.
+ */
+async function runPreview() {
+  previewError.value = ''
+  preview.value = null
+  previewing.value = true
+
+  try {
+    const data = await api.previewRequest(props.request.id, {})
+    preview.value = data.data
+  } catch (e) {
+    previewError.value = e.message
+  } finally {
+    previewing.value = false
+  }
+}
+
+/**
+ * Saves the stored body as a file.
+ *
+ * The card can copy a payload, but a large JSON belongs in an editor, and this is
+ * the original bytes (`raw_body`), not a re-serialized copy of the parsed JSON.
+ */
+async function downloadBody() {
+  downloading.value = true
+
+  try {
+    const { blob, filename } = await api.downloadRequestBody(props.request.id)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    // Revoking immediately can cancel the download in some browsers.
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  } catch (e) {
+    notify(e.message, { tone: 'error' })
+  } finally {
+    downloading.value = false
+  }
+}
+
 
 const payload = computed(() => {
   if (props.request.body !== null && props.request.body !== undefined) {
@@ -143,6 +205,85 @@ async function copyCurl() {
 
       <JsonViewer v-else-if="tab === 'query'" :value="request.query || {}" empty-text="Нет query-параметров." />
 
+      <div v-else-if="tab === 'preview'" class="space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p class="text-sm font-medium text-ink">Что сделают правила</p>
+            <p class="text-[11px] text-ink-mute">
+              Условия проверяются на этом теле, действия только описываются — ничего не отправляется
+              и не ставится в очередь.
+            </p>
+          </div>
+          <button type="button" class="btn px-3 py-1.5" :disabled="previewing" @click="runPreview">
+            <AppSpinner v-if="previewing" size="xs" />
+            <span>{{ previewing ? 'Проверяем…' : 'Проверить' }}</span>
+          </button>
+        </div>
+
+        <p
+          v-if="previewError"
+          class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {{ previewError }}
+        </p>
+
+        <p v-if="preview && preview.workflows.length === 0" class="rounded-xl border border-dashed border-line px-3 py-4 text-xs text-ink-mute">
+          В комнате нет активных сценариев для этого эндпоинта.
+        </p>
+
+        <div
+          v-for="rule in preview?.workflows ?? []"
+          :key="rule.workflow_id"
+          class="rounded-xl border border-line bg-surface-2 p-3"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <p class="text-sm text-ink">{{ rule.name }}</p>
+            <span
+              class="rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider"
+              :class="rule.matched
+                ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                : 'bg-ink/5 text-ink-mute'"
+            >
+              {{ rule.matched ? 'совпало' : 'пропустит' }}
+            </span>
+          </div>
+
+          <ol v-if="rule.steps.length" class="mt-2 space-y-1.5">
+            <li
+              v-for="step in rule.steps"
+              :key="step.index"
+              class="rounded-lg border border-line bg-surface px-2.5 py-2 text-[11px]"
+            >
+              <p class="font-medium text-ink-soft">{{ step.index + 1 }}. {{ step.type }}</p>
+
+              <p v-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
+
+              <p v-else-if="step.type === 'delay'" class="mt-1 text-ink-mute">
+                пауза {{ step.seconds }} с, затем остальные действия
+              </p>
+
+              <pre
+                v-else-if="step.type === 'transform'"
+                class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute"
+              >{{ JSON.stringify(step.mapping, null, 2) }}</pre>
+
+              <template v-else-if="step.type === 'forward'">
+                <p class="mt-1 break-all font-mono text-ink-mute">{{ step.method }} {{ step.url }}</p>
+                <p
+                  v-if="!step.allowed"
+                  class="mt-1 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-600 dark:text-rose-300"
+                >
+                  Адрес будет отклонён: {{ step.reason || 'недопустимый URL' }}
+                </p>
+                <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-ink-mute">{{ step.body }}</pre>
+              </template>
+
+              <p v-else class="mt-1 text-ink-mute">{{ step.message }}</p>
+            </li>
+          </ol>
+        </div>
+      </div>
+
       <div v-else-if="tab === 'runs'" class="space-y-2">
         <div
           v-for="run in runs"
@@ -150,8 +291,20 @@ async function copyCurl() {
           class="rounded-xl border border-line bg-surface-2 p-3"
         >
           <div class="flex items-center justify-between gap-2">
-            <p class="text-sm text-ink">{{ run.workflow_name }}</p>
-            <StatusPill :status="run.status" />
+            <div class="flex min-w-0 items-center gap-2">
+              <p class="truncate text-sm text-ink">{{ run.workflow_name }}</p>
+              <StatusPill :status="run.status" />
+            </div>
+            <!-- A fresh run, not a reset: the failed row keeps its attempts and
+                 steps, and every action runs again. -->
+            <button
+              v-if="run.status === 'failed' || run.status === 'skipped'"
+              type="button"
+              class="btn shrink-0 px-2.5 py-1 text-[11px]"
+              @click="emit('retry', run.id)"
+            >
+              Повторить
+            </button>
           </div>
           <p class="mt-1 break-words font-mono text-[11px] text-ink-mute">{{ run.message || '—' }}</p>
           <p v-if="run.attempts > 1" class="mt-1 text-[11px] text-ink-mute">попыток: {{ run.attempts }}</p>
@@ -195,10 +348,25 @@ async function copyCurl() {
       </dl>
     </div>
 
-    <footer class="flex items-center justify-between gap-3 border-t border-line p-4">
-      <button type="button" class="btn" @click="copyCurl">
-        {{ copied ? 'Скопировано!' : 'Копировать как cURL' }}
-      </button>
+    <footer class="flex flex-wrap items-center justify-between gap-3 border-t border-line p-4">
+      <div class="flex flex-wrap items-center gap-2">
+        <button type="button" class="btn" @click="copyCurl">
+          {{ copied ? 'Скопировано!' : 'Копировать как cURL' }}
+        </button>
+        <button
+          type="button"
+          class="btn"
+          :disabled="downloading || !request.raw_body"
+          title="Скачать исходное тело запроса файлом"
+          @click="downloadBody"
+        >
+          <AppSpinner v-if="downloading" size="xs" />
+          {{ downloading ? 'Скачиваем…' : 'Скачать тело' }}
+        </button>
+        <button type="button" class="btn" title="Запустить активные сценарии комнаты заново" @click="emit('replay')">
+          Повторить маршрутизацию
+        </button>
+      </div>
       <button type="button" class="btn-danger py-2" @click="emit('delete', request.id)">
         Удалить запрос
       </button>

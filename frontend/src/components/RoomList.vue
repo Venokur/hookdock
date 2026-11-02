@@ -5,45 +5,52 @@ import { subscribe } from '../composables/realtime'
 import { confirm, notify } from '../composables/dialog'
 import { useRoomsStore, rememberRoom } from '../stores/rooms'
 import AppInput from './ui/AppInput.vue'
+import AppSpinner from './ui/AppSpinner.vue'
 import RoomFormModal from './RoomFormModal.vue'
 
 const roomsStore = useRoomsStore()
 const route = useRoute()
 const router = useRouter()
 
-const query = ref('')
 const modalOpen = ref(false)
 const editing = ref(null)
 const deleting = ref(false)
 
 let offRealtime = null
 let reloadTimer = null
+let searchTimer = null
 
 const activeSlug = computed(() => (typeof route.params.slug === 'string' ? route.params.slug : ''))
 
-const filtered = computed(() => {
-  const needle = query.value.trim().toLowerCase()
-  if (needle === '') {
-    return roomsStore.rooms
-  }
+const isSearching = computed(() => roomsStore.searchQuery.trim() !== '')
 
-  return roomsStore.rooms.filter((room) => {
-    const name = room.name.toLowerCase()
-    const slug = room.slug.toLowerCase()
+/**
+ * The list is a page from the server, not the whole table: a few hundred rooms
+ * would otherwise load and count on every keystroke. Typing is debounced, while
+ * the magnifier (or Enter) searches immediately — the user asked for a result,
+ * so waiting 300 ms more would only feel broken.
+ */
+function onQuery(value) {
+  roomsStore.setQuery(value)
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => roomsStore.runSearch(), 300)
+}
 
-    return name.includes(needle) || slug.includes(needle)
-  })
-})
+function searchNow() {
+  clearTimeout(searchTimer)
+  roomsStore.runSearch()
+}
 
 /**
  * Room counters live on the list endpoint, so any request/workflow event
- * invalidates them. Debounced because one webhook publishes `request.created`
- * and then `request.updated`.
+ * invalidates them. `runSearch` refreshes whichever list is on screen (the page
+ * or the current search). Debounced because one webhook publishes
+ * `request.created` and then `request.updated`.
  */
 function refreshSoon() {
   clearTimeout(reloadTimer)
   reloadTimer = setTimeout(() => {
-    roomsStore.load({ silent: true })
+    roomsStore.runSearch()
   }, 500)
 }
 
@@ -62,9 +69,13 @@ function closeModal() {
   editing.value = null
 }
 
+/**
+ * The dialog decides when to close itself: a created room with a signature stays
+ * open to show the one-time secret, so closing it here would hide that value.
+ * Only the redirect for a renamed slug is the parent's business.
+ */
 async function onSaved(room) {
   const edited = editing.value
-  closeModal()
 
   // A renamed slug changes the URL of the room being viewed. `edited` still holds
   // the pre-save object, because the store reload already dropped the old slug.
@@ -109,6 +120,9 @@ watch(
   (slug) => {
     if (typeof slug === 'string' && slug !== '') {
       rememberRoom(slug)
+      // The open room is kept in the sidebar list even when it is older than the
+      // loaded page, so its header, highlight and counters stay resolvable.
+      roomsStore.pin(slug)
     }
   },
   { immediate: true },
@@ -133,6 +147,7 @@ onMounted(() => {
 onUnmounted(() => {
   offRealtime?.()
   clearTimeout(reloadTimer)
+  clearTimeout(searchTimer)
 })
 </script>
 
@@ -149,17 +164,34 @@ onUnmounted(() => {
       </button>
     </div>
 
-    <AppInput
-      v-model="query"
-      type="search"
-      size="sm"
-      placeholder="Поиск по названию"
-      aria-label="Поиск по комнатам"
-      class="mt-2"
-    />
+    <div class="relative mt-2">
+      <AppInput
+        :model-value="roomsStore.searchQuery"
+        type="search"
+        size="sm"
+        placeholder="Поиск по названию или slug"
+        aria-label="Поиск по комнатам"
+        class="pr-8"
+        @update:model-value="onQuery"
+        @keydown.enter.prevent="searchNow"
+      />
+      <button
+        type="button"
+        class="absolute right-1 top-1/2 -translate-y-1/2 rounded-md p-1 text-ink-mute transition hover:bg-surface-2 hover:text-ink"
+        aria-label="Найти комнаты"
+        :disabled="roomsStore.searching"
+        @click="searchNow"
+      >
+        <AppSpinner v-if="roomsStore.searching" size="xs" />
+        <svg v-else class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7" />
+          <path stroke-linecap="round" d="M20 20l-3.5-3.5" />
+        </svg>
+      </button>
+    </div>
 
     <ul class="mt-2 max-h-72 space-y-0.5 overflow-y-auto pr-0.5">
-      <li v-for="room in filtered" :key="room.id">
+      <li v-for="room in roomsStore.visible" :key="room.id">
         <div
           class="group flex items-center gap-1 rounded-xl px-2 py-1.5 transition"
           :class="room.slug === activeSlug ? 'bg-indigo-50 dark:bg-white/10' : 'hover:bg-surface-2'"
@@ -204,10 +236,24 @@ onUnmounted(() => {
         </div>
       </li>
 
-      <li v-if="filtered.length === 0" class="px-2 py-3 text-[11px] text-ink-mute">
-        {{ roomsStore.rooms.length === 0 ? 'Комнат пока нет.' : 'Ничего не найдено.' }}
+      <!-- The spinner lives in the magnifier, so the list itself stays quiet while
+           a search is running: one surface, one indicator. -->
+      <li
+        v-if="roomsStore.visible.length === 0 && !roomsStore.searching"
+        class="px-2 py-3 text-[11px] text-ink-mute"
+      >
+        <template v-if="isSearching">Ничего не найдено.</template>
+        <template v-else-if="roomsStore.loading">Загрузка…</template>
+        <template v-else>Комнат пока нет.</template>
       </li>
     </ul>
+
+    <p v-if="isSearching && roomsStore.searchMeta.has_more" class="mt-1.5 px-2 text-[10px] text-ink-mute">
+      Найдено {{ roomsStore.searchMeta.total }}, показаны первые {{ roomsStore.searchMeta.returned }} — уточните запрос.
+    </p>
+    <p v-else-if="!isSearching && roomsStore.hasMore" class="mt-1.5 px-2 text-[10px] text-ink-mute">
+      Последние {{ roomsStore.meta.limit }} из {{ roomsStore.meta.total }} — остальные через поиск.
+    </p>
 
     <RoomFormModal
       v-if="modalOpen"

@@ -3,8 +3,10 @@
 declare(strict_types=1);
 
 use App\Controllers\AuthController;
+use App\Controllers\HealthController;
 use App\Controllers\RequestsController;
 use App\Controllers\RoomsController;
+use App\Controllers\RunsController;
 use App\Controllers\WebhookController;
 use App\Controllers\WorkflowsController;
 use App\Http\Request;
@@ -16,36 +18,60 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 $router = new Router();
 
 $auth = new AuthController();
+$health = new HealthController();
 $requests = new RequestsController();
 $rooms = new RoomsController();
+$runs = new RunsController();
 $workflows = new WorkflowsController();
 $webhook = new WebhookController();
 
-$router->add('GET', '/api/health', static fn (): never => Response::json(['status' => 'ok']));
+// Real health: database, worker heartbeat, queue backlog. Public on purpose — a
+// probe has no credentials — and it carries no payloads or secrets.
+$router->add('GET', '/api/health', fn (Request $r) => $health->show($r));
 
 $router->add('POST', '/api/auth/login', fn (Request $r) => $auth->login($r));
 $router->add('GET', '/api/auth/me', fn (Request $r) => $auth->me($r));
 $router->add('POST', '/api/auth/logout', fn () => $auth->logout());
 $router->add('GET', '/api/auth/config', fn () => $auth->config());
 $router->add('POST', '/api/ws/ticket', fn (Request $r) => $auth->wsTicket($r));
+$router->add('POST', '/api/auth/read-token', fn (Request $r) => $auth->readToken($r));
 
 $router->add('GET', '/api/rooms', fn (Request $r) => $rooms->index($r));
 $router->add('POST', '/api/rooms', fn (Request $r) => $rooms->store($r));
 $router->add('GET', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->show($r, $p));
 $router->add('PUT', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->update($r, $p));
 $router->add('DELETE', '/api/rooms/{id}', fn (Request $r, array $p) => $rooms->destroy($r, $p));
+$router->add('POST', '/api/rooms/{id}/secret', fn (Request $r, array $p) => $rooms->rotateSecret($r, $p));
+$router->add('DELETE', '/api/rooms/{id}/secret', fn (Request $r, array $p) => $rooms->clearSecret($r, $p));
 
 $router->add('GET', '/api/stats', fn (Request $r) => $requests->stats($r));
+// Before `/api/requests/{id}`: that pattern matches any single segment, so
+// "export" would be read as a request id and answered with 404. Same reason
+// `/api/endpoints` is its own route rather than `/api/requests/endpoints`.
+$router->add('GET', '/api/endpoints', fn (Request $r) => $requests->endpoints($r));
 $router->add('GET', '/api/requests', fn (Request $r) => $requests->index($r));
+// Before `/api/requests/{id}`: that pattern matches any single segment, so
+// "export" would be read as a request id and answered with 404.
+$router->add('GET', '/api/requests/export', fn (Request $r) => $requests->export($r));
 $router->add('GET', '/api/requests/{id}', fn (Request $r, array $p) => $requests->show($r, $p));
 $router->add('DELETE', '/api/requests/{id}', fn (Request $r, array $p) => $requests->destroy($r, $p));
+$router->add('POST', '/api/requests/{id}/replay', fn (Request $r, array $p) => $requests->replay($r, $p));
+// Dry run: "what would routing do", without queueing or sending anything.
+$router->add('POST', '/api/requests/{id}/preview', fn (Request $r, array $p) => $requests->preview($r, $p));
+$router->add('GET', '/api/requests/{id}/body', fn (Request $r, array $p) => $requests->body($r, $p));
+$router->add('POST', '/api/runs/{id}/retry', fn (Request $r, array $p) => $requests->retryRun($r, $p));
+// The run journal as a page: "what failed in the last hour" without opening
+// stored requests one by one. Read-only; retry stays where it already is.
+$router->add('GET', '/api/runs', fn (Request $r) => $runs->index($r));
 
 $router->add('GET', '/api/workflows', fn (Request $r) => $workflows->index($r));
 $router->add('POST', '/api/workflows', fn (Request $r) => $workflows->store($r));
+// Before `/api/workflows/{id}`: a literal segment would otherwise be read as an id.
 $router->add('GET', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->show($r, $p));
 $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->update($r, $p));
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
+$router->add('POST', '/api/workflows/{id}/duplicate', fn (Request $r, array $p) => $workflows->duplicate($r, $p));
 
 $request = Request::capture();
 

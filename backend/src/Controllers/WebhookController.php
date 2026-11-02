@@ -11,6 +11,7 @@ use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
 use App\Support\RateLimiter;
+use App\Support\Signature;
 
 final class WebhookController
 {
@@ -24,6 +25,7 @@ final class WebhookController
         $this->enforceLimit($request);
 
         [$room, $endpoint] = $this->resolveTarget($request, $params);
+        $this->verifySignature($request, $room);
 
         $raw = $request->rawBody;
         $decoded = $raw !== '' ? json_decode($raw, true) : null;
@@ -118,6 +120,34 @@ final class WebhookController
         header('Retry-After: ' . $result['retry_after']);
 
         Response::error('Слишком много входящих запросов, повторите позже', 429);
+    }
+
+    /**
+     * A room with a secret accepts only requests signed with it.
+     *
+     * The check runs before the row is written, so a forged request never reaches
+     * the log and never queues a workflow. A room without a secret stays public:
+     * the catcher is meant to be reachable from any sender.
+     *
+     * @param array<string, mixed> $room
+     */
+    private function verifySignature(Request $request, array $room): void
+    {
+        $secret = (string) ($room['secret'] ?? '');
+        if ($secret === '') {
+            return;
+        }
+
+        if (Signature::verify($request->header(Signature::HEADER), $request->rawBody, $secret)) {
+            return;
+        }
+
+        header('WWW-Authenticate: Signature realm="hookdock"');
+
+        Response::error(
+            'Неверная подпись вебхука: проверьте секрет комнаты и заголовок ' . Signature::HEADER,
+            401,
+        );
     }
 
     /**

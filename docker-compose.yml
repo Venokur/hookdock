@@ -44,6 +44,19 @@ services:
       LOGIN_WINDOW_SECONDS: ${LOGIN_WINDOW_SECONDS:-60}
       INGEST_MAX_PER_WINDOW: ${INGEST_MAX_PER_WINDOW:-0}
       INGEST_WINDOW_SECONDS: ${INGEST_WINDOW_SECONDS:-60}
+      # `/api/health` turns red when the queue's oldest pending run is older than
+      # this, and when no worker beat within WORKER_STALE_SECONDS.
+      HEALTH_QUEUE_MAX_AGE: ${HEALTH_QUEUE_MAX_AGE:-300}
+      WORKER_STALE_SECONDS: ${WORKER_STALE_SECONDS:-60}
+    # Compose and orchestrators use this as readiness. The api container runs fpm,
+    # not nginx, so the check talks to the same services the API does instead of
+    # curling a port that is not open there.
+    healthcheck:
+      test: ["CMD-SHELL", "php /var/www/backend/bin/healthcheck.php"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -97,6 +110,13 @@ services:
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       RETENTION_RUN_DAYS: ${RETENTION_RUN_DAYS:-0}
       RETENTION_INTERVAL_SECONDS: ${RETENTION_INTERVAL_SECONDS:-3600}
+      # Failure alerting: a terminal run failure is counted, and the workflow is
+      # paused after this many in a row (0 = never pause automatically). Empty
+      # ALERT_WEBHOOK_URL keeps the notification off; the counters and the pause
+      # still work, so the UI shows the problem without an external service.
+      WORKFLOW_FAILURE_THRESHOLD: ${WORKFLOW_FAILURE_THRESHOLD:-3}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-900}
       RUN_MIGRATIONS: "0"
     depends_on:
       db:

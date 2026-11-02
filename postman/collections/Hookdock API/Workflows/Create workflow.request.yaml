@@ -1,0 +1,51 @@
+$kind: http-request
+name: Create workflow
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 2000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman rule",
+      "endpoint": "*",
+      "enabled": true,
+      "priority": 100,
+      "stop_processing": false,
+      "conditions": {
+        "mode": "all",
+        "rules": [
+          { "path": "body.event.type", "operator": "equals", "value": "payment" },
+          {
+            "mode": "any",
+            "rules": [
+              { "path": "body.customer.name", "operator": "equals", "value": "Ada" },
+              { "path": "body.customer.name", "operator": "equals", "value": "Bob" }
+            ]
+          }
+        ]
+      },
+      "actions": [
+        { "type": "delay", "seconds": 5 },
+        { "type": "log", "message": "paid by {{ body.customer.name }}" }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('a rule with an OR group is created', function () {
+        pm.response.to.have.status(201);
+        const rule = pm.response.json().data;
+        pm.expect(rule.conditions.mode).to.eql('all');
+        pm.expect(rule.condition_count).to.eql(3);
+        pm.expect(rule.priority).to.eql(100);
+      });
+      const rule = pm.response.json().data;
+      if (rule) {
+        pm.collectionVariables.set('workflow_id', String(rule.id));
+      }

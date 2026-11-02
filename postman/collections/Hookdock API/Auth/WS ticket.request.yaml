@@ -1,0 +1,17 @@
+$kind: http-request
+name: WebSocket ticket
+method: POST
+url: '{{base_url}}/api/ws/ticket'
+order: 4000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A ticket is a 60 s `scope: ws` credential for the handshake only. It is
+      // deliberately not usable on any REST route.
+      pm.test('a short-lived websocket ticket is issued', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data.ticket).to.be.a('string').and.not.empty;
+        pm.expect(body.data.expires_in).to.be.above(0);
+      });

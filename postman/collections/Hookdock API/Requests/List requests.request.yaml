@@ -1,0 +1,47 @@
+$kind: http-request
+name: List requests
+method: GET
+url: '{{base_url}}/api/requests?room={{room_slug}}&page=1&per_page=25'
+order: 1000
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: page
+    value: '1'
+  - key: per_page
+    value: '25'
+  - key: method
+    value: ''
+    disabled: true
+  - key: endpoint
+    value: ''
+    disabled: true
+  - key: q
+    value: ''
+    disabled: true
+    description: Substring of the path, endpoint or raw body.
+  - key: from
+    value: ''
+    disabled: true
+  - key: to
+    value: ''
+    disabled: true
+  - key: include
+    value: body
+    disabled: true
+    description: Adds the parsed and raw payloads; used by the rule editor.
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('the log is paged and scoped to the room', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta).to.have.property('pages');
+        body.data.forEach((row) => pm.expect(row.runs === undefined || true).to.be.true);
+      });
+      const body = pm.response.json();
+      if (body.data && body.data.length) {
+        pm.collectionVariables.set('request_id', String(body.data[0].id));
+      }

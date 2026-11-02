@@ -8,7 +8,7 @@ import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import { api } from '../api/client'
-import { confirm } from '../composables/dialog'
+import { confirm, notify } from '../composables/dialog'
 import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
 import { useRefresh } from '../composables/useRefresh'
 import { useRoomsStore } from '../stores/rooms'
@@ -23,11 +23,21 @@ const room = computed(() => (slug.value ? rooms.find(slug.value) : null))
 const items = ref([])
 const meta = reactive({ page: 1, per_page: 25, total: 0, pages: 1 })
 const stats = ref(null)
-const filters = reactive({ method: 'ALL', q: '', endpoint: '' })
+const filters = reactive({ method: 'ALL', q: '', endpoint: '', period: 'all', from: '', to: '' })
+
+// Endpoint panel search: the same division the sidebar uses for rooms — a page
+// from `stats`, and matches fetched on demand for everything else.
+const endpointSearch = ref('')
+const endpointHits = ref([])
+const endpointSearching = ref(false)
+const endpointSearchMeta = reactive({ total: 0, returned: 0, has_more: false })
+let endpointSeq = 0
 
 const loading = ref(false)
 const error = ref('')
 const copied = ref(false)
+const exportFormat = ref('json')
+const exporting = ref(false)
 
 // User-driven reloads (filters, paging, room switch) get their own busy flag so the
 // loader is visible even when a local API answers in a few milliseconds.
@@ -57,6 +67,156 @@ const methodOptions = methods.map((method) => ({
   value: method,
   label: method === 'ALL' ? 'Все методы' : method,
 }))
+
+/**
+ * Time presets are turned into `from` here, not on the server: "24 часа" means
+ * the last 24 hours from now, and the API already accepts an absolute date.
+ * `custom` passes the two datetime-local fields as-is.
+ */
+const PERIOD_HOURS = { '1h': 1, '24h': 24, '7d': 168, '30d': 720 }
+const periodOptions = [
+  { value: 'all', label: 'Всё время' },
+  { value: '1h', label: 'Последний час' },
+  { value: '24h', label: '24 часа' },
+  { value: '7d', label: '7 дней' },
+  { value: '30d', label: '30 дней' },
+  { value: 'custom', label: 'Свой период' },
+]
+const exportOptions = [
+  { value: 'json', label: 'JSON' },
+  { value: 'csv', label: 'CSV' },
+  { value: 'ndjson', label: 'NDJSON' },
+]
+
+/**
+ * Endpoint filter options.
+ *
+ * The closed filter shows the room's 15 most frequent endpoints (`stats.endpoints`)
+ * — enough to cover the usual case without a panel that scrolls for a screen. A
+ * room can also receive on hundreds of paths, so the rest are reachable by typing
+ * in the panel: the term goes to `/api/endpoints`, the same way the sidebar
+ * searches rooms by name/slug. Options come from one of two lists (`endpointHits`
+ * while searching), never from both, so a slow search cannot mix a stale page into
+ * fresh matches.
+ *
+ * The selected value is always included: a filter that fell out of the top 15 is
+ * still active, and a closed select would otherwise read "Все эндпоинты" while the
+ * log stayed filtered.
+ */
+const endpointOptions = computed(() => {
+  const source = endpointSearch.value.trim() === ''
+    ? (stats.value?.endpoints ?? [])
+    : endpointHits.value
+
+  const known = source.map((item) => ({ value: item.endpoint, label: item.endpoint }))
+  const current = filters.endpoint.trim()
+
+  if (current !== '' && !known.some((option) => option.value === current)) {
+    known.unshift({ value: current, label: current })
+  }
+
+  return [{ value: '', label: 'Все эндпоинты' }, ...known]
+})
+
+/**
+ * Says how much of the list is on screen, so a truncated filter never looks like
+ * a complete one. While searching, the count is the search's own meta.
+ */
+const endpointHint = computed(() => {
+  const term = endpointSearch.value.trim()
+
+  if (term !== '') {
+    const meta = endpointSearchMeta
+    // Empty matches need a line of their own: the panel still lists "Все
+    // эндпоинты", so a bare list would read as "the search found nothing to show
+    // and probably worked" instead of "there is no such endpoint".
+    if (meta.total === 0) {
+      return endpointSearching.value ? '' : 'Ничего не найдено.'
+    }
+    return meta.has_more
+      ? `Найдено ${meta.total}, показаны первые ${meta.returned} — уточните запрос.`
+      : `Найдено ${meta.total}.`
+  }
+
+  const total = stats.value?.endpoints_total ?? 0
+  const shown = (stats.value?.endpoints ?? []).length
+
+  return total > shown ? `Показаны ${shown} из ${total} — остальные через поиск.` : ''
+})
+
+async function searchEndpoints(term) {
+  endpointSearch.value = term
+
+  // Clearing the field goes back to the page from `stats`; there is nothing to
+  // fetch, and a request per deletion of the last character would only add noise.
+  if (term === '') {
+    endpointSeq += 1
+    endpointHits.value = []
+    endpointSearching.value = false
+    Object.assign(endpointSearchMeta, { total: 0, returned: 0, has_more: false })
+    return
+  }
+
+  const seq = ++endpointSeq
+  endpointSearching.value = true
+
+  try {
+    const res = await api.endpoints({ room: slug.value, q: term, limit: 15 })
+    // A slower answer for an older term must not replace the current matches.
+    if (seq !== endpointSeq || term !== endpointSearch.value) {
+      return
+    }
+
+    endpointHits.value = res.data
+    Object.assign(endpointSearchMeta, res.meta)
+  } catch (e) {
+    if (seq === endpointSeq) {
+      endpointHits.value = []
+      notify(e.message)
+    }
+  } finally {
+    if (seq === endpointSeq) {
+      endpointSearching.value = false
+    }
+  }
+}
+
+function toIso(value) {
+  if (!value) {
+    return ''
+  }
+
+  const date = new Date(value)
+
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString()
+}
+
+function rangeParams() {
+  if (filters.period === 'custom') {
+    const params = {}
+    const from = toIso(filters.from)
+    const to = toIso(filters.to)
+
+    if (from) params.from = from
+    if (to) params.to = to
+
+    return params
+  }
+
+  const hours = PERIOD_HOURS[filters.period]
+
+  return hours ? { from: new Date(Date.now() - hours * 3600 * 1000).toISOString() } : {}
+}
+
+/** Filters shared by the list and the export, so a download matches the screen. */
+function filterParams() {
+  return {
+    method: filters.method,
+    q: filters.q.trim(),
+    endpoint: filters.endpoint.trim(),
+    ...rangeParams(),
+  }
+}
 
 const webhookUrl = computed(() => {
   // The address advertises the room's own endpoint, not the endpoint filter: the
@@ -91,7 +251,14 @@ const cards = computed(() => [
     value: stats.value?.requests_last_24h ?? 0,
     hint: `${stats.value?.requests_last_hour ?? 0} за последний час`,
   },
-  { label: 'Активные сценарии', value: stats.value?.workflows_active ?? 0, hint: 'правила включены' },
+  {
+    label: 'Активные сценарии',
+    value: stats.value?.workflows_active ?? 0,
+    hint: (stats.value?.workflows_auto_paused ?? 0) > 0
+      ? `выключено автоматически: ${stats.value.workflows_auto_paused}`
+      : 'правила включены',
+    alert: false,
+  },
   {
     label: 'В очереди',
     value: stats.value?.queued_runs ?? 0,
@@ -126,9 +293,7 @@ async function load({ silent = false } = {}) {
         room: roomSlug,
         page: meta.page,
         per_page: meta.per_page,
-        method: filters.method,
-        q: filters.q.trim(),
-        endpoint: filters.endpoint.trim(),
+        ...filterParams(),
       }),
       api.stats({ room: roomSlug }),
     ])
@@ -290,12 +455,36 @@ function onRequestDeleted(payload) {
 // trigger the watcher, and a stale flag would swallow the user's next real change.
 let suppressFilterReload = false
 
-watch(slug, () => {
-  suppressFilterReload = filters.method !== 'ALL' || filters.q !== '' || filters.endpoint !== ''
+function hasActiveFilters() {
+  return filters.method !== 'ALL'
+    || filters.q !== ''
+    || filters.endpoint !== ''
+    || filters.period !== 'all'
+    || filters.from !== ''
+    || filters.to !== ''
+}
 
+function resetFilterValues() {
   filters.method = 'ALL'
   filters.q = ''
   filters.endpoint = ''
+  filters.period = 'all'
+  filters.from = ''
+  filters.to = ''
+}
+
+watch(slug, () => {
+  suppressFilterReload = hasActiveFilters()
+
+  resetFilterValues()
+  // A search term for the previous room would be sent with the new room's first
+  // stats request; the endpoints of one room say nothing about another's. Bumping
+  // the sequence also discards an answer that is still in flight.
+  endpointSeq += 1
+  endpointSearch.value = ''
+  endpointHits.value = []
+  endpointSearching.value = false
+  Object.assign(endpointSearchMeta, { total: 0, returned: 0, has_more: false })
   items.value = []
   stats.value = null
   Object.assign(meta, { page: 1, total: 0, pages: 1 })
@@ -355,6 +544,32 @@ async function openRequest(row) {
   }
 }
 
+/**
+ * Opens a request the URL names, for links from the run journal.
+ *
+ * The journal knows a run's `request_id` but not its row (the request may even be on
+ * another page of the log after a filter change), so this fetches the detail
+ * directly and lets the drawer fill itself in. An id that no longer exists closes
+ * the drawer and reports it instead of leaving an empty panel.
+ */
+async function openRequestById(id) {
+  showDetail.value = true
+  detailLoading.value = true
+  detail.value = null
+  runs.value = []
+
+  try {
+    const data = await api.request(id)
+    detail.value = data.data.request
+    runs.value = data.data.runs
+  } catch (e) {
+    notify(e.message, { tone: 'error' })
+    showDetail.value = false
+  } finally {
+    detailLoading.value = false
+  }
+}
+
 function closeDetail() {
   showDetail.value = false
 }
@@ -390,13 +605,90 @@ async function copyWebhook() {
 }
 
 function resetFilters() {
-  filters.method = 'ALL'
-  filters.q = ''
-  filters.endpoint = ''
+  resetFilterValues()
+}
+
+/**
+ * Re-routes the open request through the room's enabled workflows. The stored
+ * row is not duplicated: the API only queues new runs, so the log keeps one
+ * entry per delivery while the operator can retry a fix.
+ */
+async function replayRequest() {
+  const id = detail.value?.id
+  if (!id) {
+    return
+  }
+
+  try {
+    const data = await api.replayRequest(id)
+    const queued = data.data.queued ?? 0
+
+    notify(
+      queued > 0
+        ? `Сценарии поставлены в очередь: ${queued}`
+        : 'Нет активных сценариев для этого эндпоинта',
+      { tone: 'info' },
+    )
+
+    await refreshDetail()
+  } catch (e) {
+    notify(e.message)
+  }
+}
+
+/**
+ * Queues a fresh run of the same workflow. The failed run stays in the log as
+ * evidence; the new one executes every action again.
+ */
+async function retryRun(runId) {
+  try {
+    await api.retryRun(runId)
+    notify('Запуск поставлен в очередь', { tone: 'info' })
+    await refreshDetail()
+  } catch (e) {
+    notify(e.message)
+  }
+}
+
+/**
+ * Downloads the current selection as a file. The request goes through `fetch`
+ * because the API needs a Bearer token, which a plain link cannot send.
+ */
+async function exportNow() {
+  exporting.value = true
+
+  try {
+    const { blob, filename } = await api.exportRequests({
+      room: slug.value,
+      format: exportFormat.value,
+      ...filterParams(),
+    })
+
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+
+    notify(`Экспорт готов: ${filename}`, { tone: 'info' })
+  } catch (e) {
+    notify(e.message)
+  } finally {
+    exporting.value = false
+  }
 }
 
 onMounted(() => {
   load()
+
+  // A link from the run journal: open the request it names.
+  const requested = Number(route.query.request)
+  if (Number.isFinite(requested) && requested > 0) {
+    openRequestById(requested)
+  }
 
   const offCreated = subscribe('request.created', onRequestEvent)
   const offUpdated = subscribe('request.updated', onRequestEvent)
@@ -435,7 +727,7 @@ onUnmounted(() => {
           </p>
         </div>
 
-        <div class="flex items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3">
           <span class="flex items-center gap-1.5 text-[11px]" :class="{
             'text-emerald-700 dark:text-emerald-300': realtimeLabel.tone === 'ok',
             'text-amber-700 dark:text-amber-300': realtimeLabel.tone === 'warn',
@@ -479,6 +771,10 @@ onUnmounted(() => {
         <p class="w-full text-[11px] text-ink-mute">
           Эндпоинт комнаты <code class="font-mono text-ink-soft">{{ room?.endpoint }}</code>
           · меняется в настройках комнаты; любой другой путь тоже принимается.
+          <span v-if="room?.has_secret" class="text-emerald-700 dark:text-emerald-300">
+            · подпись обязательна (<code class="font-mono">X-Hookdock-Signature</code>)
+          </span>
+          <span v-else>· подпись не требуется</span>
         </p>
       </section>
 
@@ -492,32 +788,74 @@ onUnmounted(() => {
           :options="methodOptions"
           size="sm"
           aria-label="Фильтр по методу"
-          class="w-36"
+          class="w-[calc(50%-0.25rem)] sm:w-36"
         />
 
-        <div class="w-44">
+        <AppSelect
+          v-model="filters.period"
+          :options="periodOptions"
+          size="sm"
+          aria-label="Период"
+          class="w-[calc(50%-0.25rem)] sm:w-40"
+        />
+
+        <template v-if="filters.period === 'custom'">
           <AppInput
-            v-model="filters.endpoint"
-            list="known-endpoints"
+            v-model="filters.from"
+            type="datetime-local"
             size="sm"
-            placeholder="Фильтр по эндпоинту"
+            aria-label="Начало периода"
+            class="w-full sm:w-52"
           />
-        </div>
-        <datalist id="known-endpoints">
-          <option v-for="item in stats?.endpoints ?? []" :key="item.endpoint" :value="item.endpoint" />
-        </datalist>
+          <AppInput
+            v-model="filters.to"
+            type="datetime-local"
+            size="sm"
+            aria-label="Конец периода"
+            class="w-full sm:w-52"
+          />
+        </template>
+
+        <AppSelect
+          v-model="filters.endpoint"
+          :options="endpointOptions"
+          size="sm"
+          searchable
+          search-placeholder="Поиск эндпоинта"
+          :searching="endpointSearching"
+          :hint="endpointHint"
+          aria-label="Фильтр по эндпоинту"
+          class="w-[calc(50%-0.25rem)] sm:w-44"
+          @search="searchEndpoints"
+        />
 
         <AppInput
           v-model="filters.q"
           type="search"
           size="sm"
           placeholder="Поиск по пути или телу…"
-          class="min-w-40 flex-1"
+          class="min-w-0 flex-1 basis-40"
         />
 
         <button type="button" class="btn border-transparent bg-transparent" @click="resetFilters">
           Сбросить
         </button>
+
+        <!-- The export controls keep their own row on a phone: next to the filters
+             they squeeze the search field into an unusable width. -->
+        <div class="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
+          <AppSelect
+            v-model="exportFormat"
+            :options="exportOptions"
+            size="sm"
+            aria-label="Формат экспорта"
+            class="w-28"
+          />
+          <button type="button" class="btn" :disabled="exporting" @click="exportNow">
+            <AppSpinner v-if="exporting" size="xs" />
+            {{ exporting ? 'Готовим…' : 'Экспорт' }}
+          </button>
+        </div>
       </section>
 
       <section class="card relative overflow-hidden">
@@ -533,7 +871,11 @@ onUnmounted(() => {
           </div>
         </Transition>
 
-        <div class="overflow-x-auto">
+        <!-- Seven columns do not fit a phone, and horizontal scrolling hides the
+             method/time pair that makes a log readable at a glance. Below `md` the
+             same rows render as cards; the table stays for wider screens. Both read
+             `items`, so there is one data source and one loader. -->
+        <div v-if="items.length" class="hidden overflow-x-auto md:block">
           <table class="min-w-full text-left">
             <thead class="border-b border-line bg-surface-2 text-[11px] uppercase tracking-wider text-ink-mute">
               <tr>
@@ -574,27 +916,53 @@ onUnmounted(() => {
                 </td>
                 <td class="px-4 py-3 text-right text-ink-mute">→</td>
               </tr>
-
-              <tr v-if="!listLoading && items.length === 0">
-                <td colspan="7" class="px-4 py-16 text-center">
-                  <p class="text-sm font-medium text-ink">Пока ничего не поймано</p>
-                  <p class="mx-auto mt-1 max-w-md text-xs text-ink-mute">
-                    Отправьте запрос на <code class="font-mono text-indigo-600 dark:text-indigo-300">{{ webhookUrl }}</code>
-                    — он появится здесь сразу.
-                  </p>
-                </td>
-              </tr>
-
-              <tr v-if="showInlineLoader">
-                <td colspan="7" class="px-4 py-16 text-center">
-                  <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
-                    <AppSpinner size="sm" />
-                    {{ filtering ? 'Фильтруем…' : 'Загружаем лог…' }}
-                  </span>
-                </td>
-              </tr>
             </tbody>
           </table>
+        </div>
+
+        <ul v-if="items.length" class="divide-y divide-line md:hidden">
+          <li v-for="row in items" :key="row.id">
+            <button
+              type="button"
+              class="block w-full px-4 py-3 text-left transition active:bg-surface-2"
+              @click="openRequest(row)"
+            >
+              <div class="flex items-center gap-2">
+                <MethodBadge :method="row.method" />
+                <span class="min-w-0 flex-1 truncate font-mono text-xs text-ink">{{ row.path }}</span>
+                <span class="shrink-0 text-ink-mute" aria-hidden="true">→</span>
+              </div>
+
+              <p class="mt-1.5 truncate font-mono text-[11px] text-ink-mute">
+                {{ formatTime(row.received_at) }} · {{ row.endpoint }} · {{ formatBytes(row.body_bytes) }}
+              </p>
+
+              <p class="mt-1 text-[11px]">
+                <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
+                <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
+                <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>
+                <span v-if="!row.run_count" class="text-ink-mute">без правил</span>
+              </p>
+            </button>
+          </li>
+        </ul>
+
+        <!-- One feedback block for both layouts: the empty state and the inline
+             loader are mutually exclusive with each other and with the overlay
+             above, so no screen ever shows two spinners for one action. -->
+        <div v-if="!listLoading && items.length === 0" class="px-4 py-16 text-center">
+          <p class="text-sm font-medium text-ink">Пока ничего не поймано</p>
+          <p class="mx-auto mt-1 max-w-md break-all text-xs text-ink-mute">
+            Отправьте запрос на <code class="font-mono text-indigo-600 dark:text-indigo-300">{{ webhookUrl }}</code>
+            — он появится здесь сразу.
+          </p>
+        </div>
+
+        <div v-else-if="showInlineLoader" class="px-4 py-16 text-center">
+          <span class="inline-flex items-center gap-2 text-xs text-ink-soft">
+            <AppSpinner size="sm" />
+            {{ filtering ? 'Фильтруем…' : 'Загружаем лог…' }}
+          </span>
         </div>
 
         <footer class="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-xs text-ink-mute">
@@ -648,6 +1016,8 @@ onUnmounted(() => {
             class="h-full"
             @close="closeDetail"
             @delete="removeRequest"
+            @replay="replayRequest"
+            @retry="retryRun"
           />
         </aside>
       </Transition>

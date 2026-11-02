@@ -17,11 +17,11 @@ final class RoomResolver
 {
     public const DEFAULT_SLUG = 'default';
 
-    /** @var array<string, int>|null */
+    /** @var array<string, array{id: int, slug: string, secret: ?string}>|null */
     private static ?array $slugs = null;
 
     /**
-     * @return array{id: int, slug: string}|null
+     * @return array{id: int, slug: string, secret: ?string}|null
      */
     public static function findBySlug(string $slug): ?array
     {
@@ -30,16 +30,11 @@ final class RoomResolver
             return null;
         }
 
-        $ids = self::slugs();
-        if (!isset($ids[$slug])) {
-            return null;
-        }
-
-        return ['id' => $ids[$slug], 'slug' => $slug];
+        return self::slugs()[$slug] ?? null;
     }
 
     /**
-     * @return array{id: int, slug: string}|null
+     * @return array{id: int, slug: string, secret: ?string}|null
      */
     public static function findById(int $id): ?array
     {
@@ -47,15 +42,23 @@ final class RoomResolver
             return null;
         }
 
-        $stmt = Database::pdo()->prepare('SELECT id, slug FROM rooms WHERE id = :id');
+        $stmt = Database::pdo()->prepare('SELECT id, slug, secret FROM rooms WHERE id = :id');
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
 
-        return $row === false ? null : ['id' => (int) $row['id'], 'slug' => (string) $row['slug']];
+        if ($row === false) {
+            return null;
+        }
+
+        return [
+            'id' => (int) $row['id'],
+            'slug' => (string) $row['slug'],
+            'secret' => $row['secret'] === null ? null : (string) $row['secret'],
+        ];
     }
 
     /**
-     * @return array{id: int, slug: string}|null
+     * @return array{id: int, slug: string, secret: ?string}|null
      */
     public static function default(): ?array
     {
@@ -68,7 +71,7 @@ final class RoomResolver
     }
 
     /**
-     * @return array<string, int>
+     * @return array<string, array{id: int, slug: string, secret: ?string}>
      */
     private static function slugs(): array
     {
@@ -77,8 +80,12 @@ final class RoomResolver
         }
 
         self::$slugs = [];
-        foreach (Database::pdo()->query('SELECT id, slug FROM rooms') as $row) {
-            self::$slugs[strtolower((string) $row['slug'])] = (int) $row['id'];
+        foreach (Database::pdo()->query('SELECT id, slug, secret FROM rooms') as $row) {
+            self::$slugs[strtolower((string) $row['slug'])] = [
+                'id' => (int) $row['id'],
+                'slug' => (string) $row['slug'],
+                'secret' => $row['secret'] === null ? null : (string) $row['secret'],
+            ];
         }
 
         return self::$slugs;

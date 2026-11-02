@@ -1,0 +1,15 @@
+$kind: http-request
+name: Replay request
+method: POST
+url: '{{base_url}}/api/requests/{{request_id}}/replay'
+order: 5000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Route the stored payload again. No new request row is created, so the log
+      // keeps one entry per delivery.
+      pm.test('replay queues runs for the stored request', function () {
+        pm.response.to.have.status(202);
+        pm.expect(pm.response.json().data.id).to.be.a('number');
+      });

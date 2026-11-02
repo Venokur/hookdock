@@ -57,6 +57,51 @@ async function request(path, { method = 'GET', body, headers = {} } = {}) {
   return payload
 }
 
+/**
+ * Fetches a file with the auth header and hands back its blob.
+ *
+ * A plain `<a href="/api/...">` cannot download an export: the API expects a
+ * Bearer token and a browser navigation does not send one. The filename comes
+ * from the server so the client does not have to rebuild it.
+ */
+async function download(path) {
+  const token = getToken()
+
+  let response
+  try {
+    response = await fetch(path, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+  } catch {
+    throw new Error('Network error: backend is not reachable')
+  }
+
+  if (response.status === 401) {
+    setToken('')
+    window.dispatchEvent(new Event('auth:expired'))
+    throw new Error('Unauthorized')
+  }
+
+  if (!response.ok) {
+    let message = `Не удалось скачать файл (${response.status})`
+    try {
+      const payload = await response.json()
+      message = payload?.error?.message || message
+    } catch {
+      // The error body was not JSON; the status is all we have.
+    }
+    throw new Error(message)
+  }
+
+  const disposition = response.headers.get('Content-Disposition') || ''
+  const match = /filename="([^"]+)"/.exec(disposition)
+
+  return {
+    blob: await response.blob(),
+    filename: match ? match[1] : 'hookdock-export',
+  }
+}
+
 function query(params) {
   const search = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
@@ -74,19 +119,30 @@ export const api = {
   config: () => request('/api/auth/config'),
   wsTicket: () => request('/api/ws/ticket', { method: 'POST' }),
   me: () => request('/api/auth/me'),
-  rooms: () => request('/api/rooms'),
+  rooms: (params = {}) => request(`/api/rooms${query(params)}`),
   createRoom: (room) => request('/api/rooms', { method: 'POST', body: room }),
   updateRoom: (id, room) => request(`/api/rooms/${id}`, { method: 'PUT', body: room }),
   deleteRoom: (id) => request(`/api/rooms/${id}`, { method: 'DELETE' }),
   stats: (params = {}) => request(`/api/stats${query(params)}`),
+  endpoints: (params = {}) => request(`/api/endpoints${query(params)}`),
   requests: (params = {}) => request(`/api/requests${query(params)}`),
   request: (id) => request(`/api/requests/${id}`),
   deleteRequest: (id) => request(`/api/requests/${id}`, { method: 'DELETE' }),
+  replayRequest: (id) => request(`/api/requests/${id}/replay`, { method: 'POST' }),
+  retryRun: (id) => request(`/api/runs/${id}/retry`, { method: 'POST' }),
+  previewRequest: (id, body) => request(`/api/requests/${id}/preview`, { method: 'POST', body }),
+  downloadRequestBody: (id) => download(`/api/requests/${id}/body`),
+  exportRequests: (params = {}) => download(`/api/requests/export${query(params)}`),
+  rotateRoomSecret: (id) => request(`/api/rooms/${id}/secret`, { method: 'POST' }),
+  clearRoomSecret: (id) => request(`/api/rooms/${id}/secret`, { method: 'DELETE' }),
   workflows: (params = {}) => request(`/api/workflows${query(params)}`),
   saveWorkflow: (workflow) =>
     workflow.id
       ? request(`/api/workflows/${workflow.id}`, { method: 'PUT', body: workflow })
       : request('/api/workflows', { method: 'POST', body: workflow }),
   toggleWorkflow: (id) => request(`/api/workflows/${id}/toggle`, { method: 'POST' }),
+  duplicateWorkflow: (id) => request(`/api/workflows/${id}/duplicate`, { method: 'POST' }),
+  readToken: () => request('/api/auth/read-token', { method: 'POST' }),
+  runs: (params = {}) => request(`/api/runs${query(params)}`),
   deleteWorkflow: (id) => request(`/api/workflows/${id}`, { method: 'DELETE' }),
 }

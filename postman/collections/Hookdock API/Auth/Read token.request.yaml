@@ -1,0 +1,19 @@
+$kind: http-request
+name: Issue read-only token
+method: POST
+url: '{{base_url}}/api/auth/read-token'
+order: 2000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A read token is refused with 403 on every mutating endpoint; keep it in a
+      // separate variable so a request can be pointed at either credential.
+      pm.test('a read-only token is issued with its scope', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().data.scope).to.eql('read');
+      });
+      const body = pm.response.json();
+      if (body.data && body.data.token) {
+        pm.collectionVariables.set('read_token', body.data.token);
+      }

@@ -47,9 +47,11 @@ async function syncRouteToRooms() {
     return
   }
 
-  // Same id under a new slug = renamed in another tab; follow it. Otherwise the
-  // room is gone and the user lands on the last visited (or first) remaining one.
-  const renamed = currentId ? rooms.rooms.find((room) => room.id === currentId) : null
+  // Same id under a new slug = renamed in another tab; follow it. The room may be
+  // older than the sidebar page, so the id is resolved against the API instead of
+  // the loaded list. Otherwise the room is gone and the user lands on the last
+  // visited (or first) remaining one.
+  const renamed = currentId ? await rooms.ensureById(currentId) : null
   const next = renamed?.slug ?? rooms.fallbackSlug()
 
   await router.replace(

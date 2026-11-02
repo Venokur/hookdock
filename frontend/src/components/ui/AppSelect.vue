@@ -12,16 +12,37 @@ const props = defineProps({
   invalid: Boolean,
   /** Swaps the chevron for a spinner while the value is being applied. */
   loading: Boolean,
+  /** Shows a spinner inside the option panel while its contents are being fetched. */
+  searching: Boolean,
+  /**
+   * Adds a text field inside the panel. The component only owns the field and the
+   * debounce; the caller decides what to do with the term (`@search`), because
+   * the list may have to be fetched from the server — a room can have hundreds
+   * of endpoints, and a filter that can only pick from the visible page is a
+   * filter that cannot reach the rest.
+   */
+  searchable: Boolean,
+  searchPlaceholder: { type: String, default: 'Поиск…' },
+  /** One line under the list: "показаны первые 15 из 40" and similar. */
+  hint: { type: String, default: '' },
   ariaLabel: { type: String, default: '' },
 })
+
+const emit = defineEmits(['search'])
 
 const uid = useId()
 const listId = `listbox-${uid}`
 const triggerRef = ref(null)
 const listRef = ref(null)
+const panelRef = ref(null)
+const searchRef = ref(null)
 const open = ref(false)
 const activeIndex = ref(-1)
+const query = ref('')
 const position = ref({ top: 0, left: 0, width: 0, maxHeight: 288, placement: 'bottom' })
+
+const SEARCH_DEBOUNCE = 250
+let searchQueryTimer = null
 
 const sizes = {
   sm: 'rounded-lg px-2.5 py-1.5 text-xs',
@@ -66,12 +87,20 @@ function openMenu() {
   nextTick(() => {
     updatePosition()
     scrollActiveIntoView()
+    if (props.searchable) {
+      searchRef.value?.focus()
+    }
   })
 }
 
 function close() {
   open.value = false
   activeIndex.value = -1
+  clearTimeout(searchQueryTimer)
+  // A term left over from the previous open would filter the next one before
+  // the user typed anything.
+  query.value = ''
+  emit('search', '')
 }
 
 function choose(option) {
@@ -80,6 +109,27 @@ function choose(option) {
   }
 
   model.value = option.value
+  close()
+  nextTick(() => triggerRef.value?.focus())
+}
+
+/**
+ * Debounced so a keystroke does not start a request per letter, while Enter in
+ * the field (or the caller's own magnifier) can ask for the term immediately.
+ */
+function onSearchInput(value) {
+  query.value = value
+  clearTimeout(searchQueryTimer)
+  searchQueryTimer = setTimeout(() => emit('search', value.trim()), SEARCH_DEBOUNCE)
+}
+
+function searchNow() {
+  clearTimeout(searchQueryTimer)
+  emit('search', query.value.trim())
+}
+
+/** Escape inside the panel: same as Escape on the trigger. */
+function closeAndFocus() {
   close()
   nextTick(() => triggerRef.value?.focus())
 }
@@ -204,7 +254,10 @@ function onKeydown(event) {
       close()
       break
     default:
-      if (open.value && event.key.length === 1) {
+      // With a search field the keystrokes belong to it, not to a typeahead
+      // buffer — otherwise the first letter would jump the active row while the
+      // user is typing a term.
+      if (open.value && !props.searchable && event.key.length === 1) {
         typeahead(event.key)
       }
   }
@@ -219,7 +272,10 @@ function updatePosition() {
   const rect = trigger.getBoundingClientRect()
   const gap = 6
   const itemHeight = 32
-  const desiredHeight = Math.min(288, props.options.length * itemHeight + 8)
+  // The search field (with its padding) and the hint line are part of the panel,
+  // so a panel sized only from the row count would overflow off-screen.
+  const extra = (props.searchable ? 44 : 0) + (props.hint ? 24 : 0)
+  const desiredHeight = Math.min(288, props.options.length * itemHeight + 8 + extra)
   const spaceBelow = window.innerHeight - rect.bottom - gap - 8
   const spaceAbove = rect.top - gap - 8
   const placement = spaceBelow < desiredHeight && spaceAbove > spaceBelow ? 'top' : 'bottom'
@@ -238,7 +294,7 @@ function updatePosition() {
 function onPointerDown(event) {
   const target = event.target
 
-  if (triggerRef.value?.contains(target) || listRef.value?.contains(target)) {
+  if (triggerRef.value?.contains(target) || panelRef.value?.contains(target)) {
     return
   }
 
@@ -264,6 +320,7 @@ function checkOpenListeners(isOpen) {
 onBeforeUnmount(() => {
   checkOpenListeners(false)
   clearTimeout(searchTimer)
+  clearTimeout(searchQueryTimer)
 })
 </script>
 
@@ -308,54 +365,106 @@ onBeforeUnmount(() => {
     </button>
 
     <Teleport to="body">
-      <ul
+      <div
         v-if="open"
-        :id="listId"
-        ref="listRef"
-        role="listbox"
-        :aria-label="props.ariaLabel || undefined"
-        class="fixed z-[70] overflow-y-auto rounded-xl border border-line bg-surface p-1 shadow-xl shadow-slate-900/10 dark:shadow-black/40"
+        ref="panelRef"
         :style="{
           left: position.left + 'px',
           top: position.top + 'px',
           width: position.width + 'px',
-          maxHeight: position.maxHeight + 'px',
           transform: position.placement === 'top' ? 'translateY(-100%)' : 'none',
         }"
+        class="fixed z-[70] flex flex-col overflow-hidden rounded-xl border border-line bg-surface p-1 shadow-xl shadow-slate-900/10 dark:shadow-black/40"
       >
-        <li
-          v-for="(option, index) in props.options"
-          :id="`${listId}-option-${index}`"
-          :key="option.value"
-          role="option"
-          :aria-selected="String(option.value) === String(model)"
-          class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-xs transition"
-          :class="[
-            index === activeIndex
-              ? 'bg-indigo-50 text-indigo-700 dark:bg-white/10 dark:text-white'
-              : 'text-ink-soft',
-            option.disabled ? 'pointer-events-none opacity-40' : '',
-          ]"
-          @click="choose(option)"
-          @mouseenter="activeIndex = index"
-        >
-          <span class="truncate">{{ option.label }}</span>
+        <!-- The search field lives inside the panel: a second control next to the
+             trigger would look like a different form element, and a native
+             `<datalist>` draws an OS list that ignores the theme. -->
+        <div v-if="props.searchable" class="relative p-1 pb-1.5">
+          <input
+            ref="searchRef"
+            :value="query"
+            type="text"
+            role="searchbox"
+            :placeholder="props.searchPlaceholder"
+            aria-label="Поиск по значениям"
+            class="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 pr-7 text-xs text-ink outline-none transition
+              placeholder:text-ink-mute focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15"
+            @input="onSearchInput($event.target.value)"
+            @keydown.enter.prevent="searchNow"
+            @keydown.esc.prevent="closeAndFocus"
+            @keydown.stop
+          />
+          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-mute">
+            <AppSpinner v-if="props.searching" size="xs" />
+            <svg
+              v-else
+              class="h-3 w-3"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <circle cx="11" cy="11" r="7" />
+              <path stroke-linecap="round" d="M20 20l-3.5-3.5" />
+            </svg>
+          </span>
+        </div>
 
-          <svg
-            v-if="String(option.value) === String(model)"
-            class="h-3.5 w-3.5 shrink-0 text-indigo-600 dark:text-indigo-300"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.4"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <ul
+          :id="listId"
+          ref="listRef"
+          role="listbox"
+          :aria-label="props.ariaLabel || undefined"
+          class="overflow-y-auto"
+          :style="{ maxHeight: position.maxHeight - (props.searchable ? 44 : 0) - (props.hint ? 24 : 0) + 'px' }"
+        >
+          <li
+            v-for="(option, index) in props.options"
+            :id="`${listId}-option-${index}`"
+            :key="option.value"
+            role="option"
+            :aria-selected="String(option.value) === String(model)"
+            class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-xs transition"
+            :class="[
+              index === activeIndex
+                ? 'bg-indigo-50 text-indigo-700 dark:bg-white/10 dark:text-white'
+                : 'text-ink-soft',
+              option.disabled ? 'pointer-events-none opacity-40' : '',
+            ]"
+            @click="choose(option)"
+            @mouseenter="activeIndex = index"
           >
-            <path d="M5 12.5l4.5 4.5L19 7.5" />
-          </svg>
-        </li>
-      </ul>
+            <span class="truncate">{{ option.label }}</span>
+
+            <svg
+              v-if="String(option.value) === String(model)"
+              class="h-3.5 w-3.5 shrink-0 text-indigo-600 dark:text-indigo-300"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M5 12.5l4.5 4.5L19 7.5" />
+            </svg>
+          </li>
+
+          <!-- An empty search result is not "no data": the panel has to say which
+               one it is, or the operator reads a broken filter. -->
+          <li
+            v-if="props.options.length === 0"
+            class="px-2.5 py-2 text-[11px] text-ink-mute"
+          >
+            {{ props.searchable && query.trim() !== '' ? 'Ничего не найдено.' : 'Нет вариантов.' }}
+          </li>
+        </ul>
+
+        <p v-if="props.hint" class="px-2.5 pb-1 pt-1 text-[10px] leading-snug text-ink-mute">
+          {{ props.hint }}
+        </p>
+      </div>
     </Teleport>
   </div>
 </template>

@@ -57,6 +57,13 @@ const statusLabels = {
 
 const activeCount = computed(() => workflows.value.filter((workflow) => workflow.enabled).length)
 
+/**
+ * Rules the worker paused on its own. They are the ones worth surfacing: a manual
+ * pause is deliberate and needs no explanation, while an automatic one means a
+ * target has been failing and the operator was not looking.
+ */
+const autoPaused = computed(() => workflows.value.filter((workflow) => workflow.auto_paused))
+
 async function load({ silent = false } = {}) {
   if (!silent) {
     loading.value = true
@@ -147,6 +154,24 @@ async function removeWorkflow(workflow) {
   }
 }
 
+/**
+ * Copies a rule, disabled.
+ *
+ * The API creates the copy paused, so duplicating a live rule to tweak it cannot
+ * double every forward while the operator is still editing. The copy opens in the
+ * editor at once — a paused duplicate nobody can find is not useful.
+ */
+async function duplicateWorkflow(workflow) {
+  try {
+    const created = await api.duplicateWorkflow(workflow.id)
+    await load()
+    editorWorkflow.value = created.data
+    editorOpen.value = true
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
 function webhookUrl(workflow) {
   const endpoint = workflow.endpoint === '*' ? roomEndpoint.value : workflow.endpoint
   const prefix = slug.value ? `/${slug.value}` : ''
@@ -171,6 +196,37 @@ function conditionSummary(condition) {
   return `${condition.path} ${label} ${JSON.stringify(condition.value)}`
 }
 
+/**
+ * Renders the condition tree as flat chips.
+ *
+ * The stored shape is nested (`{mode, rules}`), and the card used to read a plain
+ * list — which is now an empty array, so every rule looked unconditional. A nested
+ * group is flattened with its joiner in parentheses instead of being rendered as a
+ * tree: the card is a summary, the editor is where the structure is edited.
+ *
+ * @returns {Array<{text: string, depth: number}>}
+ */
+function conditionChips(node, depth = 0) {
+  if (!node || !Array.isArray(node.rules)) {
+    return node && node.path ? [{ text: conditionSummary(node), depth }] : []
+  }
+
+  const chips = []
+  if (depth > 0 && node.rules.length > 0) {
+    chips.push({ text: node.mode === 'any' ? '(любое из' : '(все из', depth })
+  }
+
+  for (const rule of node.rules) {
+    chips.push(...conditionChips(rule, depth + (depth > 0 ? 1 : 0)))
+  }
+
+  if (depth > 0 && node.rules.length > 0) {
+    chips.push({ text: ')', depth })
+  }
+
+  return chips
+}
+
 function fieldsLabel(count) {
   const mod10 = count % 10
   const mod100 = count % 100
@@ -187,10 +243,14 @@ function fieldsLabel(count) {
 
 function actionSummary(action) {
   if (action.type === 'forward') {
-    return `Переслать ${action.method || 'POST'} → ${action.url}`
+    const signed = action.signed ? ' · подпись' : ''
+    return `Переслать ${action.method || 'POST'} → ${action.url}${signed}`
   }
   if (action.type === 'log') {
     return `Лог: ${action.message || 'совпадение'}`
+  }
+  if (action.type === 'delay') {
+    return `Пауза ${action.seconds} с`
   }
 
   return `Трансформация: ${fieldsLabel(Object.keys(action.mapping || {}).length)}`
@@ -273,6 +333,31 @@ onUnmounted(() => {
         {{ error }}
       </p>
 
+      <!-- A rule that stops on its own must say so. Without this banner the only
+           difference from a deliberate pause is a card further down the page. -->
+      <section
+        v-if="autoPaused.length"
+        class="flex flex-wrap items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3"
+      >
+        <span class="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-300">
+          <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <path d="M12 8v5" />
+            <path d="M12 16.5v.01" />
+            <circle cx="12" cy="12" r="9" />
+          </svg>
+        </span>
+        <div class="min-w-0 flex-1 text-xs text-amber-800 dark:text-amber-200">
+          <p class="font-semibold">
+            {{ autoPaused.length === 1 ? 'Сценарий выключен' : `Сценарии выключены (${autoPaused.length})` }}
+            автоматически после нескольких ошибок подряд
+          </p>
+          <p class="mt-1 text-[11px] text-amber-800/80 dark:text-amber-200/80">
+            {{ autoPaused.map((workflow) => workflow.name).join(', ') }} — проверьте адрес пересылки и включите
+            сценарий снова. Счётчик ошибок сбросится.
+          </p>
+        </div>
+      </section>
+
       <section class="relative">
         <Transition name="fade">
           <div
@@ -327,15 +412,38 @@ onUnmounted(() => {
           >
             <div class="flex items-start justify-between gap-3">
               <div class="min-w-0">
-                <div class="flex items-center gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                   <h2 class="truncate text-sm font-semibold text-ink">{{ workflow.name }}</h2>
                   <span
                     class="rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ring-1 ring-inset"
                     :class="workflow.enabled
                       ? 'bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300'
-                      : 'bg-ink/5 text-ink-mute ring-line'"
+                      : workflow.auto_paused
+                        ? 'bg-amber-500/10 text-amber-700 ring-amber-500/30 dark:text-amber-300'
+                        : 'bg-ink/5 text-ink-mute ring-line'"
                   >
-                    {{ workflow.enabled ? 'активен' : 'на паузе' }}
+                    {{ workflow.enabled ? 'активен' : workflow.auto_paused ? 'выключен' : 'на паузе' }}
+                  </span>
+                  <span
+                    v-if="workflow.priority > 0"
+                    class="rounded-full bg-indigo-500/10 px-2 py-0.5 font-mono text-[10px] font-medium text-indigo-700 ring-1 ring-inset ring-indigo-500/25 dark:text-indigo-300"
+                    title="Приоритет: больший выполняется первым"
+                  >
+                    P{{ workflow.priority }}
+                  </span>
+                  <span
+                    v-if="workflow.stop_processing"
+                    class="rounded-full bg-ink/5 px-2 py-0.5 text-[10px] font-medium text-ink-soft ring-1 ring-inset ring-line"
+                    title="После успеха остальные сценарии этого запроса пропускаются"
+                  >
+                    останавливает
+                  </span>
+                  <span
+                    v-if="!workflow.enabled && workflow.consecutive_failures > 0"
+                    class="font-mono text-[10px] text-rose-600 dark:text-rose-300"
+                    :title="`Ошибок подряд: ${workflow.consecutive_failures}`"
+                  >
+                    {{ workflow.consecutive_failures }} подряд
                   </span>
                 </div>
                 <p class="mt-1 text-[11px] text-ink-mute">Обновлён {{ timeAgo(workflow.updated_at) }}</p>
@@ -347,6 +455,15 @@ onUnmounted(() => {
                 @update:model-value="toggleWorkflow(workflow)"
               />
             </div>
+
+            <!-- The reason is stored by the worker, so it survives a reload and can
+                 be read by whoever opens the page next, not only in the toast. -->
+            <p
+              v-if="workflow.auto_paused && workflow.disabled_reason"
+              class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200"
+            >
+              {{ workflow.disabled_reason }}
+            </p>
 
             <div class="mt-4 rounded-xl border border-line bg-surface-2 px-3 py-2.5">
               <p class="text-[10px] uppercase tracking-wider text-ink-mute">Триггер</p>
@@ -367,13 +484,13 @@ onUnmounted(() => {
             <div class="mt-3 space-y-2">
               <div>
                 <p class="text-[10px] uppercase tracking-wider text-ink-mute">Условия</p>
-                <div v-if="(workflow.conditions ?? []).length" class="mt-1 flex flex-wrap gap-1">
+                <div v-if="conditionChips(workflow.conditions).length" class="mt-1 flex flex-wrap items-center gap-1">
                   <span
-                    v-for="(condition, index) in workflow.conditions"
+                    v-for="(chip, index) in conditionChips(workflow.conditions)"
                     :key="index"
                     class="rounded-md bg-ink/5 px-2 py-0.5 font-mono text-[10px] text-ink-soft"
                   >
-                    {{ conditionSummary(condition) }}
+                    {{ chip.text }}
                   </span>
                 </div>
                 <p v-else class="mt-1 text-[11px] text-ink-mute">Срабатывает на каждый запрос.</p>
@@ -406,6 +523,13 @@ onUnmounted(() => {
               </span>
 
               <div class="flex items-center gap-1">
+                <button
+                  type="button"
+                  class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
+                  @click="duplicateWorkflow(workflow)"
+                >
+                  Дублировать
+                </button>
                 <button
                   type="button"
                   class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
