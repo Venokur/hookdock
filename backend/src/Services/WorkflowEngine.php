@@ -85,19 +85,24 @@ final class WorkflowEngine
     }
 
     /**
-     * Puts a run back in the queue after a `delay` action.
+     * Puts a run back in the queue after a `delay` action or a breaker refusal.
      *
      * Deliberately separate from `reschedule()`: that one is retry backoff and
      * counts as an attempt, while a delay is normal operation and must not consume
      * `ROUTING_MAX_ATTEMPTS`. The attempt counter stays where it is, so the step log
      * keeps `action_index` semantics and the succeeded actions are still skipped.
+     *
+     * `$deferred` records that the reason was a refused target. It is what keeps a
+     * permanently dead address from producing an endless `pending` row: the caller
+     * counts those and gives up after `deferralLimit()`.
      */
-    private static function rescheduleIn(int $runId, int $seconds, string $message): void
+    private static function rescheduleIn(int $runId, int $seconds, string $message, bool $deferred = false): void
     {
         $stmt = Database::pdo()->prepare(
             "UPDATE workflow_runs
                 SET status = 'pending',
                     available_at = now() + make_interval(secs => :delay),
+                    deferrals = deferrals + :deferred,
                     locked_at = NULL,
                     locked_by = NULL,
                     message = :message,
@@ -106,6 +111,7 @@ final class WorkflowEngine
         );
         $stmt->execute([
             'delay' => max(1, $seconds),
+            'deferred' => $deferred ? 1 : 0,
             'message' => mb_substr($message, 0, 2000),
             'id' => $runId,
         ]);
@@ -186,7 +192,7 @@ final class WorkflowEngine
                      LIMIT :limit
                      FOR UPDATE SKIP LOCKED
               )
-              RETURNING id, workflow_id, request_id, attempts"
+              RETURNING id, workflow_id, request_id, attempts, deferrals"
         );
         $stmt->bindValue(':worker', $workerId);
         $stmt->bindValue(':limit', max(1, $limit), PDO::PARAM_INT);
@@ -232,7 +238,24 @@ final class WorkflowEngine
         }
 
         $done = self::succeededSteps($runId);
-        [$status, $message, $retry, $delay] = self::runActions($actions, $context, $runId, $attempt, $done);
+        [$status, $message, $retry, $delay, $defer, $breakerOutcomes] = self::runActions($actions, $context, $runId, $attempt, $done);
+
+        // The breaker learns an outcome only once the run has no retry left. While
+        // one is still coming the address has not been proven broken — counting
+        // every attempt would open the breaker during a five-second blip. A
+        // terminal verdict matters either way: a 4xx proves the target rejects us,
+        // and a 5xx or timeout that survives the whole retry budget proves it is
+        // down, which is exactly what the breaker exists to remember.
+        //
+        // Recorded before the branches below, because a `delay` or a deferral
+        // returns early: a forward that already succeeded in this pass must still
+        // close the breaker.
+        $willRetry = $retry && $attempt < self::maxAttempts();
+        if (!$willRetry) {
+            foreach ($breakerOutcomes as [$address, $ok, $responseStatus, $error]) {
+                CircuitBreaker::record((string) $address, (bool) $ok, $responseStatus, $error);
+            }
+        }
 
         // A delay action pauses the run itself: the remaining actions belong to the
         // other side of the pause, so the row goes back to the queue with a due
@@ -244,7 +267,33 @@ final class WorkflowEngine
             return 'pending';
         }
 
-        if ($retry && $attempt < self::maxAttempts()) {
+        // An address the breaker refused is not this run's failure. The run goes
+        // back in the queue for the moment one probe is allowed, without burning an
+        // attempt — otherwise a cooldown longer than the retry budget would turn
+        // every deferred forward into a failed run, which is exactly the outcome
+        // the breaker is there to avoid.
+        //
+        // A run that is not an attempt also has no natural end, so the deferral
+        // count is the end: after `deferralLimit()` cooldowns the address has had
+        // every chance the breaker offers, and the run is finished as `skipped`
+        // instead of sitting in the queue forever. `skipped` is honest — the target
+        // was never called — and it keeps the workflow's failure streak untouched.
+        if ($defer > 0 && !$failed) {
+            $deferrals = (int) ($run['deferrals'] ?? 0);
+
+            if ($deferrals >= self::deferralLimit()) {
+                $message .= ' · попыток проверки: ' . ($deferrals + 1);
+                self::finish($runId, 'skipped', $message);
+
+                return 'skipped';
+            }
+
+            self::rescheduleIn($runId, $defer, $message, true);
+
+            return 'pending';
+        }
+
+        if ($willRetry) {
             self::reschedule($runId, $attempt, $message);
 
             return 'pending';
@@ -401,6 +450,7 @@ final class WorkflowEngine
 
                 $timeout = self::actionTimeout($action);
                 $guard = $url === '' ? ['allowed' => false, 'reason' => 'пустой URL'] : UrlGuard::check($url);
+                $breaker = $url === '' ? ['allowed' => true, 'state' => 'closed', 'retry_in' => 0] : CircuitBreaker::peek($url);
 
                 $steps[] = $step + [
                     'url' => $url,
@@ -410,6 +460,11 @@ final class WorkflowEngine
                     'timeout' => $timeout,
                     'allowed' => (bool) ($guard['allowed'] ?? false),
                     'reason' => $guard['reason'] ?? null,
+                    // A preview has to say that the worker would skip this target
+                    // right now: describing a request that will not be attempted is
+                    // worse than describing nothing.
+                    'breaker' => $breaker['state'],
+                    'breaker_retry_in' => (int) $breaker['retry_in'],
                 ];
                 continue;
             }
@@ -445,6 +500,19 @@ final class WorkflowEngine
     public static function maxAttempts(): int
     {
         return max(1, Config::int('ROUTING_MAX_ATTEMPTS', 3));
+    }
+
+    /**
+     * How many times one run may be deferred by the breaker before it gives up.
+     *
+     * Three cooldowns is enough to tell "the target is still down" from "the target
+     * blinked", and it bounds the queue: without a limit, a dead address with a
+     * short cooldown would keep one `pending` row alive for as long as the address
+     * stayed dead.
+     */
+    public static function deferralLimit(): int
+    {
+        return max(1, Config::int('FORWARD_BREAKER_DEFERRALS', 3));
     }
 
     /**
@@ -700,6 +768,13 @@ final class WorkflowEngine
         $failed = false;
         $retry = false;
         $delay = 0;
+        // Seconds to wait before this run should try a target the breaker refused.
+        // Separate from `$delay`: a `delay` action pauses the run on purpose, while
+        // a deferred forward means "come back when the address may be up".
+        $defer = 0;
+        // [url, ok, status, error] per attempted forward. Applied to the breaker
+        // only for the terminal verdict, so a retry is not counted as an incident.
+        $breakerOutcomes = [];
 
         foreach ($actions as $index => $action) {
             $type = (string) ($action['type'] ?? '');
@@ -788,6 +863,26 @@ final class WorkflowEngine
                         continue;
                     }
 
+                    // The address itself may already be known to be down. Asking the
+                    // breaker before sending is what turns "every delivery pays for
+                    // the same timeout" into "the first few do, the rest say why they
+                    // did not". A refused attempt is `skipped`: the target is not
+                    // this run's fault, so it must not count toward the workflow's
+                    // failure streak (that streak pauses the rule, and a paused rule
+                    // cannot recover with the endpoint).
+                    $breaker = CircuitBreaker::tryAcquire($url);
+                    if (!$breaker['allowed']) {
+                        $defer = max($defer, (int) $breaker['retry_in']);
+                        $message = sprintf(
+                            'пересылка отложена: адрес %s не отвечает (повтор через %d с)',
+                            CircuitBreaker::address($url),
+                            $breaker['retry_in'],
+                        );
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'skipped', $message, null, null, $started);
+                        continue;
+                    }
+
                     $payload = $action['payload'] ?? 'body';
                     if (is_string($payload)) {
                         $payload = match ($payload) {
@@ -850,6 +945,9 @@ final class WorkflowEngine
                     if (!$result['ok']) {
                         $failed = true;
                         $retry = $retry || HttpClient::retryable($result);
+                        // The breaker only hears about a terminal verdict, which is
+                        // decided after the loop. Telling it here would open it on
+                        // the first of three retries of one incident.
                         $message = sprintf(
                             'пересылка %s %s → %s%s',
                             $method,
@@ -859,12 +957,14 @@ final class WorkflowEngine
                         );
                         $messages[] = $message;
                         self::recordStep($runId, $attempt, $index, $type, 'failed', $message, $result['status'], $result['body'], $started);
+                        $breakerOutcomes[] = [$url, false, $result['status'], $result['error']];
                         continue;
                     }
 
                     $message = sprintf('пересылка %s %s → %d', $method, $url, $result['status']);
                     $messages[] = $message;
                     self::recordStep($runId, $attempt, $index, $type, 'success', $message, $result['status'], $result['body'], $started);
+                    $breakerOutcomes[] = [$url, true, $result['status'], null];
                     continue;
                 }
 
@@ -880,7 +980,7 @@ final class WorkflowEngine
             }
         }
 
-        return [$failed ? 'failed' : 'success', implode('; ', $messages) ?: 'Готово', $failed && $retry, $delay];
+        return [$failed ? 'failed' : 'success', implode('; ', $messages) ?: 'Готово', $failed && $retry, $delay, $defer, $breakerOutcomes];
     }
 
     /**

@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Controllers\AuthController;
+use App\Controllers\BreakersController;
 use App\Controllers\HealthController;
 use App\Controllers\RequestsController;
 use App\Controllers\RoomsController;
@@ -18,6 +19,7 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 $router = new Router();
 
 $auth = new AuthController();
+$breakers = new BreakersController();
 $health = new HealthController();
 $requests = new RequestsController();
 $rooms = new RoomsController();
@@ -72,6 +74,16 @@ $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflo
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
 $router->add('POST', '/api/workflows/{id}/duplicate', fn (Request $r, array $p) => $workflows->duplicate($r, $p));
+// A room's rules as a file, and the way back. Both live under /api/workflows so
+// the collection and the spec keep one subject; the room is a path parameter
+// because an export of "everything" is not the use case.
+$router->add('GET', '/api/rooms/{id}/workflows/export', fn (Request $r, array $p) => $workflows->exportRoom($r, $p));
+$router->add('POST', '/api/rooms/{id}/workflows/import', fn (Request $r, array $p) => $workflows->importRoom($r, $p));
+
+// Forward targets the breaker is skipping. Read is open to a read token; clearing
+// one is a mutating action, so it demands a full token.
+$router->add('GET', '/api/breakers', fn (Request $r) => $breakers->index($r));
+$router->add('POST', '/api/breakers/reset', fn (Request $r) => $breakers->reset($r));
 
 $request = Request::capture();
 

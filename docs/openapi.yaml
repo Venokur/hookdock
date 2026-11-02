@@ -36,6 +36,10 @@ tags:
   - name: Requests
   - name: Runs
   - name: Workflows
+  - name: Delivery
+    description: |
+      Forward targets the circuit breaker is skipping, and moving a room's rule
+      set between installations.
   - name: Ingest
 
 security:
@@ -960,6 +964,13 @@ paths:
                               items:
                                 type: object
                                 additionalProperties: true
+                                description: |
+                                  One described action. A `forward` step also
+                                  carries `allowed`/`reason` from `UrlGuard` and
+                                  `breaker`/`breaker_retry_in` from the
+                                  per-address circuit breaker: describing a
+                                  request the worker would skip right now would
+                                  be worse than describing nothing.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1186,6 +1197,16 @@ paths:
         explicit `clear_signature: true`. The old secret is carried over only when
         the action sits at the same index **and** has the same URL, so reordering
         forwards cannot move one target's secret onto another.
+
+        **Stale saves are refused.** `actions_version` is the version of the
+        action list the editor loaded. If it differs from the stored one, the save
+        is rejected with `409` and the current version in
+        `error.actions_version` — the other tab's change is not discarded
+        silently. A client that omits the field (curl, an older script) keeps
+        working: requiring it would break every existing integration for a
+        protection it never asked for. The counter only grows when the actions
+        actually change, so renaming a rule does not invalidate another tab's
+        draft.
       requestBody:
         required: true
         content:
@@ -1208,6 +1229,8 @@ paths:
           $ref: '#/components/responses/ReadOnly'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/Invalid'
     delete:
@@ -1288,6 +1311,169 @@ paths:
           $ref: '#/components/responses/ReadOnly'
         '404':
           $ref: '#/components/responses/NotFound'
+
+  /api/breakers:
+    get:
+      tags: [Delivery]
+      summary: Forward targets the breaker is skipping
+      description: |
+        State per **address** (`scheme://host:port`), not per rule: two scenarios
+        forwarding to the same endpoint share one verdict, and fixing the endpoint
+        fixes both. Installation-wide, not room-scoped, because the target is.
+
+        `state` is derived from `next_probe_at`, so nothing has to run in the
+        background for an address to recover: the first delivery after the
+        cooldown is the probe, and its outcome either closes the breaker or
+        re-opens it. `retry_in` is the number of seconds left before that probe.
+      responses:
+        '200':
+          description: Breaker rows, broken ones first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ForwardTarget'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/breakers/reset:
+    post:
+      tags: [Delivery]
+      summary: Try an address again now
+      description: |
+        The operator says "I fixed it". The row is **deleted**, not flipped to
+        `closed`: a stale failure count would re-open the breaker on the very next
+        error and the reset would look like it did nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address:
+                  type: string
+                  example: https://down.example.com:443
+      responses:
+        '200':
+          description: The address is clear.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  reset:
+                    type: boolean
+                    description: '`false` when the address had no breaker row.'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/rooms/{id}/workflows/export:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [Workflows]
+      summary: A room's rules as a file
+      description: |
+        A portable document of the room's scenarios — conditions, actions,
+        priorities and flags — so a router built in staging does not have to be
+        rebuilt in production by hand.
+
+        Signature secrets are **not** exported, and not because of an oversight:
+        an HMAC cannot be verified against a hash, so the value is stored as-is
+        and never leaves the API. A forward with a secret comes back as
+        `signed: true`; the import counts those and reports them, instead of
+        producing a rule that looks right and sends unsigned requests.
+
+        The `room` block is informational. The import ignores it: applying
+        delivery settings while importing rules would change how the receiving
+        room accepts traffic without saying so.
+      responses:
+        '200':
+          description: The document, as a download.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomDocument'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/rooms/{id}/workflows/import:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    post:
+      tags: [Workflows]
+      summary: Create rules from an exported document
+      description: |
+        All or nothing: a half-imported rule set is worse than a refused one,
+        because the operator cannot tell which half is missing. Every rule goes
+        through the same validation as the editor, so a file cannot introduce a
+        condition tree or an action the UI could not have made.
+
+        `room_id` comes from the URL, never from the document — a staging export
+        cannot write into production by accident. Nothing is deleted or
+        overwritten: a colliding name gets a numeric suffix, because importing the
+        same file twice is a normal way to check that nothing broke.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomDocument'
+      responses:
+        '201':
+          description: Rules created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      created:
+                        type: integer
+                      workflows:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: integer
+                            name:
+                              type: string
+                      secrets_not_imported:
+                        type: integer
+                        description: |
+                          Forwards whose document said `signed: true`. Not an
+                          error — a secret cannot travel in a file — but the
+                          operator has to know that those rules send unsigned
+                          requests until the secret is entered again.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
 
   /hook/{room}/{endpoint}:
     post:
@@ -1540,6 +1726,27 @@ components:
           example:
             error:
               message: Условия вложены слишком глубоко (максимум 5)
+    Conflict:
+      description: |
+        The rule was edited elsewhere since this editor loaded it — the stored
+        `actions_version` is newer than the one the client sent.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Error'
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      actions_version:
+                        type: integer
+                        description: The version currently stored; re-read the rule.
+          example:
+            error:
+              message: 'Сценарий изменён в другой вкладке (версия действий 4). Перезагрузите его, чтобы не потерять чужие правки'
+              actions_version: 4
     TooManyRequests:
       description: Rate limited.
       headers:
@@ -1944,6 +2151,112 @@ components:
           type: string
           description: '`log` only. Supports `{{ body.field }}`.'
 
+    ForwardTarget:
+      type: object
+      description: |
+        Circuit breaker state for one forward address. A target that keeps failing
+        is skipped rather than retried by every delivery: skipping is recorded as
+        `skipped`, which deliberately does not count toward the workflow's failure
+        streak, so one dead endpoint cannot pause the rule that would recover with
+        it.
+      properties:
+        address:
+          type: string
+          example: https://down.example.com:443
+        state:
+          type: string
+          enum: [closed, open, half_open]
+          description: |
+            `open` refuses, `half_open` allows exactly one probe, `closed` is
+            normal operation.
+        consecutive_failures:
+          type: integer
+        retry_in:
+          type: integer
+          description: Seconds until one probe is allowed. `0` when closed.
+        opened_at:
+          type: string
+          format: date-time
+          nullable: true
+        next_probe_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_status:
+          type: integer
+          nullable: true
+          description: HTTP status of the last attempt, `null` for a transport error.
+        last_error:
+          type: string
+          nullable: true
+        last_failure_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+        threshold:
+          type: integer
+          description: Terminal failures in a row before the address is refused.
+        cooldown_seconds:
+          type: integer
+          description: How long an open address is skipped.
+
+    RoomDocument:
+      type: object
+      required: [workflows]
+      properties:
+        format:
+          type: string
+          example: hookdock.room
+        version:
+          type: integer
+          example: 1
+        exported_at:
+          type: string
+          format: date-time
+        room:
+          type: object
+          description: Informational; the import ignores it.
+          properties:
+            name:
+              type: string
+            slug:
+              type: string
+            endpoint:
+              type: string
+            dedup_header:
+              type: string
+              nullable: true
+            require_timestamp:
+              type: boolean
+            has_secret:
+              type: boolean
+        workflows:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [name, actions]
+            properties:
+              name:
+                type: string
+              endpoint:
+                type: string
+              enabled:
+                type: boolean
+              priority:
+                type: integer
+              stop_processing:
+                type: boolean
+              conditions:
+                $ref: '#/components/schemas/ConditionTree'
+              actions:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Action'
+
     WorkflowInput:
       type: object
       required: [name, actions]
@@ -1976,6 +2289,12 @@ components:
             A **successful** run marks the request's other `pending` runs
             `skipped`, with a message naming this rule. `failed` and `skipped`
             never stop anything.
+        actions_version:
+          type: integer
+          description: |
+            Optimistic lock on the action list. Send the value the rule was
+            loaded with; a mismatch answers `409`. Omitted means "do not check",
+            which is what a script that never read the rule needs.
         conditions:
           $ref: '#/components/schemas/ConditionTree'
         actions:
@@ -1997,6 +2316,11 @@ components:
             condition_count:
               type: integer
               description: Leaf conditions, not groups.
+            actions_version:
+              type: integer
+              description: |
+                Bumped only when the action list actually changes. The editor
+                sends it back on save to detect a concurrent edit.
             consecutive_failures:
               type: integer
               description: Terminal failures in a row; reset by a success or by enabling the rule.

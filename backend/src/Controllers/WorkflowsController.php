@@ -12,6 +12,7 @@ use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
 use App\Support\JsonColumns;
+use PDO;
 
 final class WorkflowsController
 {
@@ -27,6 +28,9 @@ final class WorkflowsController
 
     /** Leaves in the whole tree, not per level. */
     private const MAX_CONDITIONS = 40;
+
+    /** One import is a room's rule set, not a bulk tool. */
+    private const MAX_IMPORT = 50;
 
     public function index(Request $request): void
     {
@@ -87,13 +91,14 @@ final class WorkflowsController
 
         $id = (int) ($params['id'] ?? 0);
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, priority, stop_processing)
+            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
              SELECT room_id,
                     left(name, 140) || \' (копия)\',
                     endpoint,
                     false,
                     conditions,
                     actions,
+                    1,
                     priority,
                     stop_processing
                FROM workflows
@@ -121,11 +126,11 @@ final class WorkflowsController
     public function store(Request $request): void
     {
         Auth::requireUser($request, true);
-        $workflow = $this->validated($request);
+        $workflow = $this->validated($request->json() ?? []);
 
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, priority, stop_processing)
-             VALUES (:room_id, :name, :endpoint, :enabled, :conditions, :actions, :priority, :stop_processing)
+            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
+             VALUES (:room_id, :name, :endpoint, :enabled, :conditions, :actions, :actions_version, :priority, :stop_processing)
              RETURNING *'
         );
         $stmt->execute([
@@ -135,6 +140,7 @@ final class WorkflowsController
             'enabled' => $workflow['enabled'] ? 'true' : 'false',
             'conditions' => $this->encode($workflow['conditions']),
             'actions' => $this->encode($workflow['actions']),
+            'actions_version' => $workflow['actions_version'],
             'priority' => $workflow['priority'],
             'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
         ]);
@@ -159,7 +165,7 @@ final class WorkflowsController
             Response::error('Сценарий не найден', 404);
         }
 
-        $workflow = $this->validated($request, $existing);
+        $workflow = $this->validated($request->json() ?? [], $existing);
 
         // Moving a workflow between rooms would silently change which webhooks it
         // reacts to, so it needs its own explicit action rather than a side effect
@@ -180,6 +186,7 @@ final class WorkflowsController
             'UPDATE workflows
              SET name = :name, endpoint = :endpoint, enabled = :enabled,
                  conditions = :conditions, actions = :actions,
+                 actions_version = :actions_version,
                  priority = :priority, stop_processing = :stop_processing,
                  updated_at = now()' . $reset . '
              WHERE id = :id
@@ -192,6 +199,7 @@ final class WorkflowsController
             'enabled' => $workflow['enabled'] ? 'true' : 'false',
             'conditions' => $this->encode($workflow['conditions']),
             'actions' => $this->encode($workflow['actions']),
+            'actions_version' => $workflow['actions_version'],
             'priority' => $workflow['priority'],
             'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
         ]);
@@ -263,6 +271,238 @@ final class WorkflowsController
         }
 
         Response::json(['ok' => true, 'deleted' => $deleted !== false]);
+    }
+
+    /**
+     * A room's scenarios as a portable document.
+     *
+     * Rules are the part of a room that is worth reusing: an operator who built a
+     * Stripe router in staging should not rebuild it in production by hand, and a
+     * configuration in a file is also the only way to review a change before it
+     * goes live.
+     *
+     * Secrets are the exception. `rules[].actions[].secret` is stored as-is (an
+     * HMAC cannot be verified against a hash) and never leaves the API, so the
+     * export carries `signed: true` instead and the import reports how many
+     * forwards it could not re-sign. An export that quietly dropped the signatures
+     * would be worse: the imported rule would look correct and send unsigned
+     * requests.
+     */
+    public function exportRoom(Request $request, array $params): void
+    {
+        Auth::requireUser($request);
+
+        $room = $this->requireRoom((int) ($params['id'] ?? 0));
+
+        $stmt = Database::pdo()->prepare(
+            'SELECT name, endpoint, enabled, conditions, actions, priority, stop_processing
+               FROM workflows
+              WHERE room_id = :room_id
+              ORDER BY priority DESC, id'
+        );
+        $stmt->execute(['room_id' => $room['id']]);
+
+        $rules = [];
+        foreach (JsonColumns::decodeMany($stmt->fetchAll(), ['conditions', 'actions']) as $row) {
+            $rules[] = [
+                'name' => (string) $row['name'],
+                'endpoint' => (string) $row['endpoint'],
+                'enabled' => self::isTrue($row['enabled'] ?? false),
+                'priority' => (int) $row['priority'],
+                'stop_processing' => self::isTrue($row['stop_processing'] ?? false),
+                'conditions' => WorkflowEngine::normalizeTree($row['conditions'] ?? []),
+                'actions' => $this->redactActions($row['actions'] ?? []),
+            ];
+        }
+
+        $document = [
+            'format' => 'hookdock.room',
+            'version' => 1,
+            'exported_at' => gmdate('c'),
+            // The room block is informational: `import` ignores it unless asked,
+            // because applying delivery settings while importing rules would change
+            // how the receiving room accepts traffic without saying so.
+            'room' => [
+                'name' => (string) $room['name'],
+                'slug' => (string) $room['slug'],
+                'endpoint' => (string) $room['endpoint'],
+                'dedup_header' => $room['dedup_header'],
+                'require_timestamp' => self::isTrue($room['require_timestamp'] ?? false),
+                'has_secret' => self::isTrue($room['has_secret'] ?? false),
+            ],
+            'workflows' => $rules,
+        ];
+
+        $name = 'hookdock-' . preg_replace('/[^a-z0-9-]+/i', '-', (string) $room['slug']) . '.json';
+
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $name . '"');
+        header('Cache-Control: no-store');
+        echo json_encode($document, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+
+        exit;
+    }
+
+    /**
+     * Creates the rules of an exported document in this room.
+     *
+     * All or nothing on purpose: a half-imported rule set is worse than a refused
+     * one, because the operator cannot tell which half is missing. Every rule goes
+     * through the same `validated()` path as the editor, so an imported document
+     * cannot introduce a condition tree or an action the UI could not have made.
+     *
+     * A name that already exists gets a suffix instead of an error: importing the
+     * same file twice is a normal way to check that nothing broke, and the second
+     * import should not look like a failure. Nothing is deleted or overwritten —
+     * a "replace" mode would be a data-loss button, not an import.
+     */
+    public function importRoom(Request $request, array $params): void
+    {
+        Auth::requireUser($request, true);
+
+        $room = $this->requireRoom((int) ($params['id'] ?? 0));
+        $payload = $request->json() ?? [];
+
+        $incoming = $payload['workflows'] ?? null;
+        // Accept the document as-is and a bare `{"workflows": [...]}`: pasting only
+        // the rules is what an operator does when they trimmed the file.
+        if (!is_array($incoming)) {
+            Response::error('Ожидается документ с полем workflows', 422);
+        }
+        if (count($incoming) > self::MAX_IMPORT) {
+            Response::error('За один импорт можно создать не более ' . self::MAX_IMPORT . ' сценариев', 422);
+        }
+
+        $names = [];
+        $stmt = Database::pdo()->prepare('SELECT name FROM workflows WHERE room_id = :room_id');
+        $stmt->execute(['room_id' => $room['id']]);
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $existing) {
+            $names[mb_strtolower((string) $existing)] = true;
+        }
+
+        $pdo = Database::pdo();
+        $pdo->beginTransaction();
+
+        $created = [];
+        $unsigned = 0;
+
+        try {
+            foreach (array_values($incoming) as $rule) {
+                if (!is_array($rule)) {
+                    Response::error('Каждый сценарий должен быть объектом', 422);
+                }
+
+                // `room_id` is taken from the URL, never from the document: an
+                // imported file must not be able to write into another room.
+                $rule['room_id'] = $room['id'];
+                $rule['name'] = $this->uniqueName((string) ($rule['name'] ?? ''), $names);
+
+                $workflow = $this->validated($rule);
+
+                // A signature is a secret, and a secret is not in the file. The
+                // export marks a signed forward with `signed: true` and no value, so
+                // the import can only count them — that count is the operator's only
+                // warning that the imported rule will send unsigned requests.
+                //
+                // Read from the document, not from `$workflow`: normalization drops
+                // `signed` (it is a read-only view of a stored secret), so counting
+                // after it would always answer zero.
+                foreach (is_array($rule['actions'] ?? null) ? $rule['actions'] : [] as $documentAction) {
+                    if (is_array($documentAction) && self::isTrue($documentAction['signed'] ?? false)) {
+                        $unsigned++;
+                    }
+                }
+
+                $insert = $pdo->prepare(
+                    'INSERT INTO workflows
+                        (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
+                     VALUES
+                        (:room_id, :name, :endpoint, :enabled, :conditions, :actions, 1, :priority, :stop_processing)
+                     RETURNING id, name'
+                );
+                $insert->execute([
+                    'room_id' => $workflow['room_id'],
+                    'name' => $workflow['name'],
+                    'endpoint' => $workflow['endpoint'],
+                    'enabled' => $workflow['enabled'] ? 'true' : 'false',
+                    'conditions' => $this->encode($workflow['conditions']),
+                    'actions' => $this->encode($workflow['actions']),
+                    'priority' => $workflow['priority'],
+                    'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
+                ]);
+
+                $row = $insert->fetch();
+                $created[] = ['id' => (int) $row['id'], 'name' => (string) $row['name']];
+                $names[mb_strtolower((string) $row['name'])] = true;
+            }
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $e;
+        }
+
+        Realtime::publish('workflow.changed', [
+            'id' => 0,
+            'room_id' => $room['id'],
+            'action' => 'imported',
+        ]);
+
+        Response::json([
+            'data' => [
+                'created' => count($created),
+                'workflows' => $created,
+                // Not an error: the file cannot contain a secret, and pretending
+                // otherwise would make the import look complete when it is not.
+                'secrets_not_imported' => $unsigned,
+            ],
+        ], 201);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function requireRoom(int $id): array
+    {
+        $room = RoomResolver::findById($id);
+        if ($room === null) {
+            Response::error('Комната не найдена', 404);
+        }
+
+        return $room;
+    }
+
+    /**
+     * A name that does not collide within the room, so a repeated import cannot
+     * fail on something the operator cannot see in the file.
+     *
+     * @param array<string, true> $taken lowercase names already in the room
+     */
+    private function uniqueName(string $name, array $taken): string
+    {
+        $name = trim($name);
+        if ($name === '') {
+            $name = 'Импортированный сценарий';
+        }
+
+        // The column is VARCHAR(160); the suffix has to fit inside it.
+        $name = mb_substr($name, 0, 150);
+
+        if (!isset($taken[mb_strtolower($name)])) {
+            return $name;
+        }
+
+        for ($n = 2; $n < 1000; $n++) {
+            $candidate = $name . ' (' . $n . ')';
+            if (!isset($taken[mb_strtolower($candidate)])) {
+                return $candidate;
+            }
+        }
+
+        return mb_substr($name, 0, 140) . ' (' . bin2hex(random_bytes(3)) . ')';
     }
 
     /**
@@ -346,11 +586,19 @@ final class WorkflowsController
             return null;
         }
 
-        $stmt = Database::pdo()->prepare('SELECT id, room_id, actions FROM workflows WHERE id = :id');
+        // `*` rather than a short list: the version check and the "keep the stored
+        // signature secret" rule both need the stored row, and a column added later
+        // must not be forgotten here — a missing tag is easy to miss, a missing
+        // field in this query is not.
+        $stmt = Database::pdo()->prepare('SELECT * FROM workflows WHERE id = :id');
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
 
-        return $row === false ? null : $row;
+        if ($row === false) {
+            return null;
+        }
+
+        return JsonColumns::decode($row, ['conditions', 'actions']);
     }
 
     /**
@@ -477,12 +725,10 @@ final class WorkflowsController
 
     /**
      * @param array<string, mixed>|null $existing the stored row when editing
-     * @return array{room_id: int, name: string, endpoint: string, enabled: bool, conditions: array<string, mixed>, actions: list<array<string, mixed>>, priority: int, stop_processing: bool}
+     * @return array{room_id: int, name: string, endpoint: string, enabled: bool, conditions: array<string, mixed>, actions: list<array<string, mixed>>, actions_version: int, priority: int, stop_processing: bool}
      */
-    private function validated(Request $request, ?array $existing = null): array
+    private function validated(array $payload, ?array $existing = null): array
     {
-        $payload = $request->json() ?? [];
-
         $roomId = $this->requireRoomId($payload);
 
         $name = trim((string) ($payload['name'] ?? ''));
@@ -515,8 +761,28 @@ final class WorkflowsController
             Response::error('Действия должны быть массивом', 422);
         }
 
+        // Optimistic locking on the action list only.
+        //
+        // Two tabs editing one rule used to end with the last save silently
+        // replacing the other's action list — including a forward that was just
+        // added. The editor sends the `actions_version` it loaded; any other version
+        // is refused with `409` and the version currently stored, so the editor can
+        // show "reload" instead of overwriting. A client that sends no version
+        // (curl, older scripts) keeps working: requiring the field would break every
+        // existing integration for a protection it never asked for.
+        //
+        // Only the actions are guarded: renaming a rule or changing its priority in
+        // one tab must not invalidate a condition edit in another.
+        $storedVersion = $existing === null ? null : (int) ($existing['actions_version'] ?? 1);
+        $sentVersion = null;
+        if (array_key_exists('actions_version', $payload) && $payload['actions_version'] !== null && $payload['actions_version'] !== '') {
+            $sentVersion = (int) $payload['actions_version'];
+        }
+
         $previous = [];
         if ($existing !== null) {
+            // `find()` decodes the stored row, but an older caller may still hand in
+            // a raw string: decoding is idempotent, so both shapes work.
             $decodedExisting = $existing['actions'] ?? [];
             if (is_string($decodedExisting)) {
                 $decodedExisting = json_decode($decodedExisting, true);
@@ -526,6 +792,28 @@ final class WorkflowsController
 
         $normalizedActions = $this->validActions($actions, $previous);
 
+        if ($storedVersion !== null && $sentVersion !== null && $sentVersion !== $storedVersion) {
+            Response::error(
+                'Сценарий изменён в другой вкладке (версия действий ' . $storedVersion . '). '
+                . 'Перезагрузите его, чтобы не потерять чужие правки',
+                409,
+                ['actions_version' => $storedVersion],
+            );
+        }
+
+        // A real change bumps the version; a save that leaves the action list as it
+        // was must not, or merely opening the editor and pressing "save" would
+        // reject the other tab's pending edit for no reason.
+        //
+        // Compared by canonical JSON, not by `!==`: `jsonb` does not preserve object
+        // key order, so a decoded stored action and a freshly normalized one can be
+        // equal data with different key order — and `!==` would report a change on
+        // every save.
+        $version = $storedVersion === null ? 1 : $storedVersion;
+        if ($existing !== null && $this->fingerprint($normalizedActions) !== $this->fingerprint($previous)) {
+            $version = $storedVersion + 1;
+        }
+
         return [
             'room_id' => $roomId,
             'name' => $name,
@@ -533,6 +821,7 @@ final class WorkflowsController
             'enabled' => (bool) ($payload['enabled'] ?? true),
             'conditions' => $conditions,
             'actions' => $normalizedActions,
+            'actions_version' => $version,
             'priority' => $priority,
             'stop_processing' => (bool) ($payload['stop_processing'] ?? false),
         ];
@@ -690,6 +979,29 @@ final class WorkflowsController
      */
     private function encode(array $value): string
     {
+        return (string) json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * Order-independent representation of a decoded `jsonb` value.
+     *
+     * `jsonb` normalizes key order, so two saves of the same action list can decode
+     * to arrays that compare unequal with `!==`. Sorting keys recursively gives a
+     * string that is equal exactly when the data is.
+     *
+     * @param mixed $value
+     */
+    private function fingerprint(mixed $value): string
+    {
+        if (is_array($value)) {
+            if (!array_is_list($value)) {
+                ksort($value);
+            }
+            foreach ($value as $key => $item) {
+                $value[$key] = $this->fingerprint($item);
+            }
+        }
+
         return (string) json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 }

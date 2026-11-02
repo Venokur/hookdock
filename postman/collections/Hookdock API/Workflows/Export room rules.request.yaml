@@ -1,0 +1,38 @@
+$kind: http-request
+name: Export room rules
+method: GET
+url: '{{base_url}}/api/rooms/{{room_id}}/workflows/export'
+order: 5000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The document is what "move this router to another installation" means:
+      // conditions, actions, priorities and flags. Saving the answer for the import
+      // request is deliberate — the import has to accept exactly what the export
+      // produced, and a hand-written fixture would not prove that.
+      pm.test('an export describes the room without secrets', function () {
+        pm.response.to.have.status(200);
+        const doc = pm.response.json();
+        pm.expect(doc.format).to.eql('hookdock.room');
+        pm.expect(doc.version).to.eql(1);
+        pm.expect(doc.workflows).to.be.an('array').that.is.not.empty;
+        pm.expect(doc.room.slug).to.be.a('string');
+        pm.expect(doc.room).to.not.have.property('secret');
+      });
+
+      const doc = pm.response.json();
+      const signed = doc.workflows
+        .flatMap((rule) => rule.actions || [])
+        .filter((action) => action.signed === true);
+
+      // An HMAC cannot be verified against a hash, so the value is stored as-is and
+      // never leaves the API. The export has to say "this one is signed" instead of
+      // dropping the fact, or the imported rule would look right and send unsigned
+      // requests.
+      pm.test('a signed forward is marked, never exported with its secret', function () {
+        pm.expect(signed.length).to.be.greaterThan(0);
+        signed.forEach((action) => pm.expect(action).to.not.have.property('secret'));
+      });
+
+      pm.collectionVariables.set('room_document', JSON.stringify(doc));

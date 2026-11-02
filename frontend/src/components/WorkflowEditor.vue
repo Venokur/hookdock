@@ -81,6 +81,9 @@ function toForm(workflow) {
       enabled: true,
       priority: 0,
       stopProcessing: false,
+      // Version of the action list this editor loaded. Sent back on save so a
+      // change made in another tab is refused instead of overwritten.
+      actionsVersion: 0,
       conditions: { mode: 'all', rules: [] },
       actions: [blankAction()],
     }
@@ -92,6 +95,7 @@ function toForm(workflow) {
     endpoint: workflow.endpoint,
     enabled: workflow.enabled,
     priority: Number(workflow.priority ?? 0),
+    actionsVersion: Number(workflow.actions_version ?? 1),
     stopProcessing: Boolean(workflow.stop_processing),
     conditions: toTree(workflow.conditions),
     actions: (workflow.actions ?? []).map((action) => {
@@ -364,6 +368,9 @@ function buildPayload() {
   return {
     id: form.id,
     room_id: props.room?.id,
+    // Only when editing: a new rule has no stored version to conflict with, and
+    // sending `0` for it would look like a stale draft.
+    actions_version: form.id ? form.actionsVersion : undefined,
     name: form.name.trim(),
     endpoint: form.endpoint.trim() || '*',
     enabled: form.enabled,
@@ -383,7 +390,13 @@ async function save() {
   saving.value = true
 
   try {
-    await api.saveWorkflow(payload)
+    const saved = await api.saveWorkflow(payload)
+    // Adopt the version the server assigned, so saving the same open editor twice
+    // does not conflict with the worker's own save.
+    const version = saved?.data?.actions_version
+    if (version !== undefined) {
+      form.actionsVersion = Number(version)
+    }
     emit('saved')
   } catch (e) {
     error.value = e.message

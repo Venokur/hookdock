@@ -87,7 +87,7 @@ final class RunsController
 
         $stmt = $pdo->prepare(
             'SELECT wr.id, wr.workflow_id, wr.request_id, wr.status, wr.message, wr.attempts,
-                    wr.created_at, wr.updated_at, wr.available_at,
+                    wr.deferrals, wr.created_at, wr.updated_at, wr.available_at,
                     w.name AS workflow_name, w.priority,
                     i.room_id, i.method, i.path, i.endpoint,
                     stats.steps

@@ -142,6 +142,11 @@ export const api = {
       : request('/api/workflows', { method: 'POST', body: workflow }),
   toggleWorkflow: (id) => request(`/api/workflows/${id}/toggle`, { method: 'POST' }),
   duplicateWorkflow: (id) => request(`/api/workflows/${id}/duplicate`, { method: 'POST' }),
+  exportRoomWorkflows: (id) => download(`/api/rooms/${id}/workflows/export`),
+  importRoomWorkflows: (id, document) =>
+    request(`/api/rooms/${id}/workflows/import`, { method: 'POST', body: document }),
+  breakers: () => request('/api/breakers'),
+  resetBreaker: (address) => request('/api/breakers/reset', { method: 'POST', body: { address } }),
   readToken: () => request('/api/auth/read-token', { method: 'POST' }),
   runs: (params = {}) => request(`/api/runs${query(params)}`),
   deleteWorkflow: (id) => request(`/api/workflows/${id}`, { method: 'DELETE' }),

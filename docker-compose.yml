@@ -36,6 +36,10 @@ services:
       FORWARD_TIMEOUT: ${FORWARD_TIMEOUT:-8}
       FORWARD_ALLOW_INTERNAL: ${FORWARD_ALLOW_INTERNAL:-0}
       FORWARD_BLOCKED_HOSTS: ${FORWARD_BLOCKED_HOSTS:-}
+      # Read by the breaker dashboard and the dry run, so the numbers shown are the
+      # numbers the worker applies.
+      FORWARD_BREAKER_THRESHOLD: ${FORWARD_BREAKER_THRESHOLD:-2}
+      FORWARD_BREAKER_COOLDOWN: ${FORWARD_BREAKER_COOLDOWN:-60}
       DEMO_LOGIN: ${DEMO_LOGIN:-1}
       DEMO_EMAIL: ${DEMO_EMAIL:-admin@hookdock.local}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-123456}
@@ -107,6 +111,12 @@ services:
       FORWARD_TIMEOUT: ${FORWARD_TIMEOUT:-8}
       FORWARD_ALLOW_INTERNAL: ${FORWARD_ALLOW_INTERNAL:-0}
       FORWARD_BLOCKED_HOSTS: ${FORWARD_BLOCKED_HOSTS:-}
+      # Circuit breaker per forward address. The threshold and cooldown live in the
+      # worker because that is the only process that calls a target; the api reads
+      # them for the dashboard and the dry run, so both get the same numbers.
+      FORWARD_BREAKER_THRESHOLD: ${FORWARD_BREAKER_THRESHOLD:-2}
+      FORWARD_BREAKER_COOLDOWN: ${FORWARD_BREAKER_COOLDOWN:-60}
+      FORWARD_BREAKER_DEFERRALS: ${FORWARD_BREAKER_DEFERRALS:-3}
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       RETENTION_RUN_DAYS: ${RETENTION_RUN_DAYS:-0}
       RETENTION_INTERVAL_SECONDS: ${RETENTION_INTERVAL_SECONDS:-3600}

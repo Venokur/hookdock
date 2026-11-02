@@ -31,6 +31,11 @@ const router = createRouter({
       name: 'room-runs',
       component: () => import('../views/RunsView.vue'),
     },
+    {
+      path: '/rooms/:slug/delivery',
+      name: 'room-delivery',
+      component: () => import('../views/DeliveryView.vue'),
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

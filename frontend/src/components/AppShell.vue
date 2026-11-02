@@ -25,6 +25,7 @@ const nav = computed(() => {
     { name: 'room-requests', label: 'Входящие', hint: 'Пойманные запросы' },
     { name: 'room-workflows', label: 'Сценарии', hint: 'Правила маршрутизации' },
     { name: 'room-runs', label: 'Запуски', hint: 'Журнал выполнения' },
+    { name: 'room-delivery', label: 'Доставка', hint: 'Адреса и перенос правил' },
   ]
 })
 

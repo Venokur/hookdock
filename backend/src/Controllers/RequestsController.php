@@ -104,7 +104,8 @@ final class RequestsController
         $pdo = Database::pdo();
 
         $runs = $pdo->prepare(
-            'SELECT wr.id, wr.workflow_id, wr.status, wr.message, wr.attempts, wr.created_at, wr.updated_at,
+            'SELECT wr.id, wr.workflow_id, wr.status, wr.message, wr.attempts, wr.deferrals,
+                    wr.created_at, wr.updated_at,
                     w.name AS workflow_name
              FROM workflow_runs wr
              JOIN workflows w ON w.id = wr.workflow_id

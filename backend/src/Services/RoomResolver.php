@@ -23,12 +23,12 @@ final class RoomResolver
     public const DEFAULT_SLUG = 'default';
 
     /**
-     * @var array<string, array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}>|null
+     * @var array<string, array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}>|null
      */
     private static ?array $slugs = null;
 
     /**
-     * @return array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}|null
+     * @return array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}|null
      */
     public static function findBySlug(string $slug): ?array
     {
@@ -41,7 +41,7 @@ final class RoomResolver
     }
 
     /**
-     * @return array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}|null
+     * @return array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}|null
      */
     public static function findById(int $id): ?array
     {
@@ -50,7 +50,9 @@ final class RoomResolver
         }
 
         $stmt = Database::pdo()->prepare(
-            'SELECT id, slug, secret, dedup_header, require_timestamp FROM rooms WHERE id = :id'
+            'SELECT id, name, slug, endpoint, secret, dedup_header, require_timestamp,
+                    (secret IS NOT NULL) AS has_secret
+               FROM rooms WHERE id = :id'
         );
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
@@ -63,7 +65,7 @@ final class RoomResolver
     }
 
     /**
-     * @return array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}|null
+     * @return array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}|null
      */
     public static function default(): ?array
     {
@@ -76,7 +78,7 @@ final class RoomResolver
     }
 
     /**
-     * @return array<string, array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}>
+     * @return array<string, array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}>
      */
     private static function slugs(): array
     {
@@ -85,7 +87,12 @@ final class RoomResolver
         }
 
         self::$slugs = [];
-        foreach (Database::pdo()->query('SELECT id, slug, secret, dedup_header, require_timestamp FROM rooms') as $row) {
+        $rows = Database::pdo()->query(
+            'SELECT id, name, slug, endpoint, secret, dedup_header, require_timestamp,
+                    (secret IS NOT NULL) AS has_secret
+               FROM rooms'
+        );
+        foreach ($rows as $row) {
             self::$slugs[strtolower((string) $row['slug'])] = self::row($row);
         }
 
@@ -94,14 +101,17 @@ final class RoomResolver
 
     /**
      * @param array<string, mixed> $row
-     * @return array{id: int, slug: string, secret: ?string, dedup_header: ?string, require_timestamp: bool}
+     * @return array{id: int, name: string, slug: string, endpoint: string, secret: ?string, has_secret: bool, dedup_header: ?string, require_timestamp: bool}
      */
     private static function row(array $row): array
     {
         return [
             'id' => (int) $row['id'],
+            'name' => (string) ($row['name'] ?? ''),
             'slug' => (string) $row['slug'],
+            'endpoint' => (string) ($row['endpoint'] ?? ''),
             'secret' => $row['secret'] === null ? null : (string) $row['secret'],
+            'has_secret' => $row['secret'] !== null,
             'dedup_header' => $row['dedup_header'] === null ? null : (string) $row['dedup_header'],
             'require_timestamp' => self::isTrue($row['require_timestamp'] ?? false),
         ];

@@ -1,0 +1,40 @@
+$kind: http-request
+name: Stale save is refused
+method: PUT
+url: '{{base_url}}/api/workflows/{{workflow_id}}'
+order: 3500
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room_id": {{room_id}},
+      "name": "Postman rule",
+      "endpoint": "*",
+      "enabled": true,
+      "priority": 100,
+      "stop_processing": false,
+      "conditions": { "mode": "all", "rules": [] },
+      "actions": [
+        { "type": "log", "message": "stale draft" }
+      ],
+      "actions_version": 0
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The editor sends the `actions_version` it loaded. A different version means
+      // another tab saved in between, so the save is refused instead of silently
+      // replacing the other tab's action list — including a forward it just added.
+      // The answer carries the version to re-read, which is the only actionable
+      // thing a client can do about the conflict.
+      pm.test('a save from an older draft is refused with the current version', function () {
+        pm.response.to.have.status(409);
+        const error = pm.response.json().error;
+        pm.expect(error.actions_version).to.be.a('number');
+        pm.expect(error.actions_version).to.be.greaterThan(0);
+        pm.expect(error.message).to.include('версия');
+      });

@@ -1,0 +1,41 @@
+$kind: http-request
+name: List breakers
+method: GET
+url: '{{base_url}}/api/breakers'
+order: 1000
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // State is per ADDRESS, not per rule: two scenarios forwarding to the same
+      // endpoint share one verdict, and fixing the endpoint fixes both. The list is
+      // installation-wide for the same reason — a target is not a property of a
+      // room.
+      pm.test('the breaker list describes state per address', function () {
+        pm.response.to.have.status(200);
+        const targets = pm.response.json().data;
+        pm.expect(targets).to.be.an('array');
+
+        targets.forEach((target) => {
+          pm.expect(target).to.include.keys(
+            'address',
+            'state',
+            'consecutive_failures',
+            'retry_in',
+            'threshold',
+            'cooldown_seconds',
+          );
+          pm.expect(target.state).to.be.oneOf(['closed', 'open', 'half_open']);
+          pm.expect(target.address).to.match(/^https?:\/\/[^/]+:\d+$/);
+        });
+      });
+
+      // An open target is refused without being called, and the refusal does not
+      // count toward the workflow's failure streak — otherwise one dead endpoint
+      // would pause the rule that would recover with it.
+      const open = pm.response.json().data.filter((target) => target.state === 'open');
+      pm.collectionVariables.set('broken_address', open.length ? open[0].address : '');
+
+      pm.test('an open target is skipped, not retried by every delivery', function () {
+        open.forEach((target) => pm.expect(target.retry_in).to.be.greaterThan(0));
+      });

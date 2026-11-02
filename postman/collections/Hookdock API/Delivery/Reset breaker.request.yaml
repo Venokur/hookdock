@@ -1,0 +1,62 @@
+$kind: http-request
+name: Reset breaker
+method: POST
+url: '{{base_url}}/api/breakers/reset'
+order: 2000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "address": "{{broken_address}}"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // A breaker row only exists once a real forward has failed terminally, and
+      // this collection does not spend a retry budget to produce one. When "List
+      // breakers" saw an open target the reset is real; otherwise it still runs
+      // against a placeholder, where the honest answer is `reset: false` — the
+      // endpoint is exercised either way, and a no-op must not be an error.
+      if (!pm.collectionVariables.get('broken_address')) {
+        pm.collectionVariables.set('broken_address', 'https://no-such-target.invalid:443');
+        pm.collectionVariables.set('breaker_expected', 'false');
+        console.log('No open forward target; checking the reset no-op instead.');
+      } else {
+        pm.collectionVariables.set('breaker_expected', 'true');
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The row is DELETED, not flipped to `closed`: a stale failure count would
+      // re-open the breaker on the very next error, and the operator who just said
+      // "I fixed it" would reasonably conclude the reset did nothing.
+      pm.test('resetting an address clears it and its failure count', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.ok).to.eql(true);
+        pm.expect(String(body.reset)).to.eql(pm.collectionVariables.get('breaker_expected'));
+      });
+
+      // An empty address is a mistake in the call, not an unknown target: it is
+      // refused instead of silently clearing nothing.
+      pm.test('a reset without an address is refused', function () {
+        pm.sendRequest(
+          {
+            url: pm.collectionVariables.get('base_url') + '/api/breakers/reset',
+            method: 'POST',
+            header: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + pm.collectionVariables.get('token'),
+            },
+            body: { mode: 'raw', raw: JSON.stringify({ address: '' }) },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+          },
+        );
+      });

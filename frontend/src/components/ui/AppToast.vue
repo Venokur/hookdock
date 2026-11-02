@@ -22,11 +22,24 @@ const { toasts } = useDialog()
             :class="
               toast.tone === 'error'
                 ? 'bg-rose-500/10 text-rose-600 dark:text-rose-300'
-                : 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300'
+                : toast.tone === 'warning'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-300'
+                  : 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300'
             "
           >
             <svg
               v-if="toast.tone === 'error'"
+              class="h-3.5 w-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+            >
+              <path stroke-linecap="round" d="M12 8v5m0 3.5h.01" />
+              <circle cx="12" cy="12" r="9" />
+            </svg>
+            <svg
+              v-else-if="toast.tone === 'warning'"
               class="h-3.5 w-3.5"
               viewBox="0 0 24 24"
               fill="none"

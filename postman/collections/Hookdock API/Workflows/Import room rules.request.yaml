@@ -1,0 +1,47 @@
+$kind: http-request
+name: Import room rules
+method: POST
+url: '{{base_url}}/api/rooms/{{room_id}}/workflows/import'
+order: 5500
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: '{{room_document}}'
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The document comes from "Export room rules" above, so the import is tested
+      // against exactly what the API produced — a hand-written fixture would not
+      // prove that the two halves agree.
+      if (!pm.collectionVariables.get('room_document')) {
+        console.log('No document captured by "Export room rules".');
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Importing into the room the document came from is the duplicate case:
+      // every name already exists, so every rule gets a suffix. Nothing is
+      // overwritten — importing the same file twice is a normal way to check that
+      // nothing broke, and it must not behave like a destructive "replace".
+      pm.test('importing a room into itself creates copies, not replacements', function () {
+        pm.response.to.have.status(201);
+        const data = pm.response.json().data;
+        const doc = JSON.parse(pm.collectionVariables.get('room_document'));
+
+        pm.expect(data.created).to.eql(doc.workflows.length);
+        pm.expect(data.workflows).to.have.lengthOf(doc.workflows.length);
+        data.workflows.forEach((rule) => pm.expect(rule.name).to.include('('));
+      });
+
+      // A secret cannot travel in a file, so a signed forward arrives unsigned.
+      // Saying nothing would make the import look complete while the target
+      // silently rejects every request.
+      pm.test('the import reports signatures it could not carry over', function () {
+        const data = pm.response.json().data;
+        pm.expect(data.secrets_not_imported).to.be.a('number');
+        pm.expect(data.secrets_not_imported).to.be.greaterThan(0);
+      });
