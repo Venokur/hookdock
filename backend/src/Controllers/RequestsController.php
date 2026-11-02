@@ -1102,10 +1102,18 @@ final class RequestsController
             // PDO's statement parser reads `\'` as an escaped quote and then fails to
             // bind the remaining placeholders (`HY093`).
             $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
-            $where[] = '(r.path ILIKE :q_path OR r.endpoint ILIKE :q_endpoint OR r.raw_body ILIKE :q_body)';
+            // `headers::text` is a cast rather than a function wrapper, which is
+            // what keeps `incoming_requests_headers_trgm_idx` usable: the index is
+            // declared on the same expression. Without the header branch the only
+            // way to find "the delivery that carried X-GitHub-Event: push" was to
+            // open rows one by one, and a provider's traffic was indistinguishable
+            // from a hand-made test.
+            $where[] = '(r.path ILIKE :q_path OR r.endpoint ILIKE :q_endpoint'
+                . ' OR r.raw_body ILIKE :q_body OR r.headers::text ILIKE :q_headers)';
             $params['q_path'] = $like;
             $params['q_endpoint'] = $like;
             $params['q_body'] = $like;
+            $params['q_headers'] = $like;
         }
 
         $from = $this->parseDate((string) ($request->query['from'] ?? ''));

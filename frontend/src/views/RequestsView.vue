@@ -1085,7 +1085,7 @@ onUnmounted(() => {
           v-model="filters.q"
           type="search"
           size="sm"
-          placeholder="Поиск по пути или телу…"
+          placeholder="Поиск по пути, телу или заголовкам…"
           class="min-w-0 flex-1 basis-40"
         />
 

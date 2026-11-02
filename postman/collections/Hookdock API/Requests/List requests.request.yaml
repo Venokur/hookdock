@@ -19,7 +19,7 @@ queryParams:
   - key: q
     value: ''
     disabled: true
-    description: Substring of the path, endpoint or raw body.
+    description: Substring of the path, endpoint, raw body or header block.
   - key: from
     value: ''
     disabled: true

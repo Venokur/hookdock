@@ -32,6 +32,13 @@ const router = createRouter({
       component: () => import('../views/RunsView.vue'),
     },
     {
+      // Throughput and latency: "how did it behave", next to the journal's
+      // "what exactly happened".
+      path: '/rooms/:slug/analytics',
+      name: 'room-analytics',
+      component: () => import('../views/AnalyticsView.vue'),
+    },
+    {
       path: '/rooms/:slug/delivery',
       name: 'room-delivery',
       component: () => import('../views/DeliveryView.vue'),

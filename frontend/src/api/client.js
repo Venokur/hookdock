@@ -124,6 +124,7 @@ export const api = {
   updateRoom: (id, room) => request(`/api/rooms/${id}`, { method: 'PUT', body: room }),
   deleteRoom: (id) => request(`/api/rooms/${id}`, { method: 'DELETE' }),
   stats: (params = {}) => request(`/api/stats${query(params)}`),
+  analytics: (params = {}) => request(`/api/analytics${query(params)}`),
   endpoints: (params = {}) => request(`/api/endpoints${query(params)}`),
   requests: (params = {}) => request(`/api/requests${query(params)}`),
   request: (id) => request(`/api/requests/${id}`),

@@ -25,6 +25,7 @@ const nav = computed(() => {
     { name: 'room-requests', label: 'Входящие', hint: 'Пойманные запросы' },
     { name: 'room-workflows', label: 'Сценарии', hint: 'Правила маршрутизации' },
     { name: 'room-runs', label: 'Запуски', hint: 'Журнал выполнения' },
+    { name: 'room-analytics', label: 'Аналитика', hint: 'Объём и задержки' },
     { name: 'room-delivery', label: 'Доставка', hint: 'Адреса и перенос правил' },
     { name: 'room-audit', label: 'Аудит', hint: 'Кто и что менял' },
     // Only for an administrator: the API refuses the page to anyone else, and a

@@ -2,10 +2,12 @@
 
 declare(strict_types=1);
 
+use App\Controllers\AnalyticsController;
 use App\Controllers\AuthController;
 use App\Controllers\AuditController;
 use App\Controllers\BreakersController;
 use App\Controllers\HealthController;
+use App\Controllers\MetricsController;
 use App\Controllers\RequestsController;
 use App\Controllers\RoomsController;
 use App\Controllers\RunsController;
@@ -20,10 +22,12 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 
 $router = new Router();
 
+$analytics = new AnalyticsController();
 $auth = new AuthController();
 $audit = new AuditController();
 $breakers = new BreakersController();
 $health = new HealthController();
+$metrics = new MetricsController();
 $requests = new RequestsController();
 $rooms = new RoomsController();
 $runs = new RunsController();
@@ -65,6 +69,12 @@ $router->add('POST', '/api/rooms/{id}/secret', fn (Request $r, array $p) => $roo
 $router->add('DELETE', '/api/rooms/{id}/secret', fn (Request $r, array $p) => $rooms->clearSecret($r, $p));
 
 $router->add('GET', '/api/stats', fn (Request $r) => $requests->stats($r));
+// Throughput and latency over a window. `stats` is "how many right now"; this is
+// "how did it behave", which needs a time axis and the step durations.
+$router->add('GET', '/api/analytics', fn (Request $r) => $analytics->index($r));
+// Prometheus exposition. Public like `/api/health` — a scrape config has no
+// credentials — and counters only, never a payload or a forward address.
+$router->add('GET', '/api/metrics', fn (Request $r) => $metrics->show($r));
 // Before `/api/requests/{id}`: that pattern matches any single segment, so
 // "export" would be read as a request id and answered with 404. Same reason
 // `/api/endpoints` is its own route rather than `/api/requests/endpoints`.

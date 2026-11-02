@@ -866,6 +866,82 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/analytics:
+    get:
+      tags: [Runs]
+      summary: Throughput and latency over a window
+      description: |
+        `stats` answers "how many right now"; this answers "how did it behave",
+        which needs a time axis: volume per hour, the outcome mix, and how long
+        the actions actually took.
+
+        Latency comes from `workflow_run_steps`, the only place that knows how long
+        an action took. Two `forward`s that both ended `success` can differ by
+        seconds, and a p95 that creeps up is the first sign of a target degrading.
+
+        `success_rate` is computed over **finished** runs only: a run still in the
+        queue has no outcome, and counting it as "not successful" would make the
+        rate drop every time the worker is briefly behind. It is `null` when
+        nothing finished in the window.
+
+        `timeline` has one entry per hour and includes the hour in progress. Hours
+        with no traffic are present with zeroes, so a silent hour is a flat bar
+        rather than a gap that reads as a bug. Buckets are UTC.
+      parameters:
+        - $ref: '#/components/parameters/RoomSlug'
+        - name: hours
+          in: query
+          description: Window in hours. Clamped to 1…168; `0` falls back to 24.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 168
+            default: 24
+      responses:
+        '200':
+          description: Counters, breakdowns and the hourly timeline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Analytics'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/metrics:
+    get:
+      tags: [Health]
+      summary: The installation as Prometheus metrics
+      description: |
+        The exposition format (`text/plain; version=0.0.4`), for a scraper.
+
+        Public on purpose, like `/api/health`: a scrape config has no credentials.
+        The body carries counters only — never a payload, a room name or a forward
+        address. `hookdock_breaker_open` is therefore a count with no `address`
+        label, because a forward target is an internal hostname.
+
+        Answers `503` when a check failed, while still emitting every metric it
+        could read, so a broken installation keeps producing numbers.
+      security: []
+      responses:
+        '200':
+          description: Every check passed.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  hookdock_api_up 1
+                  hookdock_runs_pending 0
+                  hookdock_runs{status="failed"} 3
+        '503':
+          description: A check failed; the body is still the full exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /api/endpoints:
     get:
       tags: [Requests]
@@ -938,7 +1014,11 @@ paths:
             type: string
         - name: q
           in: query
-          description: Substring of the path, endpoint or raw body.
+          description: |
+            Substring of the path, endpoint, raw body or header block. The header
+            branch is the only way to answer "which delivery carried
+            `X-GitHub-Event: push`"; it compares the text form of the `headers`
+            jsonb, which is the expression the trigram index is declared on.
           schema:
             type: string
         - name: from
@@ -2917,6 +2997,128 @@ components:
         message:
           type: string
           description: '`log` only. Supports `{{ body.field }}`.'
+
+    Analytics:
+      type: object
+      description: |
+        Throughput and latency for one window. Every number is scoped by `room`
+        when it is given; without it the totals are installation-wide.
+      properties:
+        window_hours:
+          type: integer
+          example: 24
+        since:
+          type: string
+          format: date-time
+          description: Start of the window (UTC); the inside of the oldest bucket.
+        generated_at:
+          type: string
+          format: date-time
+        requests:
+          type: object
+          properties:
+            total:
+              type: integer
+            per_hour:
+              type: number
+              description: Mean deliveries per hour over the window.
+            duplicates:
+              type: integer
+              description: Repeat deliveries stored but not routed.
+            replayed:
+              type: integer
+              description: Copies an operator sent with corrections.
+            bytes:
+              type: integer
+              description: Sum of the stored bodies.
+            by_method:
+              type: array
+              items:
+                type: object
+                properties:
+                  method:
+                    type: string
+                  total:
+                    type: integer
+            top_endpoints:
+              type: array
+              description: The 10 most frequent paths in the window.
+              items:
+                type: object
+                properties:
+                  endpoint:
+                    type: string
+                  total:
+                    type: integer
+        runs:
+          type: object
+          properties:
+            total:
+              type: integer
+              description: Includes runs still `pending` or `running`.
+            success_rate:
+              type: number
+              nullable: true
+              description: |
+                `success` over **finished** runs. `null` when nothing finished in
+                the window — a queued backlog must not read as a failure rate.
+              example: 0.9375
+            by_status:
+              type: object
+              properties:
+                pending:
+                  type: integer
+                running:
+                  type: integer
+                success:
+                  type: integer
+                failed:
+                  type: integer
+                skipped:
+                  type: integer
+        actions:
+          type: object
+          description: Per action type, from `workflow_run_steps`.
+          properties:
+            total:
+              type: integer
+            by_type:
+              type: array
+              items:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    example: forward
+                  total:
+                    type: integer
+                  failed:
+                    type: integer
+                  skipped:
+                    type: integer
+                  p50_ms:
+                    type: integer
+                  p95_ms:
+                    type: integer
+                  max_ms:
+                    type: integer
+        timeline:
+          type: array
+          description: One entry per hour, silent hours included, oldest first.
+          items:
+            type: object
+            properties:
+              hour:
+                type: string
+                example: '2026-11-02T21:00:00Z'
+              requests:
+                type: integer
+              success:
+                type: integer
+              failed:
+                type: integer
+              skipped:
+                type: integer
 
     ForwardTarget:
       type: object

@@ -1,0 +1,40 @@
+$kind: http-request
+name: Analytics
+method: GET
+url: '{{base_url}}/api/analytics?room={{room_slug}}&hours=24'
+order: 3000
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: hours
+    value: '24'
+    description: Window in hours, clamped to 1…168.
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // "How did it behave" next to the journal's "what exactly happened": a
+      // volume chart and the step durations, which are the only place a slow
+      // forward target shows up before it fails.
+      pm.test('analytics answers a window', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data.window_hours).to.eql(24);
+        pm.expect(body.data.requests).to.have.property('total');
+        pm.expect(body.data.runs.by_status).to.have.property('success');
+        pm.expect(body.data.actions.by_type).to.be.an('array');
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Silent hours are present with zeroes: a gap in the chart would read as a
+      // bug, and the last bucket is the hour in progress.
+      const rows = pm.response.json().data.timeline || [];
+      pm.test('the timeline has one bucket per hour', function () {
+        pm.expect(rows.length).to.eql(25);
+        pm.expect(rows.every((row) => typeof row.hour === 'string')).to.be.true;
+      });
+      pm.test('the success rate is a share or null', function () {
+        const rate = pm.response.json().data.runs.success_rate;
+        pm.expect(rate === null || (rate >= 0 && rate <= 1)).to.be.true;
+      });
