@@ -254,6 +254,7 @@ const {
 
 const endpointTop = ref(null)
 const endpointsLoading = ref(false)
+const endpointsFailed = ref(false)
 
 /** "Listen to everything" is the default, so it stays a leading row. */
 const ALL_ENDPOINTS = { value: '*', label: '* — все эндпоинты комнаты' }
@@ -268,12 +269,49 @@ const endpointOptions = computed(() =>
   }),
 )
 
+/**
+ * The line under the list has four different truths to tell, and saying the wrong
+ * one is worse than saying nothing: "можно ввести свой slug" over a list that is
+ * still loading reads as an empty room, and a room with forty endpoints would look
+ * complete while the panel shows fifteen.
+ */
 const endpointHint = computed(() => {
-  const base = endpointHintText()
+  const total = endpointTop.value?.endpoints_total ?? 0
+  const shown = (endpointTop.value?.endpoints ?? []).length
 
-  // In a room that has received nothing there is no list to truncate, and the
-  // panel would otherwise look like a dead control. Say the one thing that works.
-  return base || 'Можно ввести свой slug — он появится в списке.'
+  // A search of its own: the panel already spins in the search field, so this
+  // line stays empty instead of repeating "ищу" twice.
+  const base = endpointHintText({ total, shown, failedText: 'Не удалось загрузить — введите slug вручную.' })
+
+  if (base !== '') {
+    return base
+  }
+
+  // Nothing about the room is worth saying while its answer is pending: the
+  // search field shows the spinner, and "в комнате пока нет эндпоинтов" a moment
+  // before the list arrives reads as a wrong answer, not as a wait.
+  if (endpointsSearching.value) {
+    return ''
+  }
+
+  if (endpointsLoading.value) {
+    return 'Загружаю список эндпоинтов…'
+  }
+
+  if (endpointsFailed.value) {
+    return 'Список не загрузился — введите slug вручную.'
+  }
+
+  if (total === 0) {
+    // Nothing to pick from, but the control still works: a rule is routinely
+    // written before the first delivery, and the endpoint appears in the list
+    // after it.
+    return 'В комнате пока нет эндпоинтов — введите свой slug, он появится после первого запроса.'
+  }
+
+  // A complete list needs no line, and the paragraph under the field already
+  // explains that a slug can be typed: repeating it here would be noise.
+  return ''
 })
 
 async function loadEndpoints() {
@@ -282,14 +320,17 @@ async function loadEndpoints() {
   }
 
   endpointsLoading.value = true
+  endpointsFailed.value = false
 
   try {
     const data = await api.stats({ room: props.room.slug })
     endpointTop.value = data.data
   } catch {
     // The picker stays usable: without the short list it still accepts a typed
-    // slug, which is the whole reason `allowCustom` is on.
+    // slug, which is the whole reason `allowCustom` is on. The hint says so
+    // instead of claiming the room has no endpoints.
     endpointTop.value = null
+    endpointsFailed.value = true
   } finally {
     endpointsLoading.value = false
   }

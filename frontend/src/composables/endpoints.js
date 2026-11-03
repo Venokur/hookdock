@@ -24,12 +24,17 @@
 import { reactive, ref } from 'vue'
 import { api } from '../api/client'
 
+/** What a caller sees when the search itself broke, not the endpoint list. */
+const FAILED_HINT = 'Не удалось загрузить список — попробуйте ещё раз.'
+
 export function useEndpointSearch(getSlug) {
   const term = ref('')
   const hits = ref([])
   const searching = ref(false)
   const failed = ref(false)
   const meta = reactive({ total: 0, returned: 0, has_more: false })
+  /** The term whose answer `hits`/`meta`/`failed` describe. */
+  const answered = ref('')
   let seq = 0
 
   /**
@@ -39,7 +44,12 @@ export function useEndpointSearch(getSlug) {
    * @param allowCustom  offer the typed term as a value when nothing matched it
    */
   function options(stats, { allowCustom = false, blank = null, current = '' } = {}) {
-    const source = term.value.trim() === '' ? (stats?.endpoints ?? []) : hits.value
+    // Matches appear only once the answer for *this* term has arrived. While a
+    // request is in flight the previous term's rows would sit under a box that no
+    // longer says that term, and clicking one would pick a value the operator
+    // stopped searching for.
+    const fresh = answered.value === term.value
+    const source = term.value.trim() === '' ? (stats?.endpoints ?? []) : fresh ? hits.value : []
     const known = source.map((item) => ({ value: item.endpoint, label: item.endpoint }))
     const selected = String(current ?? '').trim()
 
@@ -49,10 +59,12 @@ export function useEndpointSearch(getSlug) {
 
     if (allowCustom) {
       const typed = term.value.trim()
+      const lower = typed.toLowerCase()
 
-      // The typed term becomes a row only when nothing matched it: a duplicate
-      // that selects the same string as a real result would read as two choices.
-      if (typed !== '' && !known.some((option) => option.value === typed)) {
+      // Compared without case: routing matches an endpoint case-insensitively
+      // (`WorkflowEngine::endpointMatches`), so `HOOK-1` next to `hook-1` would be
+      // two rows that do the same thing.
+      if (typed !== '' && !known.some((option) => String(option.value).toLowerCase() === lower)) {
         known.push({ value: typed, label: `Использовать «${typed}»` })
       }
     }
@@ -60,16 +72,32 @@ export function useEndpointSearch(getSlug) {
     return blank ? [blank, ...known] : known
   }
 
-  function hint({ total = 0, shown = 0 } = {}) {
+  /**
+   * One line under the list. `failedText` is per caller: the log filter has no
+   * manual input, so telling it to "type the slug yourself" is advice it cannot
+   * follow.
+   */
+  function hint({
+    total = 0,
+    shown = 0,
+    failedText = FAILED_HINT,
+    pendingText = '',
+  } = {}) {
     const typed = term.value.trim()
 
     if (typed !== '') {
+      // Nothing is known about this term yet: "ничего не найдено" while the
+      // request is still running would state a fact the server has not answered.
+      if (answered.value !== term.value) {
+        return pendingText
+      }
+
       if (failed.value) {
-        return 'Не удалось загрузить список — введите slug вручную.'
+        return failedText
       }
 
       if (meta.total === 0) {
-        return searching.value ? '' : 'Ничего не найдено.'
+        return 'Ничего не найдено.'
       }
 
       return meta.has_more
@@ -114,6 +142,7 @@ export function useEndpointSearch(getSlug) {
       }
     } finally {
       if (mine === seq) {
+        answered.value = next
         searching.value = false
       }
     }
@@ -123,6 +152,7 @@ export function useEndpointSearch(getSlug) {
   function reset() {
     seq += 1
     term.value = ''
+    answered.value = ''
     hits.value = []
     searching.value = false
     failed.value = false

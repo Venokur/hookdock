@@ -44,6 +44,15 @@ const position = ref({ top: 0, left: 0, width: 0, maxHeight: 288, placement: 'bo
 const SEARCH_DEBOUNCE = 250
 let searchQueryTimer = null
 
+/**
+ * True once the operator moved the highlight from the search field. Enter has two
+ * meanings in a searchable select — "search now" while typing, "take this row"
+ * after an arrow — and the flag is what tells them apart.
+ */
+let navigated = false
+/** The value the highlight stood on when it was moved, to notice a reordered list. */
+let navigatedValue = null
+
 const sizes = {
   sm: 'rounded-lg px-2.5 py-1.5 text-xs',
   md: 'rounded-xl px-3 py-2 text-sm',
@@ -83,6 +92,7 @@ function openMenu() {
 
   open.value = true
   activeIndex.value = selectedIndex.value >= 0 ? selectedIndex.value : firstEnabled()
+  navigated = false
 
   nextTick(() => {
     updatePosition()
@@ -96,6 +106,7 @@ function openMenu() {
 function close() {
   open.value = false
   activeIndex.value = -1
+  navigated = false
   clearTimeout(searchQueryTimer)
   // A term left over from the previous open would filter the next one before
   // the user typed anything.
@@ -119,6 +130,8 @@ function choose(option) {
  */
 function onSearchInput(value) {
   query.value = value
+  // The highlight belonged to the previous answer; a new term invalidates it.
+  navigated = false
   clearTimeout(searchQueryTimer)
   searchQueryTimer = setTimeout(() => emit('search', value.trim()), SEARCH_DEBOUNCE)
 }
@@ -126,6 +139,62 @@ function onSearchInput(value) {
 function searchNow() {
   clearTimeout(searchQueryTimer)
   emit('search', query.value.trim())
+}
+
+/**
+ * Keyboard support for the searchable panel.
+ *
+ * Without this the field swallows every key (`@keydown.stop`), the rows are plain
+ * `<li>` elements, and a select that offers a list could only be operated with a
+ * mouse. Enter keeps its documented "search this term now" meaning until an arrow
+ * has moved the highlight into the list — after that it takes the highlighted row,
+ * which is the sequence an expert user expects.
+ */
+function onSearchKeydown(event) {
+  switch (event.key) {
+    case 'ArrowDown':
+    case 'ArrowUp': {
+      event.preventDefault()
+      if (!open.value) {
+        return
+      }
+
+      const step = event.key === 'ArrowDown' ? 1 : -1
+
+      // `move` counts from the current index, and -1 means "nothing highlighted
+      // yet": stepping from it would land near the wrong end of the list.
+      if (activeIndex.value < 0) {
+        activeIndex.value = step > 0 ? firstEnabled() : lastEnabled()
+      } else {
+        move(step)
+      }
+
+      navigated = true
+      navigatedValue = props.options[activeIndex.value]?.value ?? null
+      scrollActiveIntoView()
+      break
+    }
+    case 'Enter': {
+      event.preventDefault()
+      const option = navigated && open.value ? props.options[activeIndex.value] : null
+
+      if (option) {
+        choose(option)
+      } else {
+        searchNow()
+      }
+      break
+    }
+    case 'Escape':
+      event.preventDefault()
+      closeAndFocus()
+      break
+    case 'Tab':
+      close()
+      break
+    default:
+      break
+  }
 }
 
 /** Escape inside the panel: same as Escape on the trigger. */
@@ -301,6 +370,37 @@ function onPointerDown(event) {
   close()
 }
 
+/**
+ * The option values as one string, so a caller that builds its array inline
+ * (`:options="[…].map(…)"`, which `RequestDetail` does) does not fire this on
+ * every render — only when the rows really change.
+ */
+const optionKey = computed(() => props.options.map((option) => String(option.value)).join('\u0000'))
+
+watch(optionKey, () => {
+  if (!navigated) {
+    // A new answer reorders the rows, so an index kept from the previous one
+    // would highlight a row nobody chose. No highlight is honest; the first
+    // arrow then lands on the first row.
+    activeIndex.value = -1
+    return
+  }
+
+  // The rows moved under the highlight. Keeping the index would make Enter take
+  // a row that was never highlighted, so the highlight follows the value it
+  // stood on.
+  const index = props.options.findIndex(
+    (option) => String(option.value) === String(navigatedValue),
+  )
+
+  if (index >= 0) {
+    activeIndex.value = index
+  } else {
+    navigated = false
+    activeIndex.value = -1
+  }
+})
+
 watch(open, (isOpen) => {
   checkOpenListeners(isOpen)
 })
@@ -392,8 +492,7 @@ onBeforeUnmount(() => {
             class="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 pr-7 text-xs text-ink outline-none transition
               placeholder:text-ink-mute focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15"
             @input="onSearchInput($event.target.value)"
-            @keydown.enter.prevent="searchNow"
-            @keydown.esc.prevent="closeAndFocus"
+            @keydown="onSearchKeydown($event)"
             @keydown.stop
           />
           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-mute">
