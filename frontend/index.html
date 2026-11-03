@@ -48,11 +48,34 @@
       }
 
       /*
-       * Scroll is held back until the splash is gone. `scrollbar-gutter: stable` is
-       * not an option: it would reserve the strip for the whole session, and the
-       * log page needs the width. Locking and unlocking once is the transition the
-       * splash exists to hide — and `overflow: hidden` on the root is what also
-       * stops a wheel over the splash from scrolling the page behind it.
+       * The strip for the scrollbar is reserved from the very first frame, and it
+       * has to be declared here rather than in main.css: by the time the bundle
+       * arrives the page is already painted, so a rule added there would reflow
+       * the content once, under the splash.
+       *
+       * Without it the unlock below moved everything by 10px: while the scroll is
+       * locked there is no bar and the viewport is 10px wider (card measured 951px),
+       * then the bar appears and the content shrinks (941px) — the jump the splash
+       * is supposed to hide. With the strip always reserved the bar appears inside
+       * space that is already taken, so unlock measures 941px before and after.
+       * It also removes the same jump from ordinary pages that grow past the
+       * viewport (a filter change, a live row, a longer run list).
+       *
+       * The price is a 10px strip of body background on short pages (login, empty
+       * states) and a splash 10px narrower than the window. Both are the background
+       * colour, so they read as a margin rather than as a missing scrollbar.
+       * Browsers without `scrollbar-gutter` (older Safari/Firefox) keep the old
+       * behaviour; on macOS and iOS bars are overlaid and take no space anyway.
+       */
+      html {
+        scrollbar-gutter: stable;
+      }
+
+      /*
+       * Scroll is held back until the splash is gone: `overflow: hidden` on the
+       * root is what stops a wheel over the splash from scrolling the page behind
+       * it. The lock hides the bar, but the strip it would occupy stays reserved
+       * (above), so releasing the lock does not move the content.
        */
       html.splash-lock,
       html.splash-lock body {
