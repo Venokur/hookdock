@@ -10,6 +10,7 @@ import AppTextarea from './ui/AppTextarea.vue'
 import ConditionGroup from './ConditionGroup.vue'
 import JsonPathPicker from './JsonPathPicker.vue'
 import { api } from '../api/client'
+import { useEndpointSearch } from '../composables/endpoints'
 import { formatUtcTime } from '../utils/format'
 
 const props = defineProps({
@@ -230,6 +231,71 @@ async function loadChannels() {
 }
 
 onMounted(loadChannels)
+
+/**
+ * The room's endpoints, for the trigger's picker.
+ *
+ * A workflow names an endpoint by its slug, and the operator had to type it from
+ * memory while the same list was a dropdown one page away in the request log. The
+ * search is the one that log uses, with `allowCustom` on: a rule is often written
+ * before the first delivery arrives, so the picker must accept a slug nobody has
+ * seen yet instead of refusing the very case it is meant to help set up.
+ *
+ * `stats` is loaded here rather than through props: the editor can be opened from
+ * a page that never asked for request statistics, and the closed list has to have
+ * something in it without a second round trip from the caller.
+ */
+const {
+  options: endpointOptionList,
+  hint: endpointHintText,
+  search: searchEndpoints,
+  searching: endpointsSearching,
+} = useEndpointSearch(() => props.room?.slug ?? '')
+
+const endpointTop = ref(null)
+const endpointsLoading = ref(false)
+
+/** "Listen to everything" is the default, so it stays a leading row. */
+const ALL_ENDPOINTS = { value: '*', label: '* — все эндпоинты комнаты' }
+
+const endpointOptions = computed(() =>
+  endpointOptionList(endpointTop.value, {
+    allowCustom: true,
+    blank: ALL_ENDPOINTS,
+    // `*` is the blank row above; repeating it as "the current value" would list
+    // it twice.
+    current: form.endpoint === '*' ? '' : form.endpoint,
+  }),
+)
+
+const endpointHint = computed(() => {
+  const base = endpointHintText()
+
+  // In a room that has received nothing there is no list to truncate, and the
+  // panel would otherwise look like a dead control. Say the one thing that works.
+  return base || 'Можно ввести свой slug — он появится в списке.'
+})
+
+async function loadEndpoints() {
+  if (!props.room?.id) {
+    return
+  }
+
+  endpointsLoading.value = true
+
+  try {
+    const data = await api.stats({ room: props.room.slug })
+    endpointTop.value = data.data
+  } catch {
+    // The picker stays usable: without the short list it still accepts a typed
+    // slug, which is the whole reason `allowCustom` is on.
+    endpointTop.value = null
+  } finally {
+    endpointsLoading.value = false
+  }
+}
+
+onMounted(loadEndpoints)
 
 const extractSources = [
   { value: 'body', label: 'Тело запроса' },
@@ -683,15 +749,26 @@ async function check() {
             </div>
 
             <template v-if="!isScheduled">
-              <label class="block">
+              <div class="block">
                 <span class="mb-1.5 block text-xs font-medium text-ink-soft">Slug эндпоинта</span>
-                <AppInput v-model="form.endpoint" placeholder="*" class="font-mono" />
-              </label>
+                <AppSelect
+                  v-model="form.endpoint"
+                  :options="endpointOptions"
+                  searchable
+                  search-placeholder="Поиск или новый slug"
+                  :loading="endpointsLoading"
+                  :searching="endpointsSearching"
+                  :hint="endpointHint"
+                  aria-label="Slug эндпоинта"
+                  @search="searchEndpoints"
+                />
+              </div>
 
               <p class="text-[11px] text-ink-mute">
-                Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты комнаты,
-                или конкретный slug. Адрес комнаты по умолчанию:
-                <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/{{ room?.endpoint || 'hook-…' }}</code>.
+                Выберите эндпоинт из списка или введите свой — правило можно создать до первого
+                запроса. <code class="font-mono text-ink-soft">*</code> слушает все эндпоинты комнаты.
+                Адрес комнаты по умолчанию:
+                <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/{{ form.endpoint === '*' || form.endpoint === '' ? (room?.endpoint || 'hook-…') : form.endpoint }}</code>.
               </p>
             </template>
 

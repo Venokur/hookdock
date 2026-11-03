@@ -14,6 +14,7 @@ import { api } from '../api/client'
 import { confirm, notify } from '../composables/dialog'
 import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
 import { useRefresh } from '../composables/useRefresh'
+import { useEndpointSearch } from '../composables/endpoints'
 import { useAuthStore } from '../stores/auth'
 import { useRoomsStore } from '../stores/rooms'
 import { formatBytes, formatClock, formatTime } from '../utils/format'
@@ -33,12 +34,16 @@ const stats = ref(null)
 const filters = reactive({ method: 'ALL', q: '', endpoint: '', period: 'all', from: '', to: '' })
 
 // Endpoint panel search: the same division the sidebar uses for rooms — a page
-// from `stats`, and matches fetched on demand for everything else.
-const endpointSearch = ref('')
-const endpointHits = ref([])
-const endpointSearching = ref(false)
-const endpointSearchMeta = reactive({ total: 0, returned: 0, has_more: false })
-let endpointSeq = 0
+// from `stats`, and matches fetched on demand for everything else. The search
+// itself is shared with the workflow editor's trigger, which asks the same
+// question about the same room.
+const {
+  options: endpointOptionList,
+  hint: endpointHintText,
+  search: searchEndpoints,
+  searching: endpointSearching,
+  reset: resetEndpointSearch,
+} = useEndpointSearch(() => slug.value)
 
 const loading = ref(false)
 const error = ref('')
@@ -174,92 +179,26 @@ const exportOptions = [
  * The closed filter shows the room's 15 most frequent endpoints (`stats.endpoints`)
  * — enough to cover the usual case without a panel that scrolls for a screen. A
  * room can also receive on hundreds of paths, so the rest are reachable by typing
- * in the panel: the term goes to `/api/endpoints`, the same way the sidebar
- * searches rooms by name/slug. Options come from one of two lists (`endpointHits`
- * while searching), never from both, so a slow search cannot mix a stale page into
- * fresh matches.
- *
- * The selected value is always included: a filter that fell out of the top 15 is
- * still active, and a closed select would otherwise read "Все эндпоинты" while the
- * log stayed filtered.
+ * in the panel. The same search backs the workflow editor's trigger, so the two
+ * cannot drift into offering different endpoints for the same room.
  */
-const endpointOptions = computed(() => {
-  const source = endpointSearch.value.trim() === ''
-    ? (stats.value?.endpoints ?? [])
-    : endpointHits.value
-
-  const known = source.map((item) => ({ value: item.endpoint, label: item.endpoint }))
-  const current = filters.endpoint.trim()
-
-  if (current !== '' && !known.some((option) => option.value === current)) {
-    known.unshift({ value: current, label: current })
-  }
-
-  return [{ value: '', label: 'Все эндпоинты' }, ...known]
-})
+const endpointOptions = computed(() =>
+  endpointOptionList(stats.value, {
+    blank: { value: '', label: 'Все эндпоинты' },
+    current: filters.endpoint,
+  }),
+)
 
 /**
  * Says how much of the list is on screen, so a truncated filter never looks like
- * a complete one. While searching, the count is the search's own meta.
+ * a complete one.
  */
-const endpointHint = computed(() => {
-  const term = endpointSearch.value.trim()
-
-  if (term !== '') {
-    const meta = endpointSearchMeta
-    // Empty matches need a line of their own: the panel still lists "Все
-    // эндпоинты", so a bare list would read as "the search found nothing to show
-    // and probably worked" instead of "there is no such endpoint".
-    if (meta.total === 0) {
-      return endpointSearching.value ? '' : 'Ничего не найдено.'
-    }
-    return meta.has_more
-      ? `Найдено ${meta.total}, показаны первые ${meta.returned} — уточните запрос.`
-      : `Найдено ${meta.total}.`
-  }
-
-  const total = stats.value?.endpoints_total ?? 0
-  const shown = (stats.value?.endpoints ?? []).length
-
-  return total > shown ? `Показаны ${shown} из ${total} — остальные через поиск.` : ''
-})
-
-async function searchEndpoints(term) {
-  endpointSearch.value = term
-
-  // Clearing the field goes back to the page from `stats`; there is nothing to
-  // fetch, and a request per deletion of the last character would only add noise.
-  if (term === '') {
-    endpointSeq += 1
-    endpointHits.value = []
-    endpointSearching.value = false
-    Object.assign(endpointSearchMeta, { total: 0, returned: 0, has_more: false })
-    return
-  }
-
-  const seq = ++endpointSeq
-  endpointSearching.value = true
-
-  try {
-    const res = await api.endpoints({ room: slug.value, q: term, limit: 15 })
-    // A slower answer for an older term must not replace the current matches.
-    if (seq !== endpointSeq || term !== endpointSearch.value) {
-      return
-    }
-
-    endpointHits.value = res.data
-    Object.assign(endpointSearchMeta, res.meta)
-  } catch (e) {
-    if (seq === endpointSeq) {
-      endpointHits.value = []
-      notify(e.message)
-    }
-  } finally {
-    if (seq === endpointSeq) {
-      endpointSearching.value = false
-    }
-  }
-}
+const endpointHint = computed(() =>
+  endpointHintText({
+    total: stats.value?.endpoints_total ?? 0,
+    shown: (stats.value?.endpoints ?? []).length,
+  }),
+)
 
 function toIso(value) {
   if (!value) {
@@ -758,11 +697,7 @@ watch(slug, () => {
   // A search term for the previous room would be sent with the new room's first
   // stats request; the endpoints of one room say nothing about another's. Bumping
   // the sequence also discards an answer that is still in flight.
-  endpointSeq += 1
-  endpointSearch.value = ''
-  endpointHits.value = []
-  endpointSearching.value = false
-  Object.assign(endpointSearchMeta, { total: 0, returned: 0, has_more: false })
+  resetEndpointSearch()
   items.value = []
   stats.value = null
   Object.assign(meta, { page: 1, total: 0, pages: 1 })
