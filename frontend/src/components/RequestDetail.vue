@@ -5,6 +5,7 @@ import MethodBadge from './MethodBadge.vue'
 import StatusPill from './StatusPill.vue'
 import AppSpinner from './ui/AppSpinner.vue'
 import AppInput from './ui/AppInput.vue'
+import AppDisclosure from './ui/AppDisclosure.vue'
 import AppSelect from './ui/AppSelect.vue'
 import AppTextarea from './ui/AppTextarea.vue'
 import { api } from '../api/client'
@@ -470,12 +471,15 @@ async function copyCurl() {
           <p v-if="run.attempts > 1" class="mt-1 text-[11px] text-ink-mute">попыток: {{ run.attempts }}</p>
 
           <!-- Step log: one row per action per attempt, so a retried forward and
-               the response it got are visible instead of collapsed into a string. -->
-          <details v-if="(run.steps ?? []).length" class="mt-2 border-t border-line pt-2">
-            <summary class="cursor-pointer text-[11px] font-medium text-ink-mute">
-              Шаги ({{ run.steps.length }})
-            </summary>
-            <ul class="mt-2 space-y-1.5">
+               the response it got are visible instead of collapsed into a string.
+               The disclosure is ours, not `<details>`: the system marker is drawn
+               by the browser and ignores the theme. -->
+          <AppDisclosure
+            v-if="(run.steps ?? []).length"
+            class="mt-2 border-t border-line pt-2"
+            :label="`Шаги (${run.steps.length})`"
+          >
+            <ul class="space-y-1.5">
               <li
                 v-for="step in run.steps"
                 :key="step.id"
@@ -496,7 +500,7 @@ async function copyCurl() {
                 >{{ step.response_body }}</pre>
               </li>
             </ul>
-          </details>
+          </AppDisclosure>
         </div>
       </div>
 

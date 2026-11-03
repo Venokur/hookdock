@@ -3,6 +3,7 @@ import { computed, reactive, ref } from 'vue'
 import { api } from '../api/client'
 import AppCheckbox from './ui/AppCheckbox.vue'
 import AppInput from './ui/AppInput.vue'
+import AppPassword from './ui/AppPassword.vue'
 import AppSelect from './ui/AppSelect.vue'
 import AppSpinner from './ui/AppSpinner.vue'
 
@@ -154,10 +155,10 @@ async function save() {
 
         <label v-if="form.kind === 'slack'" class="block">
           <span class="mb-1.5 block text-xs font-medium text-ink-soft">URL входящего вебхука</span>
-          <AppInput
+          <AppPassword
             v-model="form.url"
             :placeholder="isEdit && channel?.has_url ? `сохранён · ${channel.url_hint}` : 'https://hooks.slack.com/services/…'"
-            type="password"
+            aria-label="URL входящего вебхука"
           />
           <span class="mt-1 block text-[11px] text-ink-mute">
             Приложение → Incoming Webhooks → Add New Webhook to Workspace.
@@ -168,10 +169,10 @@ async function save() {
         <template v-else>
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Токен бота</span>
-            <AppInput
+            <AppPassword
               v-model="form.bot_token"
               :placeholder="isEdit && channel?.has_token ? 'сохранён' : '123456789:AAH…'"
-              type="password"
+              aria-label="Токен бота"
             />
             <span class="mt-1 block text-[11px] text-ink-mute">
               Выдаёт @BotFather. {{ secretHint }}

@@ -338,8 +338,8 @@ function pickPathOnly() {
             <AppInput
               v-else
               v-model="filter"
-              type="search"
               size="sm"
+              clearable
               placeholder="Поиск по пути, например customer"
               aria-label="Поиск по путям"
             />
@@ -386,8 +386,8 @@ function pickPathOnly() {
           <AppInput
             v-if="manualTree"
             v-model="filter"
-            type="search"
             size="sm"
+            clearable
             placeholder="Поиск по пути"
             aria-label="Поиск по путям"
           />

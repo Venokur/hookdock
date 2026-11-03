@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import AppShell from '../components/AppShell.vue'
 import AppInput from '../components/ui/AppInput.vue'
+import AppPassword from '../components/ui/AppPassword.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import { api } from '../api/client'
@@ -228,7 +229,7 @@ onMounted(() => {
 
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Пароль</span>
-            <AppInput v-model="form.password" type="password" placeholder="не короче 8 символов" />
+            <AppPassword v-model="form.password" placeholder="не короче 8 символов" aria-label="Пароль нового пользователя" />
           </label>
 
           <label class="block sm:col-span-2">
@@ -336,15 +337,15 @@ onMounted(() => {
         <div class="mt-3 grid gap-3 sm:grid-cols-3">
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Текущий пароль</span>
-            <AppInput v-model="password.current" type="password" />
+            <AppPassword v-model="password.current" autocomplete="current-password" aria-label="Текущий пароль" />
           </label>
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Новый пароль</span>
-            <AppInput v-model="password.next" type="password" placeholder="не короче 8 символов" />
+            <AppPassword v-model="password.next" placeholder="не короче 8 символов" aria-label="Новый пароль" />
           </label>
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Повторите</span>
-            <AppInput v-model="password.repeat" type="password" />
+            <AppPassword v-model="password.repeat" aria-label="Повтор нового пароля" />
           </label>
         </div>
 

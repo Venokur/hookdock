@@ -173,7 +173,6 @@ onUnmounted(() => {
     <div class="relative mt-2">
       <AppInput
         :model-value="roomsStore.searchQuery"
-        type="search"
         size="sm"
         placeholder="Поиск по названию или slug"
         aria-label="Поиск по комнатам"

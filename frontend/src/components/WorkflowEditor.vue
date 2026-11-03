@@ -2,6 +2,8 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import AppCheckbox from './ui/AppCheckbox.vue'
 import AppInput from './ui/AppInput.vue'
+import AppNumber from './ui/AppNumber.vue'
+import AppPassword from './ui/AppPassword.vue'
 import AppSelect from './ui/AppSelect.vue'
 import AppSpinner from './ui/AppSpinner.vue'
 import AppTextarea from './ui/AppTextarea.vue'
@@ -808,12 +810,11 @@ async function check() {
                   <span class="mb-1.5 block text-[11px] text-ink-mute">
                     Таймаут, секунд (пусто — как у сервера)
                   </span>
-                  <AppInput
+                  <AppNumber
                     v-model.number="action.timeout"
                     size="sm"
-                    type="number"
-                    min="0"
-                    max="60"
+                    :min="0"
+                    :max="60"
                     placeholder="8"
                     aria-label="Таймаут пересылки"
                   />
@@ -884,13 +885,13 @@ async function check() {
                       <code class="font-mono text-ink-soft">X-Hookdock-Signature</code> (HMAC-SHA256 тела).
                     </template>
                   </p>
-                  <AppInput
+                  <AppPassword
                     v-model="action.secret"
                     size="sm"
-                    type="password"
-                    class="mt-2 font-mono"
+                    class="mt-2"
                     :placeholder="action.signed ? 'оставьте пустым, чтобы сохранить' : 'секрет получателя'"
                     :disabled="action.clearSignature"
+                    aria-label="Секрет подписи"
                   />
 
                   <div class="mt-2">
@@ -960,7 +961,7 @@ async function check() {
               <div v-else-if="action.type === 'delay'" class="mt-3 space-y-2">
                 <label class="block">
                   <span class="mb-1.5 block text-xs font-medium text-ink-soft">Подождать, секунд</span>
-                  <AppInput v-model.number="action.seconds" size="sm" type="number" min="1" max="86400" />
+                  <AppNumber v-model.number="action.seconds" size="sm" :min="1" :max="86400" aria-label="Пауза в секундах" />
                 </label>
                 <p class="text-[11px] text-ink-mute">
                   Остальные действия выполнятся позже. Пауза не расходует попытки и не повторяется при
@@ -1050,7 +1051,7 @@ async function check() {
             <div class="grid gap-3 sm:grid-cols-2">
               <label class="block">
                 <span class="mb-1.5 block text-xs font-medium text-ink-soft">Приоритет</span>
-                <AppInput v-model.number="form.priority" type="number" min="0" max="1000" />
+                <AppNumber v-model.number="form.priority" :min="0" :max="1000" aria-label="Приоритет сценария" />
               </label>
               <div class="self-end">
                 <AppCheckbox v-model="form.enabled" label="Сценарий активен" />

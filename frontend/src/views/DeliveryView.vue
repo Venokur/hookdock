@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
 import AppInput from '../components/ui/AppInput.vue'
+import AppFilePicker from '../components/ui/AppFilePicker.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import { api } from '../api/client'
 import { confirm, notify } from '../composables/dialog'
@@ -22,7 +23,6 @@ const loading = ref(false)
 const error = ref('')
 const resetting = ref('')
 
-const fileInput = ref(null)
 const importing = ref(false)
 const exporting = ref(false)
 
@@ -151,10 +151,6 @@ async function exportRules() {
   }
 }
 
-function pickFile() {
-  fileInput.value?.click()
-}
-
 /**
  * Imports into this room only.
  *
@@ -163,10 +159,7 @@ function pickFile() {
  * the file is what the operator drags in. Rules are created, never replaced — the
  * import cannot delete a scenario.
  */
-async function onFileChosen(event) {
-  const file = event.target.files?.[0]
-  event.target.value = ''
-
+async function onFileChosen(file) {
   if (!file || !roomId.value) {
     return
   }
@@ -385,22 +378,18 @@ onUnmounted(() => {
             </p>
           </div>
 
-          <div class="flex shrink-0 items-center gap-2">
-            <input
-              ref="fileInput"
-              type="file"
-              accept="application/json,.json"
-              class="hidden"
-              @change="onFileChosen"
-            />
+          <div class="flex shrink-0 flex-wrap items-center gap-2">
             <button type="button" class="btn" :disabled="exporting || !roomId" @click="exportRules">
               <AppSpinner v-if="exporting" size="xs" />
               {{ exporting ? 'Готовим файл…' : 'Скачать JSON' }}
             </button>
-            <button type="button" class="btn-primary" :disabled="importing || !roomId" @click="pickFile">
-              <AppSpinner v-if="importing" size="xs" />
-              {{ importing ? 'Импортируем…' : 'Импортировать' }}
-            </button>
+            <AppFilePicker
+              accept="application/json,.json"
+              variant="primary"
+              :label="importing ? 'Импортируем…' : 'Импортировать'"
+              :disabled="importing || !roomId"
+              @change="onFileChosen"
+            />
           </div>
         </div>
 

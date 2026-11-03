@@ -5,6 +5,7 @@ import AppShell from '../components/AppShell.vue'
 import MethodBadge from '../components/MethodBadge.vue'
 import RequestDetail from '../components/RequestDetail.vue'
 import AppInput from '../components/ui/AppInput.vue'
+import AppDatePicker from '../components/ui/AppDatePicker.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import AppCheckbox from '../components/ui/AppCheckbox.vue'
@@ -148,7 +149,9 @@ const methodOptions = methods.map((method) => ({
 /**
  * Time presets are turned into `from` here, not on the server: "24 часа" means
  * the last 24 hours from now, and the API already accepts an absolute date.
- * `custom` passes the two datetime-local fields as-is.
+ * `custom` passes the two picked values as-is: the app's own calendar
+ * (`AppDatePicker`) keeps them in the `YYYY-MM-DDTHH:mm` shape the native
+ * `datetime-local` produced, so this code did not have to change with it.
  */
 const PERIOD_HOURS = { '1h': 1, '24h': 24, '7d': 168, '30d': 720 }
 const periodOptions = [
@@ -1289,18 +1292,21 @@ onUnmounted(() => {
         />
 
         <template v-if="filters.period === 'custom'">
-          <AppInput
+          <AppDatePicker
             v-model="filters.from"
-            type="datetime-local"
+            with-time
             size="sm"
+            placeholder="Начало периода"
             aria-label="Начало периода"
             class="w-full sm:w-52"
           />
-          <AppInput
+          <AppDatePicker
             v-model="filters.to"
-            type="datetime-local"
+            with-time
             size="sm"
+            placeholder="Конец периода"
             aria-label="Конец периода"
+            :min="filters.from"
             class="w-full sm:w-52"
           />
         </template>
@@ -1320,9 +1326,10 @@ onUnmounted(() => {
 
         <AppInput
           v-model="filters.q"
-          type="search"
           size="sm"
+          clearable
           placeholder="Поиск по пути, телу или заголовкам…"
+          aria-label="Поиск по запросам"
           class="min-w-0 flex-1 basis-40"
         />
 

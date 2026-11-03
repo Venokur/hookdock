@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import AppShell from '../components/AppShell.vue'
+import AppDatePicker from '../components/ui/AppDatePicker.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
@@ -77,7 +78,7 @@ async function issue() {
     const data = await api.createToken({
       name: form.value.name.trim(),
       scope: form.value.scope,
-      // The date input yields `YYYY-MM-DD`; an empty value means "does not
+      // The calendar yields `YYYY-MM-DD`; an empty value means "does not
       // expire", which the server spells as `null` and not as a far-future date.
       expires_at: form.value.expires_at || null,
     })
@@ -241,7 +242,7 @@ onMounted(() => {
 
           <label class="block">
             <span class="mb-1.5 block text-xs font-medium text-ink-soft">Истекает</span>
-            <AppInput v-model="form.expires_at" type="date" />
+            <AppDatePicker v-model="form.expires_at" placeholder="Без срока" aria-label="Дата истечения" />
           </label>
         </div>
 

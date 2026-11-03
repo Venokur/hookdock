@@ -387,6 +387,8 @@ onBeforeUnmount(() => {
             role="searchbox"
             :placeholder="props.searchPlaceholder"
             aria-label="Поиск по значениям"
+            autocomplete="off"
+            spellcheck="false"
             class="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 pr-7 text-xs text-ink outline-none transition
               placeholder:text-ink-mute focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15"
             @input="onSearchInput($event.target.value)"

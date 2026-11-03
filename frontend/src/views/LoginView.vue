@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ThemeToggle from '../components/ThemeToggle.vue'
 import AppInput from '../components/ui/AppInput.vue'
+import AppPassword from '../components/ui/AppPassword.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import { api } from '../api/client'
 import { useAuthStore } from '../stores/auth'
@@ -46,9 +47,31 @@ async function signIn(email, password) {
 }
 
 async function submit() {
+  error.value = ''
+
+  // Validated here rather than with the browser's own bubble: a native
+  // `required`/`type=email` pair draws an OS popup in the system font that
+  // ignores both themes, and it fires before the form's own error line.
+  const email = form.email.trim()
+
+  if (!email) {
+    error.value = 'Введите email.'
+    return
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    error.value = 'Email выглядит неполным — нужен вид name@domain.ru.'
+    return
+  }
+
+  if (!form.password) {
+    error.value = 'Введите пароль.'
+    return
+  }
+
   loading.value = true
   try {
-    await signIn(form.email.trim(), form.password)
+    await signIn(email, form.password)
   } finally {
     loading.value = false
   }
@@ -111,24 +134,23 @@ async function demoSignIn() {
           <h2 class="text-2xl font-semibold text-ink">Вход</h2>
           <p class="mt-1 text-sm text-ink-soft">Используйте аккаунт администратора, созданный при первом запуске.</p>
 
-          <form class="mt-7 space-y-4" @submit.prevent="submit">
+          <form class="mt-7 space-y-4" novalidate @submit.prevent="submit">
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-ink-soft">Email</span>
               <AppInput
                 v-model="form.email"
                 type="email"
                 autocomplete="username"
-                required
+                aria-label="Email"
               />
             </label>
 
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-ink-soft">Пароль</span>
-              <AppInput
+              <AppPassword
                 v-model="form.password"
-                type="password"
                 autocomplete="current-password"
-                required
+                aria-label="Пароль"
               />
             </label>
 
