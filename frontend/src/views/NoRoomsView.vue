@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import AppShell from '../components/AppShell.vue'
+import BrandMark from '../components/BrandMark.vue'
 import RoomFormModal from '../components/RoomFormModal.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import { rememberRoom, useRoomsStore } from '../stores/rooms'
@@ -36,9 +37,7 @@ async function onSaved(room) {
 <template>
   <AppShell>
     <div class="mx-auto flex max-w-2xl flex-col items-center justify-center py-16 text-center">
-      <div class="grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-indigo-500 to-sky-500 text-lg font-bold text-white shadow-lg shadow-indigo-500/25">
-        H
-      </div>
+      <BrandMark size="lg" />
 
       <!-- An unreachable API is not an empty installation: say so instead of
            inviting the user to create a room that already exists. -->

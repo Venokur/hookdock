@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f7fb" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#020617" media="(prefers-color-scheme: dark)" />
+    <!-- The SVG is the one the browser uses when it can render it; the ICO is
+         for the rest. Both are generated from the same geometry as BrandMark,
+         so the tab, the sidebar and the splash cannot drift apart. -->
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <title>Hookdock — вебхук-роутер</title>
     <script>
       try {
@@ -79,9 +87,12 @@
         border-radius: 14px;
         background-image: linear-gradient(135deg, #6366f1, #0ea5e9);
         color: #fff;
-        font-size: 18px;
-        font-weight: 700;
         box-shadow: 0 12px 30px rgba(99, 102, 241, 0.35);
+      }
+
+      .splash-mark svg {
+        width: 26px;
+        height: 26px;
       }
 
       .splash-title {
@@ -130,7 +141,13 @@
          that it is meant to cover. -->
     <div id="splash" role="status" aria-live="polite">
       <div class="splash-stack">
-        <div class="splash-mark" aria-hidden="true">H</div>
+        <div class="splash-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 16h5.2" />
+            <path d="M13.2 16A5.2 5.2 0 0 0 18.4 10.8H23.6" />
+            <path d="M13.2 16A5.2 5.2 0 0 1 18.4 21.2H23.6" />
+          </svg>
+        </div>
         <p class="splash-title">Hookdock</p>
         <div class="splash-ring" aria-hidden="true"></div>
         <p class="splash-hint">Загрузка интерфейса…</p>

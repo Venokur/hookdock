@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ThemeToggle from '../components/ThemeToggle.vue'
+import BrandMark from '../components/BrandMark.vue'
 import AppInput from '../components/ui/AppInput.vue'
 import AppPassword from '../components/ui/AppPassword.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
@@ -97,9 +98,7 @@ async function demoSignIn() {
 
     <section class="grid-glow relative hidden flex-col justify-between border-r border-line p-12 lg:flex">
       <div class="flex items-center gap-3">
-        <div class="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-sky-500 font-bold text-white shadow-lg shadow-indigo-500/30">
-          H
-        </div>
+        <BrandMark size="md" />
         <span class="text-lg font-semibold text-ink">Hookdock</span>
       </div>
 
@@ -126,8 +125,8 @@ async function demoSignIn() {
     <section class="flex items-center justify-center px-6 py-16">
       <div class="w-full max-w-sm">
         <div class="mb-8 lg:hidden">
-          <div class="mb-3 grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-sky-500 font-bold text-white">H</div>
-          <p class="text-lg font-semibold text-ink">Hookdock</p>
+          <BrandMark size="md" />
+          <p class="mt-3 text-lg font-semibold text-ink">Hookdock</p>
         </div>
 
         <div class="card p-7">

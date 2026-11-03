@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import RoomList from './RoomList.vue'
 import ThemeToggle from './ThemeToggle.vue'
+import BrandMark from './BrandMark.vue'
 import { useAuthStore } from '../stores/auth'
 import { useRoomsStore } from '../stores/rooms'
 
@@ -51,9 +52,7 @@ function logout() {
     <aside class="sticky top-0 hidden h-screen w-72 shrink-0 flex-col overflow-y-auto border-r border-line bg-surface p-5 lg:flex">
       <div class="flex items-center justify-between gap-2">
         <div class="flex items-center gap-2.5">
-          <div class="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-sky-500 text-sm font-bold text-white shadow-lg shadow-indigo-500/25">
-            H
-          </div>
+          <BrandMark size="md" />
           <div>
             <p class="text-sm font-semibold text-ink">Hookdock</p>
             <p class="text-[11px] uppercase tracking-wider text-ink-mute">вебхук-роутер</p>
@@ -94,7 +93,7 @@ function logout() {
       <header class="border-b border-line bg-surface/90 px-4 py-3 backdrop-blur lg:hidden">
         <div class="flex items-center justify-between gap-3">
           <div class="flex min-w-0 items-center gap-2">
-            <div class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-sky-500 text-xs font-bold text-white">H</div>
+            <BrandMark size="sm" />
             <span class="truncate text-sm font-semibold text-ink">{{ currentRoom?.name || 'Hookdock' }}</span>
           </div>
           <div class="flex shrink-0 items-center gap-1">
