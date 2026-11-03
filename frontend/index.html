@@ -11,9 +11,131 @@
           document.documentElement.classList.add('dark')
         }
       } catch (e) {}
+
+      // Stamped here, in the head, because this is the closest moment to the
+      // splash being painted that the bundle can observe. main.js measures its
+      // minimum against it instead of against navigation start: on a slow load
+      // the HTML itself can arrive after 350 ms, and the splash would then be
+      // dismissed in the same frame it appeared.
+      window.__splashAt = performance.now()
     </script>
+    <style>
+      /*
+       * The boot splash carries its own styles on purpose: it has to be painted
+       * from the first HTML byte, so it cannot borrow anything from main.css or
+       * from the entry chunk — by the time either arrives, the screen it exists
+       * to cover is already over. The colours are the same tokens, copied.
+       */
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        background-color: #f5f7fb;
+      }
+
+      #splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #f5f7fb;
+        color: #0f172a;
+        font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        transition: opacity 180ms ease;
+      }
+
+      html.dark body,
+      html.dark #splash {
+        background-color: #020617;
+      }
+
+      html.dark #splash {
+        color: #e2e8f0;
+      }
+
+      #splash.is-done {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .splash-stack {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .splash-mark {
+        display: grid;
+        place-items: center;
+        width: 44px;
+        height: 44px;
+        border-radius: 14px;
+        background-image: linear-gradient(135deg, #6366f1, #0ea5e9);
+        color: #fff;
+        font-size: 18px;
+        font-weight: 700;
+        box-shadow: 0 12px 30px rgba(99, 102, 241, 0.35);
+      }
+
+      .splash-title {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+      }
+
+      .splash-ring {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        border: 2px solid currentColor;
+        border-top-color: transparent;
+        opacity: 0.5;
+        animation: splash-spin 700ms linear infinite;
+      }
+
+      .splash-hint {
+        margin: 0;
+        font-size: 12px;
+        opacity: 0.65;
+      }
+
+      @keyframes splash-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* A spinner that keeps spinning is exactly what this setting asks us not to do. */
+      @media (prefers-reduced-motion: reduce) {
+        #splash {
+          transition: none;
+        }
+
+        .splash-ring {
+          animation: none;
+        }
+      }
+    </style>
   </head>
   <body class="h-full">
+    <!-- Plain markup, removed by main.js once the first route is actually
+         renderable. A splash rendered *by* Vue would appear after the bundle
+         that it is meant to cover. -->
+    <div id="splash" role="status" aria-live="polite">
+      <div class="splash-stack">
+        <div class="splash-mark" aria-hidden="true">H</div>
+        <p class="splash-title">Hookdock</p>
+        <div class="splash-ring" aria-hidden="true"></div>
+        <p class="splash-hint">Загрузка интерфейса…</p>
+      </div>
+    </div>
     <div id="app" class="h-full"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
