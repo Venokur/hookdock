@@ -20,6 +20,14 @@
         }
       } catch (e) {}
 
+      // The app behind the splash is already taller than the viewport, so the page
+      // got its scrollbar while the splash was still covering it: the scrollbar
+      // appeared, the splash (a fixed box centred in the shrunken viewport) shifted
+      // sideways, and a wheel over the splash scrolled the page underneath it.
+      // The lock is set here, before the first paint, and main.js removes it when
+      // the splash is actually gone — not when it starts fading.
+      document.documentElement.classList.add('splash-lock')
+
       // Stamped here, in the head, because this is the closest moment to the
       // splash being painted that the bundle can observe. main.js measures its
       // minimum against it instead of against navigation start: on a slow load
@@ -37,6 +45,18 @@
       html,
       body {
         height: 100%;
+      }
+
+      /*
+       * Scroll is held back until the splash is gone. `scrollbar-gutter: stable` is
+       * not an option: it would reserve the strip for the whole session, and the
+       * log page needs the width. Locking and unlocking once is the transition the
+       * splash exists to hide — and `overflow: hidden` on the root is what also
+       * stops a wheel over the splash from scrolling the page behind it.
+       */
+      html.splash-lock,
+      html.splash-lock body {
+        overflow: hidden;
       }
 
       body {

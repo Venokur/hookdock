@@ -26,17 +26,26 @@ use App\Support\JsonColumns;
  */
 final class AuditController
 {
-    /** Actions the SPA offers as a filter; the API accepts any of them. */
+    /**
+     * Actions the SPA offers as a filter; the API accepts any of them.
+     *
+     * This list is the dropdown, so an action missing here is an entry the operator
+     * can neither name nor filter by — `workflow.run_now` and both `token.*` were
+     * recorded with no way to select them. Keep it in step with every
+     * `Audit::record()` call, and with `actionLabels` in `AuditView.vue`, which turns
+     * these identifiers into Russian.
+     */
     private const ACTIONS = [
         'room.created', 'room.updated', 'room.deleted',
         'room.secret_issued', 'room.secret_cleared',
         'workflow.created', 'workflow.updated', 'workflow.deleted',
         'workflow.toggled', 'workflow.duplicated', 'workflow.imported',
-        'workflow.rolled_back',
+        'workflow.rolled_back', 'workflow.run_now',
         'request.deleted', 'request.replayed', 'run.retried',
         'request.redelivered', 'request.bulk_deleted', 'request.bulk_replayed',
         'breaker.reset',
         'channel.created', 'channel.updated', 'channel.deleted', 'channel.tested',
+        'token.created', 'token.revoked',
         'user.created', 'user.updated', 'user.deleted', 'user.password_changed',
     ];
 

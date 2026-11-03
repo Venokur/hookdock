@@ -32,6 +32,7 @@ function dismissSplash() {
   const splash = document.getElementById('splash')
 
   if (!splash) {
+    unlockScroll()
     return
   }
 
@@ -40,8 +41,20 @@ function dismissSplash() {
 
   window.setTimeout(() => {
     splash.classList.add('is-done')
-    window.setTimeout(() => splash.remove(), SPLASH_FADE_MS)
+    window.setTimeout(() => {
+      splash.remove()
+      unlockScroll()
+    }, SPLASH_FADE_MS)
   }, Math.max(0, rest))
+}
+
+/**
+ * The scrollbar is released only once the splash is actually gone. Releasing it
+ * at the start of the fade would put the bar back next to a still-visible splash
+ * — the same shift the lock exists to prevent, just 180 ms later.
+ */
+function unlockScroll() {
+  document.documentElement.classList.remove('splash-lock')
 }
 
 // A failed navigation must still reveal the page (it renders its own error and

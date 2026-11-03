@@ -31,6 +31,10 @@ const filters = ref({ action: '', actor: '', q: '' })
 const meta = ref({ page: 1, per_page: 25, total: 0, pages: 1, actions: [] })
 
 // Actions are grouped for the dropdown: a flat list of twenty values is a wall.
+// Every `Audit::record()` action in `backend/src/Controllers` must appear here, or
+// the filter offers a raw `request.bulk_replayed` and the entry title is an
+// identifier instead of a sentence. `scripts/smoke.ps1` asserts a few of these
+// labels, but a new action is easy to add server-side alone — check this table.
 const actionLabels = {
   'room.created': 'Комната создана',
   'room.updated': 'Комната изменена',
@@ -44,14 +48,20 @@ const actionLabels = {
   'workflow.duplicated': 'Сценарий скопирован',
   'workflow.imported': 'Сценарии импортированы',
   'workflow.rolled_back': 'Сценарий откатан',
+  'workflow.run_now': 'Сценарий запущен вручную',
   'request.deleted': 'Запрос удалён',
   'request.replayed': 'Запрос маршрутизирован повторно',
+  'request.redelivered': 'Запрос доставлен заново',
+  'request.bulk_deleted': 'Запросы удалены пачкой',
+  'request.bulk_replayed': 'Запросы маршрутизированы пачкой',
   'run.retried': 'Запуск повторён',
   'breaker.reset': 'Сброшен предохранитель',
   'channel.created': 'Канал уведомлений создан',
   'channel.updated': 'Канал уведомлений изменён',
   'channel.deleted': 'Канал уведомлений удалён',
   'channel.tested': 'Канал уведомлений проверен',
+  'token.created': 'Токен API выдан',
+  'token.revoked': 'Токен API отозван',
   'user.created': 'Пользователь создан',
   'user.updated': 'Пользователь изменён',
   'user.deleted': 'Пользователь удалён',
@@ -210,6 +220,10 @@ function changeRows(entry) {
   }))
 }
 
+// Field names that can appear inside `changes` — one per `Audit::diff()` key and per
+// hand-written pair in the controllers. A missing entry here renders as the raw
+// column name in the middle of a Russian sentence, which is what the audit page
+// looked like before these were filled in.
 const fieldLabels = {
   name: 'название',
   slug: 'slug',
@@ -223,6 +237,7 @@ const fieldLabels = {
   dedup_header: 'заголовок дедупликации',
   require_timestamp: 'требовать время',
   has_secret: 'секрет подписи',
+  ip_allowlist: 'список IP',
   email: 'email',
   role: 'роль',
   password: 'пароль',
@@ -230,12 +245,18 @@ const fieldLabels = {
   created: 'создано',
   secrets_not_imported: 'подписей не перенесено',
   queued: 'в очереди',
+  skipped: 'пропущено',
+  count: 'записей',
+  replayed_from: 'копия запроса',
+  replaces: 'заменяет запуск',
+  scope: 'права токена',
+  expires_at: 'действует до',
+  revoked: 'отозван',
   kind: 'тип',
   notify_on_failure: 'сообщать о падениях',
   has_url: 'адрес задан',
   has_token: 'токен задан',
   chat_id: 'chat_id',
-  replaces: 'заменяет запуск',
 }
 
 function formatValue(value) {
@@ -260,6 +281,15 @@ function formatValue(value) {
   }
 
   return String(value)
+}
+
+// The actor's role is copied onto the entry at write time and arrives as the code
+// the API stores. Printed raw it read as `· admin` next to Russian text — the same
+// dictionary the users page uses keeps the two pages describing one thing.
+const roleLabels = {
+  admin: 'администратор',
+  editor: 'редактор',
+  viewer: 'наблюдатель',
 }
 
 const toneByAction = {
@@ -381,7 +411,7 @@ function actionTone(entry) {
               {{ formatTime(entry.created_at) }}
               <span class="text-ink-mute/70">({{ timeAgo(entry.created_at) }})</span>
               · {{ entry.actor_email || 'система' }}
-              <span v-if="entry.actor_role" class="font-mono">· {{ entry.actor_role }}</span>
+              <span v-if="entry.actor_role" class="font-mono">· {{ roleLabels[entry.actor_role] || entry.actor_role }}</span>
               <span v-if="entry.ip" class="font-mono">· {{ entry.ip }}</span>
             </p>
 
