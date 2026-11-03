@@ -85,14 +85,22 @@
         width: 44px;
         height: 44px;
         border-radius: 14px;
-        background-image: linear-gradient(135deg, #6366f1, #0ea5e9);
+        background-color: #0f172a;
         color: #fff;
-        box-shadow: 0 12px 30px rgba(99, 102, 241, 0.35);
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.35);
       }
 
       .splash-mark svg {
         width: 26px;
         height: 26px;
+      }
+
+      /* Graphite on a near-black dark page needs an edge, or the tile dissolves
+         into the splash background. */
+      html.dark .splash-mark {
+        outline: 1px solid rgba(148, 163, 184, 0.32);
+        outline-offset: -1px;
+        box-shadow: none;
       }
 
       .splash-title {
@@ -142,10 +150,10 @@
     <div id="splash" role="status" aria-live="polite">
       <div class="splash-stack">
         <div class="splash-mark" aria-hidden="true">
-          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 16h5.2" />
-            <path d="M13.2 16A5.2 5.2 0 0 0 18.4 10.8H23.6" />
-            <path d="M13.2 16A5.2 5.2 0 0 1 18.4 21.2H23.6" />
+          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="3.6" stroke-linecap="round">
+            <path d="M9.6 8v16" />
+            <path d="M22.4 8v16" />
+            <path d="M9.6 16h12.8" />
           </svg>
         </div>
         <p class="splash-title">Hookdock</p>

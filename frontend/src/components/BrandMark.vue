@@ -1,18 +1,23 @@
 <script setup>
 /**
- * The project mark: one line in, two out.
+ * The project mark: the letter H on a graphite tile.
  *
- * It replaced a bare "H" that had been copy-pasted into five places (each copy
- * drifting a little), and it is drawn rather than typed so the same shape reads
- * at 16px in a browser tab, at 18px in the mobile header and at 32px on the
- * empty state. The geometry is the one in `public/favicon.svg` — a trunk, a
- * split, and two branches — because the sidebar and the tab are the same logo
- * and a second, hand-tuned drawing would eventually disagree with the first.
+ * A monogram rather than a pictogram: the fork drawn earlier said "routing"
+ * more precisely, but it did not survive 16px in a browser tab without turning
+ * into a blob, and a wordmark that only works at 48px is not a favicon. The H
+ * is the product's initial and it keeps its shape at every size down to 16px.
  *
- * The gradient is the wrapper's Tailwind background, not an SVG `<defs>`: the
- * mark can appear twice on one page, and duplicate gradient ids resolve to the
- * first definition in the document — which breaks as soon as that first one is
- * inside a hidden container.
+ * The geometry is the one in `public/favicon.svg` — three capsules in a 32-unit
+ * box, stems at 9.6 and 22.4 from y=8 to y=24, crossbar at y=16 — so the tab,
+ * the sidebar and the splash are one drawing. Do not hand-tune a second copy:
+ * that is exactly how the five typed "H"s this replaced drifted apart.
+ *
+ * The tile colour is a flat token, not a gradient. Graphite is `#0f172a`, the
+ * same value as the light theme's `--ink`, so the mark belongs to the palette
+ * instead of fighting the status colours (green = success, red = failure).
+ * A wrapper class, not an SVG `<defs>`: the mark renders twice per page
+ * (sidebar + mobile header, one hidden by CSS), and a duplicated fill id would
+ * resolve to the first definition and break inside the hidden container.
  */
 const props = defineProps({
   size: { type: String, default: 'md' },
@@ -27,22 +32,21 @@ const sizes = {
 
 <template>
   <span
-    class="grid shrink-0 place-items-center bg-gradient-to-br from-indigo-500 to-sky-500 text-white shadow-lg shadow-indigo-500/25"
+    class="grid shrink-0 place-items-center bg-[#0f172a] text-white shadow-lg shadow-slate-900/25 ring-1 ring-inset ring-white/10"
     :class="sizes[props.size]?.box ?? sizes.md.box"
   >
     <svg
       viewBox="0 0 32 32"
       fill="none"
       stroke="currentColor"
-      stroke-width="3.4"
+      stroke-width="3.6"
       stroke-linecap="round"
-      stroke-linejoin="round"
       aria-hidden="true"
       :class="sizes[props.size]?.icon ?? sizes.md.icon"
     >
-      <path d="M8 16h5.2" />
-      <path d="M13.2 16A5.2 5.2 0 0 0 18.4 10.8H23.6" />
-      <path d="M13.2 16A5.2 5.2 0 0 1 18.4 21.2H23.6" />
+      <path d="M9.6 8v16" />
+      <path d="M22.4 8v16" />
+      <path d="M9.6 16h12.8" />
     </svg>
   </span>
 </template>
