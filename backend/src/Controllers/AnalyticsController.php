@@ -53,7 +53,7 @@ final class AnalyticsController
         $since = new \DateTimeImmutable('-' . $hours . ' hours', new \DateTimeZone('UTC'));
 
         $requestScope = $roomId === null ? '' : ' AND i.room_id = :room_id';
-        $runScope = $roomId === null ? '' : ' AND i.room_id = :room_id';
+        $runScope = $roomId === null ? '' : ' AND wr.room_id = :room_id';
         $bound = ['since' => $since->format('Y-m-d H:i:sP')] + ($roomId === null ? [] : ['room_id' => $roomId]);
 
         $requests = $this->requestTotals($pdo, $bound, $requestScope, $hours);
@@ -134,7 +134,6 @@ final class AnalyticsController
         $stmt = $pdo->prepare(
             "SELECT wr.status, count(*)::int AS total
                FROM workflow_runs wr
-               JOIN incoming_requests i ON i.id = wr.request_id
               WHERE wr.created_at >= :since" . $scope . '
               GROUP BY 1'
         );
@@ -174,7 +173,6 @@ final class AnalyticsController
                     COALESCE(max(s.duration_ms), 0)::int AS max_ms
                FROM workflow_run_steps s
                JOIN workflow_runs wr ON wr.id = s.run_id
-               JOIN incoming_requests i ON i.id = wr.request_id
               WHERE s.created_at >= :since" . $scope . '
               GROUP BY s.type
               ORDER BY total DESC, s.type'
@@ -212,14 +210,15 @@ final class AnalyticsController
      */
     private function timeline(\PDO $pdo, array $bound, ?int $roomId, int $hours, \DateTimeImmutable $since): array
     {
-        $scope = $roomId === null ? '' : ' AND i.room_id = :room_id';
+        $requestScope = $roomId === null ? '' : ' AND i.room_id = :room_id';
+        $runScope = $roomId === null ? '' : ' AND wr.room_id = :room_id';
 
         $requests = $pdo->prepare(
             "SELECT to_char(date_trunc('hour', i.received_at) AT TIME ZONE 'UTC',
                             'YYYY-MM-DD\"T\"HH24:00:00\"Z\"') AS hour,
                     count(*)::int AS total
                FROM incoming_requests i
-              WHERE i.received_at >= :since" . $scope . '
+              WHERE i.received_at >= :since" . $requestScope . '
               GROUP BY 1'
         );
         $requests->execute($bound);
@@ -231,8 +230,7 @@ final class AnalyticsController
                     count(*) FILTER (WHERE wr.status = 'failed')::int AS failed,
                     count(*) FILTER (WHERE wr.status = 'skipped')::int AS skipped
                FROM workflow_runs wr
-               JOIN incoming_requests i ON i.id = wr.request_id
-              WHERE wr.created_at >= :since" . $scope . '
+              WHERE wr.created_at >= :since" . $runScope . '
               GROUP BY 1'
         );
         $runs->execute($bound);

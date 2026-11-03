@@ -2005,6 +2005,57 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/workflows/{id}/run:
+    parameters:
+      - $ref: '#/components/parameters/WorkflowId'
+    post:
+      tags: [Workflows]
+      summary: Run a rule once, now
+      description: |
+        Queues one run immediately instead of waiting for a delivery or a cron slot.
+        This is how a scheduled rule is tested without waiting for its next slot,
+        and how a webhook rule is exercised while its source is still silent.
+
+        The run has **no request**: `request_id` is `null` and the payload is empty,
+        exactly what a scheduled fire sees. Conditions are therefore not evaluated —
+        a rule whose conditions would not match still runs, because there is nothing
+        to match them against.
+
+        `schedule_next_at` is **not** touched: a test must not move the real
+        schedule. A paused rule can still be run — the operator is asking whether it
+        works, and refusing would make them unpause a rule that is paused for a
+        reason. The answer is `202`; the worker does the work and publishes
+        `run.updated`.
+      responses:
+        '202':
+          description: The queued run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        description: The new `workflow_runs.id`.
+                      workflow_id:
+                        type: integer
+                      request_id:
+                        type: integer
+                        nullable: true
+                        description: Always `null` here.
+                      queued:
+                        type: integer
+                        description: Always `1`.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/workflows/{id}/versions:
     parameters:
       - $ref: '#/components/parameters/WorkflowId'
@@ -2795,6 +2846,13 @@ components:
           type: integer
         stop_processing:
           type: boolean
+        schedule_cron:
+          type: string
+          nullable: true
+          description: |
+            The trigger of that version. A rollback restores it, so restoring an
+            older snapshot cannot silently turn a scheduled rule back into a
+            webhook one; the next slot is then computed from now.
         actor_email:
           type: string
           description: Empty for a baseline row or a change made by a script.
@@ -3016,6 +3074,15 @@ components:
           type: integer
         request_id:
           type: integer
+          nullable: true
+          description: |
+            NULL for a run the rule started by itself — a cron slot or
+            «Запустить сейчас». Such a run has no stored delivery behind it, so
+            `method`/`path`/`endpoint` are empty too.
+        trigger_type:
+          type: string
+          enum: [webhook, schedule, manual]
+          description: What started the run. `webhook` is a delivery, `schedule` a cron slot.
         status:
           type: string
           enum: [pending, running, success, failed, skipped]
@@ -3043,10 +3110,13 @@ components:
           type: integer
         method:
           type: string
+          nullable: true
         path:
           type: string
+          nullable: true
         endpoint:
           type: string
+          nullable: true
         steps:
           type: integer
 
@@ -3469,6 +3539,24 @@ components:
             A **successful** run marks the request's other `pending` runs
             `skipped`, with a message naming this rule. `failed` and `skipped`
             never stop anything.
+        schedule_cron:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: |
+            Five-field cron expression in **UTC**. This field *is* the trigger
+            switch: set it and the rule fires on a schedule instead of on a
+            webhook; send `""` (or `null`) and it becomes a webhook rule again.
+
+            Supported: `*`, `n`, `a-b`, `*/n`, `a-b/n`, comma lists. No month or
+            weekday names, no `@daily`, `?`, `L`, `W` or `#`. `7` is Sunday.
+            When both day-of-month and day-of-week are restricted either may
+            match (standard cron). An expression that never fires
+            (`0 0 31 2 *`) is `422`.
+
+            A scheduled fire has no request: the body, headers and query are
+            empty and conditions are not evaluated. Missed slots are fired once —
+            the next slot is computed from now, not from the one that was missed.
         actions_version:
           type: integer
           description: |
@@ -3496,6 +3584,24 @@ components:
             condition_count:
               type: integer
               description: Leaf conditions, not groups.
+            trigger_type:
+              type: string
+              enum: [webhook, schedule]
+              description: Derived from `schedule_cron`; never stored twice.
+            schedule_next_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: |
+                The single queue the worker's scheduler reads. Recalculated on
+                save, on enabling the rule and on a version rollback; a manual
+                «Запустить сейчас» leaves it alone.
+            schedule_description:
+              type: string
+              nullable: true
+              description: |
+                One-line Russian reading of the expression («ежедневно в 09:00
+                UTC»). Present only for a scheduled rule.
             actions_version:
               type: integer
               description: |

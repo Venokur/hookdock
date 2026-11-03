@@ -8,6 +8,7 @@ import AppTextarea from './ui/AppTextarea.vue'
 import ConditionGroup from './ConditionGroup.vue'
 import JsonPathPicker from './JsonPathPicker.vue'
 import { api } from '../api/client'
+import { formatUtcTime } from '../utils/format'
 
 const props = defineProps({
   workflow: { type: Object, default: null },
@@ -84,6 +85,10 @@ function toForm(workflow) {
       // Version of the action list this editor loaded. Sent back on save so a
       // change made in another tab is refused instead of overwritten.
       actionsVersion: 0,
+      // A rule fires either on a webhook or on a schedule; `schedule_cron` is the
+      // switch on the server, and this flag is just how the editor shows it.
+      trigger: 'webhook',
+      scheduleCron: '',
       conditions: { mode: 'all', rules: [] },
       actions: [blankAction()],
     }
@@ -97,6 +102,8 @@ function toForm(workflow) {
     priority: Number(workflow.priority ?? 0),
     actionsVersion: Number(workflow.actions_version ?? 1),
     stopProcessing: Boolean(workflow.stop_processing),
+    trigger: workflow.trigger_type === 'schedule' ? 'schedule' : 'webhook',
+    scheduleCron: workflow.schedule_cron ?? '',
     conditions: toTree(workflow.conditions),
     actions: (workflow.actions ?? []).map((action) => {
       const base = blankAction(action.type)
@@ -164,6 +171,13 @@ const payloadOptions = [
 ]
 
 const conditionCount = computed(() => countLeaves(form.conditions))
+
+/**
+ * A scheduled rule has no payload, so its conditions can never match — the server
+ * evaluates an empty context. Showing the tree would invite the operator to write
+ * a filter that silently never passes, so the editor hides it and says why.
+ */
+const isScheduled = computed(() => form.trigger === 'schedule')
 
 function countLeaves(group) {
   return (group.rules ?? []).reduce(
@@ -277,6 +291,14 @@ function buildPayload() {
     return null
   }
 
+  // The API is the authority (it also refuses an expression that never fires), but
+  // an empty field must not travel as "no schedule": that would quietly save the
+  // rule as a webhook one and the operator would think it fires on a timer.
+  if (isScheduled.value && form.scheduleCron.trim() === '') {
+    error.value = 'Укажите cron-выражение, например 0 9 * * 1-5.'
+    return null
+  }
+
   const actions = []
 
   for (const action of form.actions) {
@@ -372,11 +394,16 @@ function buildPayload() {
     // sending `0` for it would look like a stale draft.
     actions_version: form.id ? form.actionsVersion : undefined,
     name: form.name.trim(),
+    // A scheduled rule has no endpoint to listen to, so the server keeps the old
+    // one untouched instead of letting an empty string match nothing.
     endpoint: form.endpoint.trim() || '*',
     enabled: form.enabled,
     priority: Math.min(1000, Math.max(0, Number(form.priority) || 0)),
     stop_processing: form.stopProcessing,
-    conditions: pruneTree(form.conditions, true),
+    // Empty string clears the schedule, which is how a rule goes back to being a
+    // webhook rule. The API treats `null`/`''` the same way.
+    schedule_cron: isScheduled.value ? form.scheduleCron.trim() : '',
+    conditions: isScheduled.value ? { mode: 'all', rules: [] } : pruneTree(form.conditions, true),
     actions,
   }
 }
@@ -498,23 +525,90 @@ async function check() {
             <h3 class="text-sm font-semibold text-ink">Триггер</h3>
           </div>
 
-          <div class="mt-3 grid gap-3 pl-8 sm:grid-cols-2">
-            <label class="block">
-              <span class="mb-1.5 block text-xs font-medium text-ink-soft">Название сценария</span>
-              <AppInput v-model="form.name" placeholder="Уведомления в Slack" />
-            </label>
+          <div class="mt-3 space-y-3 pl-8">
+            <div class="grid gap-3 sm:grid-cols-2">
+              <label class="block">
+                <span class="mb-1.5 block text-xs font-medium text-ink-soft">Название сценария</span>
+                <AppInput v-model="form.name" placeholder="Уведомления в Slack" />
+              </label>
 
-            <label class="block">
-              <span class="mb-1.5 block text-xs font-medium text-ink-soft">Slug эндпоинта</span>
-              <AppInput v-model="form.endpoint" placeholder="*" class="font-mono" />
-            </label>
+              <div class="block">
+                <span class="mb-1.5 block text-xs font-medium text-ink-soft">Когда запускать</span>
+                <div class="inline-flex rounded-xl border border-line bg-surface-2 p-1" role="group" aria-label="Триггер сценария">
+                  <button
+                    type="button"
+                    class="rounded-lg px-3 py-1.5 text-xs font-medium transition"
+                    :class="!isScheduled
+                      ? 'bg-surface text-ink shadow-sm'
+                      : 'text-ink-mute hover:text-ink'"
+                    :aria-pressed="!isScheduled"
+                    @click="form.trigger = 'webhook'"
+                  >
+                    Вебхук
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-lg px-3 py-1.5 text-xs font-medium transition"
+                    :class="isScheduled
+                      ? 'bg-surface text-ink shadow-sm'
+                      : 'text-ink-mute hover:text-ink'"
+                    :aria-pressed="isScheduled"
+                    @click="form.trigger = 'schedule'"
+                  >
+                    Расписание
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <template v-if="!isScheduled">
+              <label class="block">
+                <span class="mb-1.5 block text-xs font-medium text-ink-soft">Slug эндпоинта</span>
+                <AppInput v-model="form.endpoint" placeholder="*" class="font-mono" />
+              </label>
+
+              <p class="text-[11px] text-ink-mute">
+                Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты комнаты,
+                или конкретный slug. Адрес комнаты по умолчанию:
+                <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/{{ room?.endpoint || 'hook-…' }}</code>.
+              </p>
+            </template>
+
+            <template v-else>
+              <label class="block">
+                <span class="mb-1.5 block text-xs font-medium text-ink-soft">Cron-выражение</span>
+                <AppInput
+                  v-model="form.scheduleCron"
+                  placeholder="0 9 * * 1-5"
+                  class="font-mono sm:max-w-sm"
+                />
+              </label>
+
+              <p class="text-[11px] text-ink-mute">
+                Пять полей: минуты, часы, день месяца, месяц, день недели.
+                Время — <strong class="font-semibold text-ink-soft">UTC</strong>, поэтому «9:00» здесь —
+                это 12:00 по Москве. Примеры: <code class="font-mono text-ink-soft">*/15 * * * *</code> —
+                каждые 15 минут, <code class="font-mono text-ink-soft">0 9 * * 1-5</code> — по будням в 9:00.
+              </p>
+
+              <p
+                v-if="workflow?.schedule_description"
+                class="rounded-xl border border-line bg-surface-2 px-3 py-2 text-[11px] text-ink-soft"
+              >
+                Сейчас: {{ workflow.schedule_description }}
+                <template v-if="workflow.schedule_next_at">
+                  · следующий запуск {{ formatUtcTime(workflow.schedule_next_at) }} UTC
+                </template>
+              </p>
+
+              <p class="text-[11px] text-ink-mute">
+                Запуск по расписанию приходит без запроса: тело, заголовки и параметры пусты,
+                а в шаблоне доступны <code class="font-mono text-ink-soft">meta.workflow</code> и
+                <code class="font-mono text-ink-soft">meta.schedule</code>. Условия такому запуску
+                не нужны — они проверяются только у вебхуков.
+              </p>
+            </template>
           </div>
-
-          <p class="mt-2 pl-8 text-[11px] text-ink-mute">
-            Укажите <code class="font-mono text-ink-soft">*</code>, чтобы слушать все эндпоинты комнаты,
-            или конкретный slug. Адрес комнаты по умолчанию:
-            <code class="font-mono text-ink-soft">/api/webhook{{ room ? `/${room.slug}` : '' }}/{{ room?.endpoint || 'hook-…' }}</code>.
-          </p>
         </section>
 
         <section>
@@ -526,7 +620,7 @@ async function check() {
             </div>
           </div>
 
-          <div class="mt-3 pl-8">
+          <div v-if="!isScheduled" class="mt-3 pl-8">
             <ConditionGroup
               :group="form.conditions"
               :operators="operatorOptions"
@@ -537,6 +631,15 @@ async function check() {
               Условий: {{ conditionCount }} · вложенность: {{ MAX_DEPTH }} уровней
             </p>
           </div>
+
+          <p
+            v-else
+            class="mt-3 ml-8 rounded-xl border border-line bg-surface-2 px-3 py-2 text-[11px] text-ink-mute"
+          >
+            У запланированного сценария нет запроса, поэтому и условий нет: правило выполняется
+            на каждом слоте. Отбор по полям имеет смысл только для вебхуков — переключите триггер
+            выше, чтобы вернуть условия.
+          </p>
         </section>
 
         <section>
@@ -759,7 +862,7 @@ async function check() {
           </div>
         </section>
 
-        <section>
+        <section v-if="!isScheduled">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h3 class="text-sm font-semibold text-ink">Проверка</h3>

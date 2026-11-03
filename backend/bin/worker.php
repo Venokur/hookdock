@@ -128,10 +128,25 @@ function pruneIfDue(int $lastPrune): int
  * Publishes the outcome of one run so open tabs refresh without polling. Payloads
  * stay thin (ids only) — the SPA re-reads what it shows.
  *
+ * A scheduled run has no request, so `request.updated` is published only when one
+ * exists; `run.updated` always is, because the run journal has a row either way.
+ *
  * @param array<string, mixed> $run
  */
-function announce(array $run, int $requestId, int $roomId, string $status): void
+function announce(array $run, ?int $requestId, int $roomId, string $status): void
 {
+    Realtime::publish('run.updated', [
+        'room_id' => $roomId,
+        'run_id' => (int) $run['id'],
+        'workflow_id' => (int) $run['workflow_id'],
+        'status' => $status,
+        'request_id' => $requestId,
+    ]);
+
+    if ($requestId === null) {
+        return;
+    }
+
     Realtime::publish('request.updated', [
         'id' => $requestId,
         'room_id' => $roomId,
@@ -145,6 +160,21 @@ while ($running) {
     // the only query the idle loop runs. Retention is checked on every pass, not only
     // in the idle branch — a busy worker would otherwise never get to it.
     $lastPrune = pruneIfDue($lastPrune);
+
+    // Scheduled rules are fired from here rather than from a second process: one
+    // loop that owns the queue also owns the clock, so a run can never be queued by
+    // a scheduler that is down while the queue keeps draining. The call is a single
+    // index probe when nothing is due, and `--once` fires them too so a test can
+    // drain a due schedule without starting the daemon.
+    try {
+        $fired = WorkflowEngine::fireDueSchedules();
+        if ($fired > 0) {
+            logLine(sprintf('scheduler queued %d run(s)', $fired));
+        }
+    } catch (Throwable $e) {
+        // A broken schedule must not stop webhook routing, which is the product.
+        logLine('scheduler failed: ' . $e->getMessage());
+    }
 
     // One upsert per pass with the number of runs just taken: an idle pass is
     // 250 ms, so `beat_at` tracks the process rather than the queue, and
@@ -162,7 +192,10 @@ while ($running) {
     }
 
     foreach ($runs as $run) {
-        $requestId = (int) $run['request_id'];
+        // A scheduled or manual run has no request; `room_id` lives on the run for
+        // exactly that reason, so the event and the log line never need a join.
+        $requestId = $run['request_id'] === null ? null : (int) $run['request_id'];
+        $roomId = (int) ($run['room_id'] ?? 0);
 
         try {
             $status = WorkflowEngine::execute($run);
@@ -173,12 +206,15 @@ while ($running) {
             continue;
         }
 
-        logLine(sprintf('run #%d (request #%d, attempt %d) → %s', (int) $run['id'], $requestId, (int) $run['attempts'], $status));
-
-        // `request.updated` is room-scoped so tabs of other rooms ignore it.
-        $roomStmt = Database::pdo()->prepare('SELECT room_id FROM incoming_requests WHERE id = :id');
-        $roomStmt->execute(['id' => $requestId]);
-        $roomId = (int) ($roomStmt->fetchColumn() ?: 0);
+        logLine(sprintf(
+            'run #%d (%s, attempt %d) → %s',
+            (int) $run['id'],
+            $requestId === null
+                ? 'no request / ' . (string) ($run['trigger_type'] ?? 'manual')
+                : 'request #' . $requestId,
+            (int) $run['attempts'],
+            $status,
+        ));
 
         announce($run, $requestId, $roomId, $status);
     }

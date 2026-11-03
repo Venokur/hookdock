@@ -1,0 +1,40 @@
+$kind: http-request
+name: Clear schedule
+method: PUT
+url: '{{base_url}}/api/workflows/{{scheduled_workflow_id}}'
+order: 2250
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman schedule rule",
+      "enabled": false,
+      "schedule_cron": "",
+      "actions": [
+        { "type": "log", "message": "scheduled tick" }
+      ]
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('scheduled_workflow_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // An empty string is how a rule goes back to being a webhook rule. It is left
+      // paused so a leftover `*` endpoint cannot start firing on the deliveries the
+      // later folders send.
+      pm.test('clearing the expression makes the rule a webhook rule', function () {
+        pm.response.to.have.status(200);
+        const rule = pm.response.json().data;
+        pm.expect(rule.trigger_type).to.eql('webhook');
+        pm.expect(rule.schedule_cron).to.eql(null);
+        pm.expect(rule.schedule_description).to.eql(null);
+      });

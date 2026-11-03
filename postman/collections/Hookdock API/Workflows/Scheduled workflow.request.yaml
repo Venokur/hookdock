@@ -1,0 +1,39 @@
+$kind: http-request
+name: Scheduled workflow
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 2100
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman schedule rule",
+      "enabled": true,
+      "schedule_cron": "*/15 * * * *",
+      "actions": [
+        { "type": "log", "message": "scheduled tick" }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `schedule_cron` is the trigger switch, not a second flag: a rule with it
+      // fires on a schedule and is never queued by a delivery. The server derives
+      // `trigger_type` and a Russian reading of the expression.
+      pm.test('a scheduled rule reports its trigger and next slot', function () {
+        pm.response.to.have.status(201);
+        const rule = pm.response.json().data;
+        pm.expect(rule.trigger_type).to.eql('schedule');
+        pm.expect(rule.schedule_cron).to.eql('*/15 * * * *');
+        pm.expect(rule.schedule_description).to.eql('каждые 15 мин.');
+        pm.expect(rule.schedule_next_at).to.be.a('string');
+      });
+      const rule = pm.response.json().data;
+      if (rule) {
+        pm.collectionVariables.set('scheduled_workflow_id', String(rule.id));
+      }

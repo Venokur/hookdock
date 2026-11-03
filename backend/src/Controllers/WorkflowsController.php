@@ -14,6 +14,7 @@ use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
 use App\Services\WorkflowHistory;
 use App\Support\Canonical;
+use App\Support\Cron;
 use App\Support\JsonColumns;
 use PDO;
 
@@ -94,7 +95,7 @@ final class WorkflowsController
 
         $id = (int) ($params['id'] ?? 0);
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
+            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing, schedule_cron)
              SELECT room_id,
                     left(name, 140) || \' (копия)\',
                     endpoint,
@@ -103,7 +104,8 @@ final class WorkflowsController
                     actions,
                     1,
                     priority,
-                    stop_processing
+                    stop_processing,
+                    schedule_cron
                FROM workflows
               WHERE id = :id
              RETURNING *'
@@ -142,14 +144,61 @@ final class WorkflowsController
         Response::json(['data' => $this->present($decoded)], 201);
     }
 
-    public function store(Request $request): void
+    /**
+     * Runs a rule once, right now, without waiting for a webhook or a slot.
+     *
+     * The run has no request, so the payload is empty and only `meta` describes the
+     * trigger — which is exactly what a scheduled rule sees. That makes this the
+     * way to test a scheduled rule without waiting for its next slot, and it leaves
+     * `schedule_next_at` alone: a test must not move the real schedule.
+     *
+     * A paused rule can still be run: the operator is asking "does this work", and
+     * refusing would leave them to unpause a rule that may be paused for a reason.
+     */
+    public function runNow(Request $request, array $params): void
     {
         Auth::requireUser($request, true);
+
+        $id = (int) ($params['id'] ?? 0);
+        $workflow = $this->find($id);
+        if ($workflow === null) {
+            Response::error('Сценарий не найден', 404);
+        }
+
+        $trigger = trim((string) ($workflow['schedule_cron'] ?? '')) === '' ? 'manual' : 'schedule';
+        $runId = WorkflowEngine::enqueueRun($id, null, (int) $workflow['room_id'], $trigger);
+
+        Realtime::publish('run.updated', [
+            'room_id' => (int) $workflow['room_id'],
+            'run_id' => $runId,
+            'workflow_id' => $id,
+            'status' => 'pending',
+            'request_id' => null,
+        ]);
+
+        Audit::record([
+            'action' => 'workflow.run_now',
+            'object_type' => 'workflow_run',
+            'object_id' => $runId,
+            'object_label' => '#' . $runId,
+            'room_id' => (int) $workflow['room_id'],
+            'room_slug' => $this->roomSlug((int) $workflow['room_id']),
+            'summary' => 'Ручной запуск сценария «' . $workflow['name'] . '»',
+            'changes' => [],
+        ], $request);
+
+        Response::json([
+            'data' => ['id' => $runId, 'workflow_id' => $id, 'request_id' => null, 'queued' => 1],
+        ], 202);
+    }
+
+    public function store(Request $request): void
+    {        Auth::requireUser($request, true);
         $workflow = $this->validated($request->json() ?? []);
 
         $stmt = Database::pdo()->prepare(
-            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
-             VALUES (:room_id, :name, :endpoint, :enabled, :conditions, :actions, :actions_version, :priority, :stop_processing)
+            'INSERT INTO workflows (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing, schedule_cron, schedule_next_at)
+             VALUES (:room_id, :name, :endpoint, :enabled, :conditions, :actions, :actions_version, :priority, :stop_processing, :schedule_cron, :schedule_next_at)
              RETURNING *'
         );
         $stmt->execute([
@@ -162,6 +211,8 @@ final class WorkflowsController
             'actions_version' => $workflow['actions_version'],
             'priority' => $workflow['priority'],
             'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
+            'schedule_cron' => $workflow['schedule_cron'],
+            'schedule_next_at' => $workflow['schedule_next_at'],
         ]);
 
         $row = JsonColumns::decode($stmt->fetch(), ['conditions', 'actions']);
@@ -223,6 +274,7 @@ final class WorkflowsController
                  conditions = :conditions, actions = :actions,
                  actions_version = :actions_version,
                  priority = :priority, stop_processing = :stop_processing,
+                 schedule_cron = :schedule_cron, schedule_next_at = :schedule_next_at,
                  updated_at = now()' . $reset . '
              WHERE id = :id
              RETURNING *'
@@ -237,6 +289,8 @@ final class WorkflowsController
             'actions_version' => $workflow['actions_version'],
             'priority' => $workflow['priority'],
             'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
+            'schedule_cron' => $workflow['schedule_cron'],
+            'schedule_next_at' => $workflow['schedule_next_at'],
         ]);
 
         $row = $stmt->fetch();
@@ -295,13 +349,26 @@ final class WorkflowsController
                     disabled_at = NULL,
                     updated_at = now()
               WHERE id = :id
-              RETURNING id, enabled, room_id'
+              RETURNING id, enabled, room_id, schedule_cron'
         );
         $stmt->execute(['id' => (int) ($params['id'] ?? 0)]);
         $row = $stmt->fetch();
 
         if ($row === false) {
             Response::error('Сценарий не найден', 404);
+        }
+
+        // Re-enabling a scheduled rule must not fire every slot it missed while
+        // paused: the next run is computed from now, exactly like a fresh save.
+        if (self::isTrue($row['enabled'] ?? false) && (string) ($row['schedule_cron'] ?? '') !== '') {
+            $next = Cron::nextAfter(
+                (string) $row['schedule_cron'],
+                new \DateTimeImmutable('now', new \DateTimeZone('UTC')),
+            );
+            $advance = Database::pdo()->prepare(
+                'UPDATE workflows SET schedule_next_at = :next WHERE id = :id'
+            );
+            $advance->execute(['next' => $next?->format('c'), 'id' => (int) $row['id']]);
         }
 
         Realtime::publish('workflow.changed', [
@@ -392,7 +459,7 @@ final class WorkflowsController
         $room = $this->requireRoom((int) ($params['id'] ?? 0));
 
         $stmt = Database::pdo()->prepare(
-            'SELECT name, endpoint, enabled, conditions, actions, priority, stop_processing
+            'SELECT name, endpoint, enabled, conditions, actions, priority, stop_processing, schedule_cron
                FROM workflows
               WHERE room_id = :room_id
               ORDER BY priority DESC, id'
@@ -407,6 +474,7 @@ final class WorkflowsController
                 'enabled' => self::isTrue($row['enabled'] ?? false),
                 'priority' => (int) $row['priority'],
                 'stop_processing' => self::isTrue($row['stop_processing'] ?? false),
+                'schedule_cron' => $row['schedule_cron'],
                 'conditions' => WorkflowEngine::normalizeTree($row['conditions'] ?? []),
                 'actions' => $this->redactActions($row['actions'] ?? []),
             ];
@@ -512,10 +580,10 @@ final class WorkflowsController
 
                 $insert = $pdo->prepare(
                     'INSERT INTO workflows
-                        (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing)
+                        (room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing, schedule_cron, schedule_next_at)
                      VALUES
-                        (:room_id, :name, :endpoint, :enabled, :conditions, :actions, 1, :priority, :stop_processing)
-                     RETURNING id, room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing'
+                        (:room_id, :name, :endpoint, :enabled, :conditions, :actions, 1, :priority, :stop_processing, :schedule_cron, :schedule_next_at)
+                     RETURNING id, room_id, name, endpoint, enabled, conditions, actions, actions_version, priority, stop_processing, schedule_cron, schedule_next_at'
                 );
                 $insert->execute([
                     'room_id' => $workflow['room_id'],
@@ -526,6 +594,8 @@ final class WorkflowsController
                     'actions' => $this->encode($workflow['actions']),
                     'priority' => $workflow['priority'],
                     'stop_processing' => $workflow['stop_processing'] ? 'true' : 'false',
+                    'schedule_cron' => $workflow['schedule_cron'],
+                    'schedule_next_at' => $workflow['schedule_next_at'],
                 ]);
 
                 $row = $insert->fetch();
@@ -596,7 +666,7 @@ final class WorkflowsController
 
         $stmt = Database::pdo()->prepare(
             'SELECT id, version, actions_version, name, endpoint, enabled, priority,
-                    stop_processing, actor_email, change, created_at
+                    stop_processing, schedule_cron, actor_email, change, created_at
                FROM workflow_versions
               WHERE workflow_id = :workflow_id
               ORDER BY version DESC
@@ -692,12 +762,26 @@ final class WorkflowsController
             $actionsVersion++;
         }
 
+        // The snapshot carries the trigger as well, so a rollback restores a rule
+        // that fired on a schedule as a scheduled rule. The next slot is computed
+        // from now: replaying every slot since the version was saved would be a
+        // burst, not a restore.
+        $schedule = trim((string) ($snapshot['schedule_cron'] ?? ''));
+        $schedule = $schedule === '' ? null : $schedule;
+        $scheduleNextAt = null;
+        if ($schedule !== null) {
+            $next = Cron::nextAfter($schedule, new \DateTimeImmutable('now', new \DateTimeZone('UTC')));
+            $scheduleNextAt = $next?->format('c');
+        }
+
         $stmt = Database::pdo()->prepare(
             'UPDATE workflows
                 SET name = :name, endpoint = :endpoint, enabled = :enabled,
                     conditions = :conditions, actions = :actions,
                     actions_version = :actions_version, priority = :priority,
-                    stop_processing = :stop_processing, updated_at = now()
+                    stop_processing = :stop_processing,
+                    schedule_cron = :schedule_cron, schedule_next_at = :schedule_next_at,
+                    updated_at = now()
               WHERE id = :id
               RETURNING *'
         );
@@ -713,6 +797,8 @@ final class WorkflowsController
             'actions_version' => $actionsVersion,
             'priority' => (int) $snapshot['priority'],
             'stop_processing' => self::isTrue($snapshot['stop_processing'] ?? false) ? 'true' : 'false',
+            'schedule_cron' => $schedule,
+            'schedule_next_at' => $scheduleNextAt,
         ]);
 
         $row = JsonColumns::decode($stmt->fetch(), ['conditions', 'actions']);
@@ -812,6 +898,13 @@ final class WorkflowsController
         $row['conditions'] = WorkflowEngine::normalizeTree($row['conditions'] ?? []);
         $row['actions'] = $this->redactActions($row['actions'] ?? []);
 
+        // `trigger_type` is derived, not stored twice: `schedule_cron` is the switch,
+        // and a second column would be one more thing to keep in sync.
+        $schedule = trim((string) ($row['schedule_cron'] ?? ''));
+        $row['schedule_cron'] = $schedule === '' ? null : $schedule;
+        $row['trigger_type'] = $schedule === '' ? 'webhook' : 'schedule';
+        $row['schedule_description'] = $schedule === '' ? null : Cron::describe($schedule);
+
         return $row;
     }
 
@@ -842,6 +935,9 @@ final class WorkflowsController
             ),
             'priority' => (int) ($row['priority'] ?? 0),
             'stop_processing' => self::isTrue($row['stop_processing'] ?? false),
+            'schedule_cron' => trim((string) ($row['schedule_cron'] ?? '')) === ''
+                ? null
+                : (string) $row['schedule_cron'],
             'actions_version' => (int) ($row['actions_version'] ?? 1),
         ];
     }
@@ -1087,6 +1183,53 @@ final class WorkflowsController
             Response::error('Slug эндпоинта должен быть не длиннее 160 символов', 422);
         }
 
+        // A rule fires either on a webhook or on a schedule, and `schedule_cron` is
+        // the switch — a second boolean would be one more thing to keep in sync.
+        // An empty value clears the schedule, which is how the editor turns a rule
+        // back into a webhook one.
+        //
+        // An **omitted** key keeps the stored expression, like every other delivery
+        // setting: a client that never knew about schedules must not turn a
+        // scheduled rule into a webhook one by renaming it.
+        $storedSchedule = trim((string) ($existing['schedule_cron'] ?? ''));
+        $storedSchedule = $storedSchedule === '' ? null : $storedSchedule;
+
+        if (array_key_exists('schedule_cron', $payload)) {
+            $schedule = trim((string) ($payload['schedule_cron'] ?? ''));
+            $schedule = $schedule === '' ? null : $schedule;
+        } else {
+            $schedule = $storedSchedule;
+        }
+
+        $scheduleNextAt = null;
+
+        if ($schedule !== null) {
+            // Recomputing an unchanged expression would move the slot on every
+            // rename; the stored one is already correct (and if it is in the past,
+            // the worker fires it once and moves on).
+            if ($schedule === $storedSchedule && !empty($existing['schedule_next_at'])) {
+                $scheduleNextAt = (string) $existing['schedule_next_at'];
+            } else {
+                if (!Cron::isValid($schedule)) {
+                    Response::error(
+                        'Расписание: нужно cron-выражение из 5 полей (минуты часы день месяц день недели), '
+                        . 'например 0 9 * * 1-5',
+                        422,
+                    );
+                }
+
+                // A well-formed expression can still never match — `0 0 31 2 *` is the
+                // classic. Refusing it here is better than storing a rule that sits in
+                // the scheduler forever and never fires.
+                $next = Cron::nextAfter($schedule, new \DateTimeImmutable('now', new \DateTimeZone('UTC')));
+                if ($next === null) {
+                    Response::error('Расписание не сработает ни разу: проверьте день и месяц', 422);
+                }
+
+                $scheduleNextAt = $next->format('c');
+            }
+        }
+
         $conditions = $this->validTree($payload['conditions'] ?? []);
         $count = WorkflowEngine::conditionCount($conditions);
         if ($count > self::MAX_CONDITIONS) {
@@ -1166,6 +1309,8 @@ final class WorkflowsController
             'actions_version' => $version,
             'priority' => $priority,
             'stop_processing' => (bool) ($payload['stop_processing'] ?? false),
+            'schedule_cron' => $schedule,
+            'schedule_next_at' => $scheduleNextAt,
         ];
     }
 

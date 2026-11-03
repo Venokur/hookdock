@@ -145,6 +145,7 @@ export const api = {
       : request('/api/workflows', { method: 'POST', body: workflow }),
   toggleWorkflow: (id) => request(`/api/workflows/${id}/toggle`, { method: 'POST' }),
   duplicateWorkflow: (id) => request(`/api/workflows/${id}/duplicate`, { method: 'POST' }),
+  runWorkflow: (id) => request(`/api/workflows/${id}/run`, { method: 'POST' }),
   exportRoomWorkflows: (id) => download(`/api/rooms/${id}/workflows/export`),
   importRoomWorkflows: (id, document) =>
     request(`/api/rooms/${id}/workflows/import`, { method: 'POST', body: document }),

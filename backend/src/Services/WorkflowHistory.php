@@ -49,11 +49,11 @@ final class WorkflowHistory
             $stmt = $pdo->prepare(
                 'INSERT INTO workflow_versions
                     (workflow_id, room_id, version, actions_version, name, endpoint, enabled,
-                     conditions, actions, priority, stop_processing, actor_id, actor_email, change)
+                     conditions, actions, priority, stop_processing, schedule_cron, actor_id, actor_email, change)
                  SELECT :workflow_id, w.room_id,
                         COALESCE((SELECT max(v.version) FROM workflow_versions v WHERE v.workflow_id = :workflow_id), 0) + 1,
                         w.actions_version, w.name, w.endpoint, w.enabled,
-                        w.conditions, w.actions, w.priority, w.stop_processing,
+                        w.conditions, w.actions, w.priority, w.stop_processing, w.schedule_cron,
                         :actor_id, :actor_email, :change
                    FROM workflows w
                   WHERE w.id = :workflow_id'

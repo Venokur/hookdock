@@ -1,0 +1,59 @@
+$kind: http-request
+name: Invalid cron is refused
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 2200
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman impossible schedule",
+      "enabled": false,
+      "schedule_cron": "0 0 31 2 *",
+      "actions": [
+        { "type": "log", "message": "never" }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `0 0 31 2 *` is well-formed and matches no date. Storing it would leave a
+      // rule that sits in the scheduler forever and never fires, so it is a 422
+      // rather than an accepted expression with a null next slot.
+      pm.test('an expression that never fires is refused', function () {
+        pm.response.to.have.status(422);
+      });
+
+      // A malformed field is a different failure: `61` is out of range, and a
+      // parser that silently clamps it would accept a schedule nobody wrote.
+      pm.sendRequest({
+        url: pm.variables.replaceIn('{{base_url}}/api/workflows'),
+        method: 'POST',
+        header: {
+          'Content-Type': 'application/json',
+          // `pm.sendRequest` does not inherit the collection's bearer auth, so the
+          // token has to be attached by hand — without it this answers 401 and the
+          // test would "pass" for the wrong reason if it asserted only non-201.
+          Authorization: 'Bearer ' + pm.collectionVariables.get('token')
+        },
+        body: {
+          mode: 'raw',
+          raw: JSON.stringify({
+            room: pm.collectionVariables.get('room_slug'),
+            name: 'Postman out-of-range schedule',
+            enabled: false,
+            schedule_cron: '61 * * * *',
+            actions: [{ type: 'log', message: 'never' }]
+          })
+        }
+      }, function (err, res) {
+        pm.test('an out-of-range field is refused', function () {
+          pm.expect(err).to.eql(null);
+          pm.expect(res.code).to.eql(422);
+        });
+      });

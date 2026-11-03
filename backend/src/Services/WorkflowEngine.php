@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Config;
 use App\Database;
+use App\Support\Cron;
 use App\Support\HttpClient;
 use App\Support\JsonPath;
 use App\Support\Signature;
@@ -52,7 +53,7 @@ final class WorkflowEngine
 
         $stmt = $pdo->prepare(
             'SELECT id, endpoint FROM workflows
-              WHERE enabled AND room_id = :room_id
+              WHERE enabled AND room_id = :room_id AND schedule_cron IS NULL
               ORDER BY priority DESC, id'
         );
         $stmt->execute(['room_id' => (int) ($request['room_id'] ?? 0)]);
@@ -69,15 +70,22 @@ final class WorkflowEngine
         }
 
         $values = [];
-        $params = ['request_id' => (int) $request['id']];
+        $params = [
+            'request_id' => (int) $request['id'],
+            'room_id' => (int) ($request['room_id'] ?? 0),
+        ];
 
         foreach ($ids as $index => $id) {
-            $values[] = sprintf('(:workflow_%d, :request_id, \'pending\')', $index);
+            $values[] = sprintf(
+                "(:workflow_%d, :request_id, :room_id, 'webhook', 'pending')",
+                $index,
+            );
             $params['workflow_' . $index] = $id;
         }
 
         $insert = $pdo->prepare(
-            'INSERT INTO workflow_runs (workflow_id, request_id, status) VALUES ' . implode(', ', $values)
+            'INSERT INTO workflow_runs (workflow_id, request_id, room_id, trigger_type, status) '
+            . 'VALUES ' . implode(', ', $values)
         );
         $insert->execute($params);
 
@@ -151,16 +159,103 @@ final class WorkflowEngine
      * row instead would make `succeededSteps()` skip the actions that worked in
      * the previous attempt, which is the opposite of what "повторить" means.
      */
-    public static function enqueueRun(int $workflowId, int $requestId): int
-    {
+    public static function enqueueRun(
+        int $workflowId,
+        ?int $requestId,
+        int $roomId,
+        string $triggerType = 'webhook',
+    ): int {
         $stmt = Database::pdo()->prepare(
-            "INSERT INTO workflow_runs (workflow_id, request_id, status)
-             VALUES (:workflow_id, :request_id, 'pending')
+            "INSERT INTO workflow_runs (workflow_id, request_id, room_id, trigger_type, status)
+             VALUES (:workflow_id, :request_id, :room_id, :trigger_type, 'pending')
              RETURNING id"
         );
-        $stmt->execute(['workflow_id' => $workflowId, 'request_id' => $requestId]);
+        $stmt->execute([
+            'workflow_id' => $workflowId,
+            'request_id' => $requestId,
+            'room_id' => $roomId,
+            'trigger_type' => $triggerType,
+        ]);
 
         return (int) $stmt->fetchColumn();
+    }
+
+    /**
+     * Queues every scheduled rule whose slot has come.
+     *
+     * A scheduled fire is a run without a request: the rule was started by its own
+     * schedule, not by a delivery, so there is no payload and `request_id` stays
+     * NULL. `FOR UPDATE SKIP LOCKED` keeps two workers from firing the same slot.
+     *
+     * A slot that came and went while the worker was down is fired **once**: the
+     * next slot is computed from *now*, not from the missed one. Catching up on
+     * every missed minute would turn a five-minute outage into a burst of hundreds
+     * of identical runs, and a periodic tick does not need every tick to exist.
+     *
+     * @return int number of runs queued
+     */
+    public static function fireDueSchedules(int $limit = 20): int
+    {
+        $pdo = Database::pdo();
+
+        // The cheap check first: an installation without schedules must not pay a
+        // transaction on every worker pass.
+        $probe = $pdo->query(
+            'SELECT 1 FROM workflows
+              WHERE enabled AND schedule_cron IS NOT NULL AND schedule_next_at <= now()
+              LIMIT 1'
+        );
+
+        if ($probe === false || $probe->fetchColumn() === false) {
+            return 0;
+        }
+
+        $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+        $queued = 0;
+
+        $pdo->beginTransaction();
+
+        try {
+            $stmt = $pdo->prepare(
+                'SELECT id, room_id, schedule_cron
+                   FROM workflows
+                  WHERE enabled AND schedule_cron IS NOT NULL AND schedule_next_at <= now()
+                  ORDER BY schedule_next_at, id
+                  LIMIT :limit
+                  FOR UPDATE SKIP LOCKED'
+            );
+            $stmt->bindValue(':limit', max(1, $limit), PDO::PARAM_INT);
+            $stmt->execute();
+            $due = $stmt->fetchAll();
+
+            $insert = $pdo->prepare(
+                "INSERT INTO workflow_runs (workflow_id, room_id, request_id, trigger_type, status)
+                 VALUES (:workflow_id, :room_id, NULL, 'schedule', 'pending')"
+            );
+            $advance = $pdo->prepare('UPDATE workflows SET schedule_next_at = :next WHERE id = :id');
+
+            foreach ($due as $workflow) {
+                $insert->execute([
+                    'workflow_id' => (int) $workflow['id'],
+                    'room_id' => (int) $workflow['room_id'],
+                ]);
+                $queued++;
+
+                $next = Cron::nextAfter((string) $workflow['schedule_cron'], $now);
+                $advance->execute([
+                    'next' => $next?->format('c'),
+                    'id' => (int) $workflow['id'],
+                ]);
+            }
+
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+
+            throw $e;
+        }
+
+        return $queued;
     }
 
     /**
@@ -192,7 +287,7 @@ final class WorkflowEngine
                      LIMIT :limit
                      FOR UPDATE SKIP LOCKED
               )
-              RETURNING id, workflow_id, request_id, attempts, deferrals"
+              RETURNING id, workflow_id, request_id, room_id, trigger_type, attempts, deferrals"
         );
         $stmt->bindValue(':worker', $workerId);
         $stmt->bindValue(':limit', max(1, $limit), PDO::PARAM_INT);
@@ -212,8 +307,10 @@ final class WorkflowEngine
         $runId = (int) $run['id'];
         $attempt = (int) $run['attempts'];
 
-        $request = self::loadRequest((int) $run['request_id']);
-        if ($request === null) {
+        $requestId = $run['request_id'] === null ? null : (int) $run['request_id'];
+        $request = $requestId === null ? null : self::loadRequest($requestId);
+
+        if ($requestId !== null && $request === null) {
             // The request was deleted while queued: nothing to route.
             self::finish($runId, 'skipped', 'Запрос удалён до выполнения');
 
@@ -227,7 +324,10 @@ final class WorkflowEngine
             return 'skipped';
         }
 
-        $context = self::context($request);
+        // A run without a request was started by the rule itself (schedule or a
+        // manual "run now"), so there is no payload. The trigger context keeps the
+        // template paths defined instead of making every `{{ body.x }}` a fatal.
+        $context = $request === null ? self::triggerContext($workflow) : self::context($request);
         $conditions = self::decodeNode($workflow['conditions'] ?? '[]');
         $actions = self::decode((string) $workflow['actions']);
 
@@ -311,9 +411,9 @@ final class WorkflowEngine
         // Done before `finish()` so the count lands in this run's message: the row
         // is already written by then, and a message appended afterwards would only
         // exist in this local variable.
-        if ($status === 'success' && self::isTrue($workflow['stop_processing'] ?? false)) {
+        if ($requestId !== null && $status === 'success' && self::isTrue($workflow['stop_processing'] ?? false)) {
             $stopped = self::skipPending(
-                (int) $run['request_id'],
+                $requestId,
                 $runId,
                 'остановлено сценарием «' . mb_substr((string) $workflow['name'], 0, 120) . '»',
             );
@@ -574,6 +674,39 @@ final class WorkflowEngine
                 'endpoint' => $request['endpoint'] ?? null,
                 'ip' => $request['ip'] ?? null,
                 'received_at' => $request['received_at'] ?? null,
+            ],
+        ];
+    }
+
+    /**
+     * The context of a run that has no stored request.
+     *
+     * A scheduled rule (or a manual "run now") has no payload, so every path a
+     * template reads is empty except `meta`, which describes the trigger itself.
+     * Conditions evaluated against this context simply fail — which is why the
+     * editor hides them for a scheduled rule instead of pretending they mean
+     * something.
+     *
+     * @param array<string, mixed> $workflow
+     * @return array<string, mixed>
+     */
+    private static function triggerContext(array $workflow): array
+    {
+        return [
+            'body' => [],
+            'raw' => '',
+            'headers' => [],
+            'query' => [],
+            'transformed' => [],
+            'meta' => [
+                'id' => null,
+                'method' => 'SCHEDULE',
+                'path' => '/schedule',
+                'endpoint' => 'schedule',
+                'ip' => null,
+                'received_at' => gmdate('Y-m-d\TH:i:s\Z'),
+                'workflow' => (string) ($workflow['name'] ?? ''),
+                'schedule' => (string) ($workflow['schedule_cron'] ?? ''),
             ],
         ];
     }

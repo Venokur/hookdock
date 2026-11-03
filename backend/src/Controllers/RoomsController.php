@@ -114,8 +114,7 @@ final class RoomsController
              LEFT JOIN LATERAL (
                  SELECT count(*) AS total
                  FROM workflow_runs wr
-                 JOIN incoming_requests i ON i.id = wr.request_id
-                 WHERE i.room_id = r.id
+                 WHERE wr.room_id = r.id
                    AND wr.status = 'failed'
                    AND wr.created_at >= now() - interval '24 hours'
              ) fail ON TRUE

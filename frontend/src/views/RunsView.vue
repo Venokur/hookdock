@@ -117,7 +117,9 @@ watch(slug, () => {
 async function retryRun(run) {
   const confirmed = await confirm({
     title: 'Повторить запуск?',
-    message: `Сценарий «${run.workflow_name}» будет выполнен заново для запроса #${run.request_id}. Прошлый запуск останется в журнале.`,
+    message: run.request_id === null
+      ? `Сценарий «${run.workflow_name}» будет выполнен заново без запроса. Прошлый запуск останется в журнале.`
+      : `Сценарий «${run.workflow_name}» будет выполнен заново для запроса #${run.request_id}. Прошлый запуск останется в журнале.`,
     confirmLabel: 'Повторить',
   })
 
@@ -144,6 +146,9 @@ onMounted(() => {
   offRealtime = [
     subscribe('request.updated', refreshSoon),
     subscribe('request.created', refreshSoon),
+    // A scheduled run has no request, so `request.updated` never fires for it and
+    // this list would sit on "в очереди" until the next reload.
+    subscribe('run.updated', refreshSoon),
     subscribe('workflow.changed', refreshSoon),
     subscribe('resync', refreshSoon),
   ]
@@ -234,6 +239,15 @@ onUnmounted(() => {
                 <span class="font-mono text-[11px] text-ink-mute">#{{ run.id }}</span>
                 <span class="truncate text-sm font-medium text-ink">{{ run.workflow_name }}</span>
                 <StatusPill :status="run.status" />
+                <!-- A run started by the rule itself has no delivery behind it; saying
+                     so here is what keeps the journal honest about why it happened. -->
+                <span
+                  v-if="run.trigger_type && run.trigger_type !== 'webhook'"
+                  class="rounded-full bg-ink/5 px-2 py-0.5 text-[10px] font-medium text-ink-soft ring-1 ring-inset ring-line"
+                  :title="run.trigger_type === 'schedule' ? 'Запуск по расписанию' : 'Ручной запуск'"
+                >
+                  {{ run.trigger_type === 'schedule' ? 'расписание' : 'вручную' }}
+                </span>
                 <span v-if="run.priority > 0" class="font-mono text-[10px] text-ink-mute">P{{ run.priority }}</span>
                 <span v-if="run.attempts > 1" class="text-[10px] text-ink-mute">попыток: {{ run.attempts }}</span>
               </div>
@@ -241,7 +255,12 @@ onUnmounted(() => {
               <p class="mt-1 break-words font-mono text-[11px] text-ink-mute">{{ run.message || '—' }}</p>
 
               <p class="mt-1 text-[11px] text-ink-mute">
-                запрос #{{ run.request_id }} · {{ run.method }} · {{ run.path }}
+                <template v-if="run.request_id !== null">
+                  запрос #{{ run.request_id }} · {{ run.method }} · {{ run.path }}
+                </template>
+                <template v-else>
+                  без запроса · {{ run.trigger_type === 'schedule' ? 'расписание' : 'ручной запуск' }}
+                </template>
                 · шагов: {{ run.steps }} · {{ formatTime(run.created_at) }}
                 <span class="text-ink-mute/70">({{ timeAgo(run.created_at) }})</span>
               </p>
@@ -249,6 +268,7 @@ onUnmounted(() => {
 
             <div class="flex shrink-0 items-center gap-1">
               <button
+                v-if="run.request_id !== null"
                 type="button"
                 class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink"
                 @click="openRequest(run)"

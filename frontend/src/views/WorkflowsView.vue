@@ -11,7 +11,7 @@ import { retain, subscribe } from '../composables/realtime'
 import { useRefresh } from '../composables/useRefresh'
 import { useAuthStore } from '../stores/auth'
 import { useRoomsStore } from '../stores/rooms'
-import { formatClock, timeAgo } from '../utils/format'
+import { formatClock, formatTime, formatUtcTime, timeAgo } from '../utils/format'
 
 const route = useRoute()
 const auth = useAuthStore()
@@ -30,6 +30,7 @@ const error = ref('')
 const editorOpen = ref(false)
 const editorWorkflow = ref(null)
 const copiedId = ref(null)
+const runningId = ref(null)
 
 // Version history panel: which rule, its versions, and the one being previewed.
 const historyOpen = ref(false)
@@ -255,6 +256,28 @@ async function duplicateWorkflow(workflow) {
   }
 }
 
+/**
+ * Queues one run right now, without waiting for a webhook or a slot.
+ *
+ * This is how a scheduled rule is tested: the run sees exactly what a real
+ * scheduled fire sees (an empty payload), and `schedule_next_at` is left alone, so
+ * a test does not move the real schedule. The answer is `202` — the worker does the
+ * work, and `run.updated` brings the outcome back into this list.
+ */
+async function runNow(workflow) {
+  runningId.value = workflow.id
+
+  try {
+    await api.runWorkflow(workflow.id)
+    notify(`«${workflow.name}» поставлен в очередь`, { tone: 'success' })
+    await load({ silent: true })
+  } catch (e) {
+    notify(e.message, { tone: 'error' })
+  } finally {
+    runningId.value = null
+  }
+}
+
 function webhookUrl(workflow) {
   const endpoint = workflow.endpoint === '*' ? roomEndpoint.value : workflow.endpoint
   const prefix = slug.value ? `/${slug.value}` : ''
@@ -353,12 +376,16 @@ onMounted(() => {
   load()
 
   const offChanged = subscribe('workflow.changed', onWorkflowChanged)
+  // A finished run changes "последний запуск" and the failure streak on the card,
+  // and a scheduled rule has no other signal that it fired at all.
+  const offRun = subscribe('run.updated', onWorkflowChanged)
   const offResync = subscribe('resync', refreshSoon)
 
   releaseLive = retain()
 
   offRealtime = () => {
     offChanged()
+    offRun()
     offResync()
   }
 })
@@ -551,8 +578,26 @@ onUnmounted(() => {
             </p>
 
             <div class="mt-4 rounded-xl border border-line bg-surface-2 px-3 py-2.5">
-              <p class="text-[10px] uppercase tracking-wider text-ink-mute">Триггер</p>
-              <div class="mt-1 flex items-center gap-2">
+              <p class="text-[10px] uppercase tracking-wider text-ink-mute">
+                {{ workflow.trigger_type === 'schedule' ? 'Расписание' : 'Триггер' }}
+              </p>
+
+              <!-- A scheduled rule has no address to copy: what the operator needs is
+                   the expression, its plain-language reading and when it fires next. -->
+              <template v-if="workflow.trigger_type === 'schedule'">
+                <div class="mt-1 flex flex-wrap items-center gap-2">
+                  <code class="font-mono text-[11px] text-ink-soft">{{ workflow.schedule_cron }}</code>
+                  <span class="text-[11px] text-ink-mute">{{ workflow.schedule_description }}</span>
+                </div>
+                <p class="mt-1 text-[11px] text-ink-mute">
+                  <template v-if="workflow.schedule_next_at">
+                    Следующий запуск {{ formatUtcTime(workflow.schedule_next_at) }} · UTC
+                  </template>
+                  <template v-else>Следующий запуск не запланирован — сценарий выключен.</template>
+                </p>
+              </template>
+
+              <div v-else class="mt-1 flex items-center gap-2">
                 <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-soft">
                   {{ triggerLabel(workflow) }}
                 </code>
@@ -578,6 +623,9 @@ onUnmounted(() => {
                     {{ chip.text }}
                   </span>
                 </div>
+                <p v-else-if="workflow.trigger_type === 'schedule'" class="mt-1 text-[11px] text-ink-mute">
+                  Без условий: запуск по расписанию приходит без запроса.
+                </p>
                 <p v-else class="mt-1 text-[11px] text-ink-mute">Срабатывает на каждый запрос.</p>
               </div>
 
@@ -608,6 +656,19 @@ onUnmounted(() => {
               </span>
 
               <div class="flex items-center gap-1">
+                <!-- Running a rule by hand is the only way to see a scheduled one work
+                     without waiting for its slot, and it is useful for a webhook rule
+                     whose source is not sending anything yet. -->
+                <button
+                  v-if="auth.canWrite"
+                  type="button"
+                  class="rounded-lg px-2 py-1 text-xs text-ink-soft transition hover:bg-surface-2 hover:text-ink disabled:opacity-50"
+                  :disabled="runningId === workflow.id"
+                  @click="runNow(workflow)"
+                >
+                  <AppSpinner v-if="runningId === workflow.id" size="xs" class="mr-1 inline" />
+                  {{ runningId === workflow.id ? 'Запускаем…' : 'Запустить сейчас' }}
+                </button>
                 <!-- History is readable by every role: seeing what changed is the
                      reason it is kept, and a viewer is exactly who needs it. -->
                 <button

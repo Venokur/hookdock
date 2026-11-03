@@ -119,6 +119,9 @@ $router->add('PUT', '/api/workflows/{id}', fn (Request $r, array $p) => $workflo
 $router->add('DELETE', '/api/workflows/{id}', fn (Request $r, array $p) => $workflows->destroy($r, $p));
 $router->add('POST', '/api/workflows/{id}/toggle', fn (Request $r, array $p) => $workflows->toggle($r, $p));
 $router->add('POST', '/api/workflows/{id}/duplicate', fn (Request $r, array $p) => $workflows->duplicate($r, $p));
+// A scheduled rule cannot be triggered by hand through a webhook, so "run now" is
+// how it is tested without waiting for its next slot.
+$router->add('POST', '/api/workflows/{id}/run', fn (Request $r, array $p) => $workflows->runNow($r, $p));
 // Saved configurations of one rule. Reads are open to every role; a rollback is a
 // write and passes the same `$write` flag as any other mutation.
 $router->add('GET', '/api/workflows/{id}/versions', fn (Request $r, array $p) => $workflows->versions($r, $p));

@@ -1,0 +1,27 @@
+$kind: http-request
+name: Run workflow now
+method: POST
+url: '{{base_url}}/api/workflows/{{scheduled_workflow_id}}/run'
+order: 2150
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // No captured rule means no run to queue; sending the placeholder would
+      // answer a 404 that says nothing about this endpoint.
+      if (!pm.collectionVariables.get('scheduled_workflow_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A scheduled rule cannot be triggered through a webhook, so this is how it
+      // is tested without waiting for its slot. The run has no request — there was
+      // no delivery — and `schedule_next_at` is deliberately left alone.
+      pm.test('run now queues a run without a request', function () {
+        pm.response.to.have.status(202);
+        const data = pm.response.json().data;
+        pm.expect(data.request_id).to.eql(null);
+        pm.expect(data.queued).to.eql(1);
+        pm.expect(data.id).to.be.a('number');
+      });

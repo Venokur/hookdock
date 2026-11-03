@@ -195,9 +195,7 @@ final class RequestsController
         // `room` narrows every counter to one room; without it the totals stay
         // installation-wide (the SPA always sends a room).
         $requestWhere = $roomId === null ? '' : ' WHERE room_id = :room_id';
-        $runScope = $roomId === null
-            ? ''
-            : ' AND request_id IN (SELECT id FROM incoming_requests WHERE room_id = :room_id)';
+        $runScope = $roomId === null ? '' : ' AND room_id = :room_id';
 
         $requestsStmt = $pdo->prepare(
             "SELECT count(*)::int AS total,
@@ -634,9 +632,8 @@ final class RequestsController
         $id = (int) ($params['id'] ?? 0);
 
         $stmt = Database::pdo()->prepare(
-            'SELECT wr.id, wr.status, wr.workflow_id, wr.request_id, i.room_id
+            'SELECT wr.id, wr.status, wr.workflow_id, wr.request_id, wr.room_id, wr.trigger_type
                FROM workflow_runs wr
-               JOIN incoming_requests i ON i.id = wr.request_id
               WHERE wr.id = :id'
         );
         $stmt->execute(['id' => $id]);
@@ -650,12 +647,30 @@ final class RequestsController
             Response::error('Запуск ещё выполняется, повторите позже', 422);
         }
 
-        $newId = WorkflowEngine::enqueueRun((int) $run['workflow_id'], (int) $run['request_id']);
+        $requestId = $run['request_id'] === null ? null : (int) $run['request_id'];
+        $newId = WorkflowEngine::enqueueRun(
+            (int) $run['workflow_id'],
+            $requestId,
+            (int) $run['room_id'],
+            (string) ($run['trigger_type'] ?? 'webhook'),
+        );
 
-        Realtime::publish('request.updated', [
-            'id' => (int) $run['request_id'],
+        Realtime::publish('run.updated', [
             'room_id' => (int) $run['room_id'],
+            'run_id' => $newId,
+            'workflow_id' => (int) $run['workflow_id'],
+            'status' => 'pending',
+            'request_id' => $requestId,
         ]);
+
+        // The requests page has no row to update for a scheduled run, so its event
+        // is only published when there is a request behind the run.
+        if ($requestId !== null) {
+            Realtime::publish('request.updated', [
+                'id' => $requestId,
+                'room_id' => (int) $run['room_id'],
+            ]);
+        }
 
         Audit::record([
             'action' => 'run.retried',
@@ -663,12 +678,14 @@ final class RequestsController
             'object_id' => $newId,
             'object_label' => '#' . $newId,
             'room_id' => (int) $run['room_id'],
-            'summary' => 'Повторный запуск сценария для запроса #' . $run['request_id'],
+            'summary' => $requestId === null
+                ? 'Повторный запуск сценария без запроса (#' . $newId . ')'
+                : 'Повторный запуск сценария для запроса #' . $requestId,
             'changes' => ['replaces' => [(int) $run['id'], $newId]],
         ], $request);
 
         Response::json([
-            'data' => ['id' => $newId, 'request_id' => (int) $run['request_id'], 'queued' => 1],
+            'data' => ['id' => $newId, 'request_id' => $requestId, 'queued' => 1],
         ], 202);
     }
 

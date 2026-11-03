@@ -34,6 +34,28 @@ export function formatTime(value) {
   })
 }
 
+/**
+ * UTC wall clock — a cron slot is defined in UTC, so printing it in the
+ * browser's zone while the label says «UTC» would name two different moments
+ * (`0 3 * * *` fires at 03:00 UTC, which is 06:00 in Moscow).
+ */
+export function formatUtcTime(value) {
+  const date = parseDate(value)
+
+  if (!date) {
+    return '—'
+  }
+
+  return date.toLocaleString('ru-RU', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZone: 'UTC',
+  })
+}
+
 /** Time only — used for "обновлено 12:34:56" next to a refresh button. */
 export function formatClock(value) {
   const date = parseDate(value)

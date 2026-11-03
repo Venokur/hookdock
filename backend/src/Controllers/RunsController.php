@@ -42,7 +42,7 @@ final class RunsController
             if ($room === null) {
                 Response::error('Комната не найдена: ' . $slug, 404);
             }
-            $where[] = 'i.room_id = :room_id';
+            $where[] = 'wr.room_id = :room_id';
             $params['room_id'] = $room['id'];
         }
 
@@ -66,7 +66,7 @@ final class RunsController
             // Same escaping rule as the request log: `%` and `_` are LIKE
             // metacharacters, and backslash is Postgres' default escape character.
             $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
-            $where[] = '(wr.message ILIKE :q_message OR w.name ILIKE :q_workflow OR i.path ILIKE :q_path)';
+            $where[] = '(wr.message ILIKE :q_message OR w.name ILIKE :q_workflow OR COALESCE(i.path, \'\') ILIKE :q_path)';
             $params['q_message'] = $like;
             $params['q_workflow'] = $like;
             $params['q_path'] = $like;
@@ -80,20 +80,21 @@ final class RunsController
             'SELECT count(*)
                FROM workflow_runs wr
                JOIN workflows w ON w.id = wr.workflow_id
-               JOIN incoming_requests i ON i.id = wr.request_id' . $clause
+               LEFT JOIN incoming_requests i ON i.id = wr.request_id' . $clause
         );
         $countStmt->execute($params);
         $total = (int) $countStmt->fetchColumn();
 
         $stmt = $pdo->prepare(
-            'SELECT wr.id, wr.workflow_id, wr.request_id, wr.status, wr.message, wr.attempts,
+            'SELECT wr.id, wr.workflow_id, wr.request_id, wr.room_id, wr.trigger_type,
+                    wr.status, wr.message, wr.attempts,
                     wr.deferrals, wr.created_at, wr.updated_at, wr.available_at,
                     w.name AS workflow_name, w.priority,
-                    i.room_id, i.method, i.path, i.endpoint,
+                    i.method, i.path, i.endpoint,
                     stats.steps
                FROM workflow_runs wr
                JOIN workflows w ON w.id = wr.workflow_id
-               JOIN incoming_requests i ON i.id = wr.request_id
+               LEFT JOIN incoming_requests i ON i.id = wr.request_id
                LEFT JOIN LATERAL (
                    SELECT count(*)::int AS steps FROM workflow_run_steps
                     WHERE run_id = wr.id
