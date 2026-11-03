@@ -1355,13 +1355,17 @@ onUnmounted(() => {
               <tr>
                 <th class="w-10 px-4 py-3 font-medium">
                   <span class="sr-only">Выбрать все</span>
-                  <AppCheckbox
-                    v-if="auth.canWrite"
-                    :model-value="allSelected"
-                    :indeterminate="someSelected"
-                    aria-label="Выбрать все запросы на странице"
-                    @update:model-value="toggleAll"
-                  />
+                  <!-- The same `row-line` the body cells use: the header's own line
+                       box (16.5px for 11px text) is not what the tick is 16px tall
+                       against, so without it the box sits 1.4px off the labels. -->
+                  <div v-if="auth.canWrite" class="row-line">
+                    <AppCheckbox
+                      :model-value="allSelected"
+                      :indeterminate="someSelected"
+                      aria-label="Выбрать все запросы на странице"
+                      @update:model-value="toggleAll"
+                    />
+                  </div>
                 </th>
                 <th class="px-4 py-3 font-medium">Получен</th>
                 <th class="px-4 py-3 font-medium">Метод</th>
@@ -1383,39 +1387,56 @@ onUnmounted(() => {
                 }"
                 @click="openRequest(row)"
               >
+                <!-- Every cell is `py-3` + one `row-line` flex box, so the time, the
+                     method badge, the endpoint chip and the routing counters share
+                     one vertical axis. Aligning by baseline instead let each of them
+                     sit at its own height (badge 20.5 px, chip 20 px, text 16 px) and
+                     the row read as five different rows. -->
                 <td class="w-10 px-4 py-3" @click.stop>
-                  <AppCheckbox
-                    v-if="auth.canWrite"
-                    :model-value="isSelected(row.id)"
-                    :aria-label="`Выбрать запрос #${row.id}`"
-                    @update:model-value="toggleSelected(row.id)"
-                  />
+                  <div class="row-line">
+                    <AppCheckbox
+                      v-if="auth.canWrite"
+                      :model-value="isSelected(row.id)"
+                      :aria-label="`Выбрать запрос #${row.id}`"
+                      @update:model-value="toggleSelected(row.id)"
+                    />
+                  </div>
                 </td>
                 <td class="whitespace-nowrap px-4 py-3 font-mono text-[11px] text-ink-soft">
-                  {{ formatTime(row.received_at) }}
+                  <div class="row-line">{{ formatTime(row.received_at) }}</div>
                 </td>
-                <td class="px-4 py-3"><MethodBadge :method="row.method" /></td>
                 <td class="px-4 py-3">
-                  <span class="inline-block max-w-40 truncate rounded-md bg-ink/5 px-2 py-0.5 font-mono text-xs text-ink-soft">
-                    {{ row.endpoint }}
-                  </span>
+                  <div class="row-line"><MethodBadge :method="row.method" /></div>
                 </td>
-                <td class="max-w-[22rem] truncate px-4 py-3 font-mono text-xs text-ink-soft">{{ row.path }}</td>
+                <td class="px-4 py-3">
+                  <div class="row-line">
+                    <span class="inline-block max-w-40 truncate rounded-md bg-ink/5 px-2 py-0.5 font-mono text-xs text-ink-soft">
+                      {{ row.endpoint }}
+                    </span>
+                  </div>
+                </td>
+                <td class="max-w-[22rem] px-4 py-3 font-mono text-xs text-ink-soft">
+                  <div class="row-line"><span class="min-w-0 truncate">{{ row.path }}</span></div>
+                </td>
                 <td class="whitespace-nowrap px-4 py-3 font-mono text-[11px] text-ink-mute">
-                  {{ formatBytes(row.body_bytes) }}
+                  <div class="row-line">{{ formatBytes(row.body_bytes) }}</div>
                 </td>
                 <td class="whitespace-nowrap px-4 py-3 text-xs">
-                  <span
-                    v-if="row.duplicate_of"
-                    class="mr-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
-                    :title="`Повтор доставки #${row.duplicate_of}: сценарии не запускались`"
-                  >повтор</span>
-                  <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
-                  <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
-                  <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>
-                  <span v-if="!row.run_count" class="text-ink-mute">без правил</span>
+                  <div class="row-line">
+                    <span
+                      v-if="row.duplicate_of"
+                      class="mr-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300"
+                      :title="`Повтор доставки #${row.duplicate_of}: сценарии не запускались`"
+                    >повтор</span>
+                    <span v-if="row.pending_runs" class="text-indigo-700 dark:text-indigo-300">в очереди: {{ row.pending_runs }}</span>
+                    <span v-if="row.run_count" class="text-ink-soft" :class="{ 'ml-1': row.pending_runs }">запусков: {{ row.run_count }}</span>
+                    <span v-if="row.failed_runs" class="ml-1 text-rose-600 dark:text-rose-300">· ошибок: {{ row.failed_runs }}</span>
+                    <span v-if="!row.run_count" class="text-ink-mute">без правил</span>
+                  </div>
                 </td>
-                <td class="px-4 py-3 text-right text-ink-mute">→</td>
+                <td class="px-4 py-3 text-right text-ink-mute">
+                  <div class="row-line justify-end">→</div>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1439,7 +1460,10 @@ onUnmounted(() => {
 
         <ul v-if="items.length" class="divide-y divide-line md:hidden">
           <li v-for="row in items" :key="row.id" class="flex items-start gap-2 px-4 py-3" :class="{ 'row-fresh': freshIds.has(row.id) }">
-            <span v-if="auth.canWrite" class="pt-0.5">
+            <!-- The card's first line is a 24px flex row (method badge + path); the
+                 box is centred on it rather than nudged with padding, so the tick
+                 sits on the same axis as the method it belongs to. -->
+            <span v-if="auth.canWrite" class="flex h-6 shrink-0 items-center">
               <AppCheckbox
                 :model-value="isSelected(row.id)"
                 :aria-label="`Выбрать запрос #${row.id}`"

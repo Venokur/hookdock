@@ -166,6 +166,18 @@ input[type="radio"] {
     @apply inline-flex items-center rounded-md bg-ink/5 px-2 py-0.5 font-mono text-[11px] text-ink-soft;
   }
 
+  /* One vertical axis for a table row's contents.
+     A `td` aligns its children by baseline, and the children have different
+     heights: 11px text (16.5px line box), a 12px chip (20px), a 20.5px method
+     badge. Baseline alignment then puts each of their centres at a different
+     offset from the row centre — measured 5px of spread — and the row reads as
+     several rows. A flex box of one line height centres all of them on the same
+     axis regardless of what the cell holds. `min-w-0` lets a `truncate` span
+     shrink inside it. */
+  .row-line {
+    @apply flex min-h-5 min-w-0 items-center;
+  }
+
   /* A row that just arrived through the live feed. Fading it out (rather than
      leaving a permanent colour) is what keeps "new" meaning new: a highlighted
      row that never clears would make the whole list look unread. */

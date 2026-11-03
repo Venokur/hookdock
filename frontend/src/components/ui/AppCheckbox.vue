@@ -20,9 +20,12 @@ const box = computed(() => (props.indeterminate && !model.value ? 'dash' : 'chec
 </script>
 
 <template>
-  <!-- align-middle keeps the box off the text baseline: an inline-flex label
-       aligns by its own baseline, which changes when the checkmark svg appears,
-       making the whole control jump 2px on every toggle. -->
+  <!-- `items-start` + a 16px box against the 16px line height of `text-xs`:
+       the box and the first text line share both their top and their bottom, so
+       the label reads as centred on the box. The box used to carry `mt-0.5`,
+       which pushed it 2px below the text — the label then looked like it hung
+       off the bottom of the checkbox. Do not reintroduce an offset here; if a
+       line height ever changes, change the box and the line together. -->
   <label class="inline-flex cursor-pointer select-none items-start gap-2 text-left align-middle">
     <input
       v-model="model"
@@ -33,7 +36,7 @@ const box = computed(() => (props.indeterminate && !model.value ? 'dash' : 'chec
     />
 
     <span
-      class="mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-[5px] border bg-surface transition
+      class="grid h-4 w-4 shrink-0 place-items-center rounded-[5px] border bg-surface transition
         border-line
         peer-hover:border-ink-mute
         peer-checked:border-indigo-600 peer-checked:bg-indigo-600
