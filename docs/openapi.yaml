@@ -1188,11 +1188,27 @@ paths:
           schema:
             type: string
             enum: [body]
+        - name: after
+          in: query
+          description: |
+            Cursor for the live feed: return only deliveries with a greater id,
+            oldest first. A page offset cannot express "what arrived since I last
+            looked" — on a busy room the window shifts between two requests and the
+            tail either skips rows or returns them twice. `after=0` is the ordinary
+            paged list, newest first, so a client with no cursor yet reloads instead
+            of prepending history in the wrong order.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PerPage'
       responses:
         '200':
-          description: A page of requests.
+          description: |
+            A page of requests, or — with `after` — the rows newer than that id.
+            A cursor answer carries `meta.cursor` and `meta.has_more` and no page
+            counters, because it is a window, not a page of history.
           content:
             application/json:
               schema:
@@ -1203,7 +1219,9 @@ paths:
                     items:
                       $ref: '#/components/schemas/RequestSummary'
                   meta:
-                    $ref: '#/components/schemas/Pagination'
+                    oneOf:
+                      - $ref: '#/components/schemas/Pagination'
+                      - $ref: '#/components/schemas/CursorPage'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -2663,6 +2681,23 @@ components:
           type: integer
         pages:
           type: integer
+
+    CursorPage:
+      type: object
+      description: |
+        The answer to `?after=<id>`. `cursor` is the newest id returned (unchanged
+        when nothing was), which is what the next pull sends as `after`. `has_more`
+        means "ask again straight away": a burst can exceed one page.
+      properties:
+        per_page:
+          type: integer
+        cursor:
+          type: integer
+        has_more:
+          type: boolean
+        mode:
+          type: string
+          enum: [after]
 
     Health:
       type: object

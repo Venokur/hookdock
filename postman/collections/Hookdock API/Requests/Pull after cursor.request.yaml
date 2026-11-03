@@ -1,0 +1,42 @@
+$kind: http-request
+name: Pull after cursor
+method: GET
+url: '{{base_url}}/api/requests?room={{room_slug}}&after={{feed_cursor}}&per_page=5'
+order: 1400
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: after
+    value: '{{feed_cursor}}'
+  - key: per_page
+    value: '5'
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The cursor comes from the previous request. A placeholder would be read as
+      // an id and the assertions would describe a list nobody asked for.
+      if (!pm.collectionVariables.get('feed_cursor')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A cursor answer is a window, not a page: it carries the next cursor and
+      // `has_more` instead of `page`/`total`, and it is ordered oldest first so a
+      // burst appends in the order it was received.
+      pm.test('a cursor answer is a window, not a page', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta.mode).to.eql('after');
+        pm.expect(body.meta.cursor).to.be.a('number');
+        pm.expect(body.meta.has_more).to.be.a('boolean');
+        pm.expect(body.meta).to.not.have.property('total');
+        body.data.forEach(function (row) {
+          pm.expect(row.id).to.be.above(Number(pm.collectionVariables.get('feed_cursor')));
+        });
+        if (body.data.length > 1) {
+          pm.expect(body.data[0].id).to.be.below(body.data[1].id);
+        }
+      });

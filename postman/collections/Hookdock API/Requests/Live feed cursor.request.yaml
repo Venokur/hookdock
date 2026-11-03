@@ -1,0 +1,40 @@
+$kind: http-request
+name: Live feed cursor
+method: GET
+url: '{{base_url}}/api/requests?room={{room_slug}}&after=0&per_page=5'
+order: 1300
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: after
+    value: '0'
+  - key: per_page
+    value: '5'
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The feed needs a room that has rows. Without one the cursor assertions
+      // below would pass on an empty answer and prove nothing.
+      if (!pm.collectionVariables.get('room_slug')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `after=0` is the ordinary paged list, not "everything oldest first": a
+      // client with no cursor yet must reload instead of prepending history in the
+      // wrong order. The newest id becomes the cursor for the second request.
+      pm.test('after=0 keeps the paged list', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.meta).to.have.property('total');
+        pm.expect(body.meta).to.not.have.property('cursor');
+        if (body.data.length > 1) {
+          pm.expect(body.data[0].id).to.be.above(body.data[1].id);
+        }
+        if (body.data.length > 0) {
+          pm.collectionVariables.set('feed_cursor', String(body.data[0].id));
+        }
+      });

@@ -47,11 +47,37 @@ final class RequestsController
         // asks for the heavy columns explicitly; the plain list stays lean.
         $extraColumns = in_array('body', $include, true) ? ', r.body, r.raw_body' : '';
 
-        $pdo = Database::pdo();
+        // Catch-up mode for the live feed: `?after=<id>` answers "what arrived
+        // since I last looked", oldest first, so a burst is appended in the order
+        // it was received. A page offset cannot express that — a busy room shifts
+        // the window between two requests and the tail would either skip rows or
+        // show them twice. The id cursor is stable under concurrent inserts.
+        $after = max(0, (int) ($request->query['after'] ?? 0));
 
-        $countStmt = $pdo->prepare('SELECT count(*) FROM incoming_requests r' . $clause);
-        $countStmt->execute($params);
-        $total = (int) $countStmt->fetchColumn();
+        $pdo = Database::pdo();
+        $total = null;
+
+        if ($after === 0) {
+            $countStmt = $pdo->prepare('SELECT count(*) FROM incoming_requests r' . $clause);
+            $countStmt->execute($params);
+            $total = (int) $countStmt->fetchColumn();
+        }
+
+        if ($after > 0) {
+            // `r.id`, not `received_at`: the id is unique and monotonic, so a
+            // delivery stored in the same millisecond as its neighbour cannot be
+            // returned twice or skipped. The list is ordered by id for the same
+            // reason — chronological order is what a tail needs, and ids follow it.
+            $clause = $clause === ''
+                ? ' WHERE r.id > :after'
+                : $clause . ' AND r.id > :after';
+            $params['after'] = $after;
+            $order = 'ORDER BY r.id ASC';
+            $offset = 0;
+        } else {
+            $order = 'ORDER BY r.received_at DESC, r.id DESC';
+            $offset = ($page - 1) * $perPage;
+        }
 
         $sql = "SELECT r.id, r.room_id, r.endpoint, r.method, r.path, r.content_type, r.body_bytes, r.ip, r.received_at,
                        r.duplicate_of, r.replayed_from,
@@ -66,21 +92,41 @@ final class RequestsController
                     FROM workflow_runs wr
                     WHERE wr.request_id = r.id
                 ) stats ON TRUE" . $clause . '
-                ORDER BY r.received_at DESC, r.id DESC
+                ' . $order . '
                 LIMIT :limit OFFSET :offset';
 
         $stmt = $pdo->prepare($sql);
         foreach ($params as $key => $value) {
-            $stmt->bindValue(':' . $key, $value);
+            // `after` is an id: bound as a string, Postgres compares a bigint with
+            // an untyped parameter, which works but re-plans as text in some drivers.
+            // An integer bind is what the column actually is.
+            $stmt->bindValue(':' . $key, $value, $key === 'after' ? \PDO::PARAM_INT : \PDO::PARAM_STR);
         }
         $stmt->bindValue(':limit', $perPage, \PDO::PARAM_INT);
-        $stmt->bindValue(':offset', ($page - 1) * $perPage, \PDO::PARAM_INT);
+        $stmt->bindValue(':offset', $offset, \PDO::PARAM_INT);
         $stmt->execute();
 
         $rows = $stmt->fetchAll();
         if (in_array('body', $include, true)) {
             // Only `body` is jsonb; `raw_body` is text and must stay a string.
             $rows = JsonColumns::decodeMany($rows, ['body']);
+        }
+
+        if ($after > 0) {
+            // `has_more` tells the caller to ask again straight away: a burst can
+            // exceed one page, and stopping at the first answer would make the tail
+            // lag behind until the next event.
+            Response::json([
+                'data' => $rows,
+                'meta' => [
+                    'per_page' => $perPage,
+                    'cursor' => $rows === [] ? $after : (int) $rows[count($rows) - 1]['id'],
+                    'has_more' => count($rows) === $perPage,
+                    'mode' => 'after',
+                ],
+            ]);
+
+            return;
         }
 
         Response::json([

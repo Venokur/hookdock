@@ -8,6 +8,7 @@ import AppInput from '../components/ui/AppInput.vue'
 import AppSelect from '../components/ui/AppSelect.vue'
 import AppSpinner from '../components/ui/AppSpinner.vue'
 import AppCheckbox from '../components/ui/AppCheckbox.vue'
+import AppToggle from '../components/ui/AppToggle.vue'
 import { api } from '../api/client'
 import { confirm, notify } from '../composables/dialog'
 import { retain, status as realtimeStatus, subscribe } from '../composables/realtime'
@@ -96,6 +97,44 @@ let filterTimer = null
 let reloadTimer = null
 let busyToken = 0
 let loadSeq = 0
+
+/**
+ * Live feed.
+ *
+ * Off by default: a log that moves under the cursor is wrong for reading history,
+ * and the operator asked for the *page*, not a stream. When it is on, new rows are
+ * prepended from an id cursor (`?after=`) instead of reloading the page — a reload
+ * would repaint rows that did not change and lose the scroll position on a busy
+ * room. The preference is per browser, like the saved filters.
+ */
+const LIVE_KEY = 'wr_live'
+/**
+ * A tail is a window, not the whole log: past this the oldest rows drop off.
+ * Kept at the API's `per_page` ceiling (100) so a reload of the feed can refill
+ * the same window — a larger window would silently shrink on every status change.
+ */
+const LIVE_MAX = 100
+
+const live = ref(readLivePref())
+const livePaused = ref(false)
+const livePending = ref(0)
+const freshIds = ref(new Set())
+let liveCursor = 0
+let liveSeq = 0
+let freshTimer = null
+
+function readLivePref() {
+  try {
+    return window.localStorage.getItem(LIVE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/** Newest id on screen, which is also the cursor the next pull starts after. */
+function newestId() {
+  return items.value.reduce((max, row) => (row.id > max ? row.id : max), 0)
+}
 
 const FILTER_DEBOUNCE = 250
 const BUSY_MIN = 350
@@ -330,7 +369,9 @@ async function load({ silent = false } = {}) {
       api.requests({
         room: roomSlug,
         page: meta.page,
-        per_page: meta.per_page,
+        // A live feed is a window, not a page: reloading it with the paged size
+        // would shrink 200 rows back to 25 every time a run changed status.
+        per_page: live.value ? Math.max(meta.per_page, LIVE_MAX) : meta.per_page,
         ...filterParams(),
       }),
       api.stats({ room: roomSlug }),
@@ -346,6 +387,9 @@ async function load({ silent = false } = {}) {
     Object.assign(meta, list.meta)
     stats.value = summary.data
     error.value = ''
+    // The cursor follows what is on screen: a filter change answers a different
+    // question, and pulling "newer than the old newest" would mix the two.
+    liveCursor = newestId()
 
     // A selection cannot outlive the rows it was made on: paging, a filter
     // change or a deletion elsewhere would otherwise leave ids ticked that are
@@ -430,6 +474,143 @@ function refreshSoon() {
   }, 300)
 }
 
+/**
+ * Pulls deliveries newer than the cursor and prepends them.
+ *
+ * Used instead of a page reload when the feed is live: a reload repaints rows that
+ * did not change, and on a busy room the page shifts while the operator is reading
+ * it. The cursor is an id, so a delivery stored in the same millisecond as its
+ * neighbour cannot be skipped or returned twice.
+ */
+async function pullLive() {
+  if (!live.value || livePaused.value || meta.page !== 1) {
+    return
+  }
+
+  const seq = ++liveSeq
+  const roomSlug = slug.value
+  const cursor = liveCursor || newestId()
+
+  // Nothing on screen means there is no cursor to follow: `after=0` is the paged
+  // list (newest first), and prepending that would put the oldest row on top.
+  // A room's first delivery is a plain reload.
+  if (cursor <= 0) {
+    await load({ silent: true })
+
+    return
+  }
+
+  try {
+    const res = await api.requests({
+      room: roomSlug,
+      after: cursor,
+      per_page: 50,
+      ...filterParams(),
+    })
+
+    // Superseded, or the room/filters moved while the answer was in flight.
+    if (seq !== liveSeq || roomSlug !== slug.value) {
+      return
+    }
+
+    if (res.meta?.cursor) {
+      liveCursor = res.meta.cursor
+    }
+
+    const added = mergeLive(res.data ?? [])
+    if (added.length > 0) {
+      highlightFresh(added.map((row) => row.id))
+    }
+
+    // A burst can exceed one page: stopping here would leave the tail behind
+    // until the next delivery arrives.
+    if (res.meta?.has_more) {
+      await pullLive()
+    }
+  } catch {
+    // A missed pull is covered by the next event and by `resync` after a reconnect.
+  }
+}
+
+/**
+ * @returns {Array<object>} rows that were actually added
+ */
+function mergeLive(rows) {
+  const known = new Set(items.value.map((row) => row.id))
+  const added = rows.filter((row) => !known.has(row.id))
+
+  if (added.length === 0) {
+    return []
+  }
+
+  // The cursor answers oldest-first, so reverse before prepending: the newest
+  // delivery has to end up on top, exactly like the paged list.
+  items.value = [...added.slice().reverse(), ...items.value].slice(0, LIVE_MAX)
+  meta.total = (meta.total ?? 0) + added.length
+
+  return added
+}
+
+/** Marks just-arrived rows for a moment, so the eye can find them. */
+function highlightFresh(ids) {
+  const next = new Set(freshIds.value)
+  for (const id of ids) {
+    next.add(id)
+  }
+  freshIds.value = next
+
+  clearTimeout(freshTimer)
+  freshTimer = setTimeout(() => {
+    freshIds.value = new Set()
+  }, 2500)
+}
+
+async function setLive(on) {
+  live.value = on
+
+  try {
+    window.localStorage.setItem(LIVE_KEY, on ? '1' : '0')
+  } catch {
+    // Private mode: the feed still works, the preference just is not remembered.
+  }
+
+  if (!on) {
+    livePaused.value = false
+    livePending.value = 0
+    freshIds.value = new Set()
+
+    return
+  }
+
+  // A tail always shows the newest rows, so a deeper page has to come back to
+  // the first one; appending to the middle of history would be a lie.
+  if (meta.page !== 1) {
+    meta.page = 1
+    await loadWithLoader()
+  }
+
+  livePaused.value = false
+  livePending.value = 0
+  liveCursor = newestId()
+}
+
+/** Freezes the feed: the operator is reading, not watching. */
+function pauseLive() {
+  livePaused.value = true
+}
+
+/**
+ * Resumes from a full reload rather than a cursor pull: while paused a row may
+ * have been deleted or had its run counters change, and those are not "new rows".
+ */
+async function resumeLive() {
+  livePaused.value = false
+  livePending.value = 0
+  await load({ silent: true })
+  liveCursor = newestId()
+  await pullLive()
+}
+
 async function refreshDetail() {
   const id = detail.value?.id
   if (!showDetail.value || !id) {
@@ -450,6 +631,35 @@ async function refreshDetail() {
   }
 }
 
+/**
+ * A delivery was stored. With the feed live the row is pulled through the cursor
+ * instead of reloading the page: a reload repaints rows that did not change and,
+ * on a busy room, moves what the operator is reading.
+ */
+function onRequestCreated(payload) {
+  if (payload?.room_id && room.value && payload.room_id !== room.value.id) {
+    return
+  }
+
+  if (!live.value || meta.page !== 1) {
+    refreshSoon()
+
+    return
+  }
+
+  // A paused feed counts what it is holding back; a frozen list with no number
+  // looks like a broken connection rather than a deliberate pause.
+  if (livePaused.value) {
+    livePending.value += 1
+
+    return
+  }
+
+  clearTimeout(reloadTimer)
+  reloadTimer = setTimeout(() => pullLive(), 120)
+}
+
+/** A run changed, a row was replayed: the row itself must be re-read. */
 function onRequestEvent(payload) {
   // Events carry room_id: another room's webhook must not disturb this list.
   if (payload?.room_id && room.value && payload.room_id !== room.value.id) {
@@ -458,6 +668,12 @@ function onRequestEvent(payload) {
 
   if (detail.value?.id && payload?.id === detail.value.id) {
     refreshDetail()
+  }
+
+  if (live.value && livePaused.value) {
+    livePending.value += 1
+
+    return
   }
 
   refreshSoon()
@@ -942,7 +1158,7 @@ onMounted(() => {
     openRequestById(requested)
   }
 
-  const offCreated = subscribe('request.created', onRequestEvent)
+  const offCreated = subscribe('request.created', onRequestCreated)
   const offUpdated = subscribe('request.updated', onRequestEvent)
   const offDeleted = subscribe('request.deleted', onRequestDeleted)
   const offResync = subscribe('resync', onResync)
@@ -963,6 +1179,7 @@ onUnmounted(() => {
   releaseLive = null
   clearTimeout(filterTimer)
   clearTimeout(reloadTimer)
+  clearTimeout(freshTimer)
 })
 </script>
 
@@ -988,6 +1205,26 @@ onUnmounted(() => {
             <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
             {{ realtimeLabel.label }}
           </span>
+
+          <!-- Tail mode: the log follows the room instead of staying a page of
+               history. Pausing is part of the same control, because a feed that
+               keeps moving the row under the cursor is unusable for reading. -->
+          <div class="flex items-center gap-1.5 rounded-xl border border-line bg-surface px-2.5 py-1">
+            <span class="text-[11px] text-ink-mute">Поток</span>
+            <AppToggle :model-value="live" @update:model-value="setLive" />
+            <button
+              v-if="live"
+              type="button"
+              class="rounded-md px-1.5 py-0.5 text-[11px] font-medium transition"
+              :class="livePaused
+                ? 'bg-indigo-600/10 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-200'
+                : 'text-ink-mute hover:bg-surface-2 hover:text-ink'"
+              :aria-pressed="livePaused"
+              @click="livePaused ? resumeLive() : pauseLive()"
+            >
+              {{ livePaused ? `Продолжить${livePending > 0 ? ` · +${livePending}` : ''}` : 'Пауза' }}
+            </button>
+          </div>
 
           <span v-if="updatedAt" class="font-mono text-[11px] text-ink-mute">
             обновлено {{ formatClock(updatedAt) }}
@@ -1198,7 +1435,10 @@ onUnmounted(() => {
                 v-for="row in items"
                 :key="row.id"
                 class="cursor-pointer transition hover:bg-surface-2"
-                :class="{ 'bg-indigo-500/[0.06]': isSelected(row.id) }"
+                :class="{
+                  'bg-indigo-500/[0.06]': isSelected(row.id),
+                  'row-fresh': freshIds.has(row.id),
+                }"
                 @click="openRequest(row)"
               >
                 <td class="w-10 px-4 py-3" @click.stop>
@@ -1256,7 +1496,7 @@ onUnmounted(() => {
         </div>
 
         <ul v-if="items.length" class="divide-y divide-line md:hidden">
-          <li v-for="row in items" :key="row.id" class="flex items-start gap-2 px-4 py-3">
+          <li v-for="row in items" :key="row.id" class="flex items-start gap-2 px-4 py-3" :class="{ 'row-fresh': freshIds.has(row.id) }">
             <span v-if="auth.canWrite" class="pt-0.5">
               <AppCheckbox
                 :model-value="isSelected(row.id)"
@@ -1312,10 +1552,16 @@ onUnmounted(() => {
         </div>
 
         <footer class="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-xs text-ink-mute">
-          <span>
+          <!-- A live tail is not a page: the newest 200 rows are a window, and
+               "страница 1 из 1" next to a stream would be a lie about history. -->
+          <span v-if="live">
+            поток: последние {{ items.length }}<span v-if="meta.total > items.length"> из {{ meta.total }}</span>
+            <span v-if="livePaused" class="text-amber-700 dark:text-amber-300"> · пауза</span>
+          </span>
+          <span v-else>
             {{ meta.total }} запросов · страница {{ meta.page }} из {{ meta.pages }}
           </span>
-          <div class="flex items-center gap-1.5">
+          <div v-if="!live" class="flex items-center gap-1.5">
             <button
               type="button"
               class="btn px-2.5 py-1"
