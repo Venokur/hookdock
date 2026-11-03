@@ -323,8 +323,15 @@ async function loadEndpoints() {
   endpointsFailed.value = false
 
   try {
-    const data = await api.stats({ room: props.room.slug })
-    endpointTop.value = data.data
+    // The picker needs a list of endpoints, not the room's dashboard. `stats`
+    // answers six questions (volume per hour, failure streak, queue depth, active
+    // rules, the endpoint page and their count) and the editor would pay for all of
+    // them on every open; this route asks the one it uses.
+    const data = await api.endpoints({ room: props.room.slug, limit: 15 })
+    endpointTop.value = {
+      endpoints: data.data,
+      endpoints_total: data.meta?.total ?? data.data.length,
+    }
   } catch {
     // The picker stays usable: without the short list it still accepts a typed
     // slug, which is the whole reason `allowCustom` is on. The hint says so

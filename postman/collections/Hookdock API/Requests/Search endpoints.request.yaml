@@ -1,0 +1,48 @@
+$kind: http-request
+name: Search endpoints
+method: GET
+url: '{{base_url}}/api/endpoints?room={{room_slug}}&q=hook&limit=2'
+order: 1500
+queryParams:
+  - key: room
+    value: '{{room_slug}}'
+  - key: q
+    value: hook
+    description: Case-insensitive substring of the endpoint slug.
+  - key: limit
+    value: '2'
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The picker reaches endpoints outside the short list `stats` returns. Without
+      // a room that has rows there is nothing to page, so the request is skipped
+      // rather than asserting on a placeholder slug.
+      if (!pm.collectionVariables.get('room_slug')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // One pass counts and pages: `meta.total` is the number of distinct endpoints
+      // the term matched (not the number of deliveries), so a page of two against a
+      // wider match must report `has_more`.
+      pm.test('the endpoint search is a page with a count', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body.data).to.be.an('array');
+        pm.expect(body.data.length).to.be.at.most(2);
+        pm.expect(body.meta.limit).to.eql(2);
+        pm.expect(body.meta.returned).to.eql(body.data.length);
+        pm.expect(body.meta.total).to.be.at.least(body.data.length);
+        pm.expect(body.meta.has_more).to.eql(body.meta.total > body.meta.returned);
+      });
+
+      pm.test('every row matches the term and carries its own count', function () {
+        pm.response.json().data.forEach(function (row) {
+          pm.expect(row.endpoint.toLowerCase()).to.include('hook');
+          pm.expect(row.total).to.be.a('number');
+          // The window column is a detail of the query, not part of the contract.
+          pm.expect(row).to.not.have.property('matched');
+        });
+      });

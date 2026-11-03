@@ -350,11 +350,23 @@ final class RequestsController
 
         $clause = $where === [] ? '' : ' WHERE ' . implode(' AND ', $where);
 
+        // One pass, not two.
+        //
+        // The window counts the grouped rows *before* the LIMIT, so `total` is the
+        // number of distinct endpoints the term matched and `has_more` falls out of
+        // comparing it with the page — the separate `count(DISTINCT endpoint)` this
+        // used to run scanned the same rows a second time, on every keystroke of the
+        // picker. Grouping materializes at most one row per endpoint, which is the
+        // set the window has to size anyway.
+        //
         // The LIMIT is interpolated, never bound: the value is clamped above.
         $stmt = Database::pdo()->prepare(
-            'SELECT endpoint, count(*)::int AS total
-               FROM incoming_requests' . $clause . '
-              GROUP BY endpoint
+            'SELECT endpoint, total, count(*) OVER ()::int AS matched
+               FROM (
+                     SELECT endpoint, count(*)::int AS total
+                       FROM incoming_requests' . $clause . '
+                      GROUP BY endpoint
+                    ) grouped
               ORDER BY total DESC, endpoint
               LIMIT ' . $limit
         );
@@ -362,20 +374,22 @@ final class RequestsController
         $rows = $stmt->fetchAll();
 
         // `has_more` is what tells the SPA whether to offer "уточните запрос"
-        // instead of silently showing a truncated list.
-        $countStmt = Database::pdo()->prepare(
-            'SELECT count(DISTINCT endpoint) FROM incoming_requests' . $clause
-        );
-        $countStmt->execute($params);
-        $total = (int) $countStmt->fetchColumn();
+        // instead of silently showing a truncated list. Every page carries the same
+        // `matched`, so an empty page is the only case without one.
+        $matched = (int) ($rows[0]['matched'] ?? 0);
+
+        foreach ($rows as &$row) {
+            unset($row['matched']);
+        }
+        unset($row);
 
         Response::json([
             'data' => $rows,
             'meta' => [
-                'total' => $total,
+                'total' => $matched,
                 'limit' => $limit,
                 'returned' => count($rows),
-                'has_more' => $total > count($rows),
+                'has_more' => $matched > count($rows),
             ],
         ]);
     }

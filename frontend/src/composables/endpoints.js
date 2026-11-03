@@ -27,6 +27,18 @@ import { api } from '../api/client'
 /** What a caller sees when the search itself broke, not the endpoint list. */
 const FAILED_HINT = 'Не удалось загрузить список — попробуйте ещё раз.'
 
+/**
+ * Shortest term that goes to the server.
+ *
+ * `endpoint ILIKE '%q%'` is served by a trigram index, and a trigram needs three
+ * characters: at one or two Postgres cannot extract a single one and falls back to
+ * scanning the room's rows — twice per pause in typing, since the panel asks on
+ * every 250 ms heartbeat of the keyboard. Below the threshold the panel keeps the
+ * short list it already has and says so, which is both cheaper and more honest
+ * than a request whose answer cannot be selective.
+ */
+const MIN_TERM = 3
+
 export function useEndpointSearch(getSlug) {
   const term = ref('')
   const hits = ref([])
@@ -44,12 +56,16 @@ export function useEndpointSearch(getSlug) {
    * @param allowCustom  offer the typed term as a value when nothing matched it
    */
   function options(stats, { allowCustom = false, blank = null, current = '' } = {}) {
+    const typed = term.value.trim()
+    // Too short a term is not a search: the panel keeps showing the room's short
+    // list, exactly as if the field were empty.
+    const filtering = typed.length >= MIN_TERM
     // Matches appear only once the answer for *this* term has arrived. While a
     // request is in flight the previous term's rows would sit under a box that no
     // longer says that term, and clicking one would pick a value the operator
     // stopped searching for.
     const fresh = answered.value === term.value
-    const source = term.value.trim() === '' ? (stats?.endpoints ?? []) : fresh ? hits.value : []
+    const source = !filtering ? (stats?.endpoints ?? []) : fresh ? hits.value : []
     const known = source.map((item) => ({ value: item.endpoint, label: item.endpoint }))
     const selected = String(current ?? '').trim()
 
@@ -57,14 +73,14 @@ export function useEndpointSearch(getSlug) {
       known.unshift({ value: selected, label: selected })
     }
 
-    if (allowCustom) {
-      const typed = term.value.trim()
+    if (allowCustom && typed !== '') {
       const lower = typed.toLowerCase()
 
       // Compared without case: routing matches an endpoint case-insensitively
       // (`WorkflowEngine::endpointMatches`), so `HOOK-1` next to `hook-1` would be
-      // two rows that do the same thing.
-      if (typed !== '' && !known.some((option) => String(option.value).toLowerCase() === lower)) {
+      // two rows that do the same thing. Offered even below the search threshold:
+      // a short slug is legal, and this row needs no server to answer.
+      if (!known.some((option) => String(option.value).toLowerCase() === lower)) {
         known.push({ value: typed, label: `Использовать «${typed}»` })
       }
     }
@@ -86,6 +102,13 @@ export function useEndpointSearch(getSlug) {
     const typed = term.value.trim()
 
     if (typed !== '') {
+      // Too short to ask the server: the list still shows the room's top
+      // endpoints, and saying nothing here would leave the operator wondering why
+      // typing changed nothing.
+      if (typed.length < MIN_TERM) {
+        return `Введите минимум ${MIN_TERM} символа — короткий запрос не сужает список.`
+      }
+
       // Nothing is known about this term yet: "ничего не найдено" while the
       // request is still running would state a fact the server has not answered.
       if (answered.value !== term.value) {
@@ -113,9 +136,11 @@ export function useEndpointSearch(getSlug) {
     failed.value = false
 
     // Clearing the field goes back to the short list: there is nothing to fetch,
-    // and a request per deleted character would only add noise.
-    if (next === '') {
+    // and a request per deleted character would only add noise. A term too short to
+    // be selective does the same, with a line that says why.
+    if (next === '' || next.length < MIN_TERM) {
       reset()
+      term.value = next
       return
     }
 

@@ -1104,6 +1104,11 @@ paths:
         `stats` returns only the 15 most frequent, which is what the closed filter
         shows. This route reaches the rest: the operator types into the same field
         and gets matches from every endpoint, not only the visible page.
+
+        `meta.total` counts distinct endpoints matching the term, never deliveries —
+        the per-row `total` is the delivery count. The SPA does not call this route
+        for a term shorter than three characters, because a trigram index cannot be
+        selective below that and the answer would cost a scan of the room's rows.
       parameters:
         - $ref: '#/components/parameters/RoomSlug'
         - name: q
@@ -1140,12 +1145,16 @@ paths:
                     properties:
                       total:
                         type: integer
+                        description: Distinct endpoints matching the term.
                       limit:
                         type: integer
+                        description: Page size after clamping to 1–100.
                       returned:
                         type: integer
+                        description: Rows in this answer.
                       has_more:
                         type: boolean
+                        description: True when `total` exceeds `returned`.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
