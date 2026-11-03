@@ -338,6 +338,14 @@ final class WorkflowEngine
         }
 
         $done = self::succeededSteps($runId);
+
+        // A retry skips a forward that already succeeded, so its answer is no longer
+        // in memory — but a later `extract` may still read `response.…`. Seeding it
+        // from the step log keeps the chain intact on the second attempt.
+        if ($done !== []) {
+            $context['response'] = self::lastResponse($runId);
+        }
+
         [$status, $message, $retry, $delay, $defer, $breakerOutcomes] = self::runActions($actions, $context, $runId, $attempt, $done);
 
         // The breaker learns an outcome only once the run has no retry left. While
@@ -479,6 +487,16 @@ final class WorkflowEngine
             $type = (string) ($action['type'] ?? '');
             $step = ['index' => $index, 'type' => $type];
 
+            // A branch that would not run is described as such instead of being
+            // silently omitted: the point of the dry run is to show what the rule
+            // will do, and "this action is skipped because its condition is false"
+            // is exactly what an operator is checking for.
+            $when = $action['when'] ?? null;
+            if (is_array($when) && $when !== [] && !self::conditionsPass(self::normalizeTree($when), $context)) {
+                $steps[] = $step + ['skipped' => true, 'reason' => 'условие действия не выполнено'];
+                continue;
+            }
+
             if ($type === 'log') {
                 $steps[] = $step + [
                     'message' => Template::render((string) ($action['message'] ?? ''), $context),
@@ -509,6 +527,28 @@ final class WorkflowEngine
                 continue;
             }
 
+            if ($type === 'extract') {
+                $sourceName = (string) ($action['source'] ?? 'body');
+                $source = $sourceName === 'response'
+                    ? ($context['response'] ?? [])
+                    : ($context[$sourceName] ?? null);
+
+                $mapping = is_array($action['mapping'] ?? null) ? $action['mapping'] : [];
+                $result = [];
+
+                foreach ($mapping as $key => $path) {
+                    $resolved = JsonPath::resolveWithin($source, (string) $path);
+                    if ($resolved['found']) {
+                        $result[$key] = $resolved['value'];
+                    }
+                }
+
+                $existing = is_array($context['extracted'] ?? null) ? $context['extracted'] : [];
+                $context['extracted'] = array_merge($existing, $result);
+                $steps[] = $step + ['source' => $sourceName, 'extracted' => $result];
+                continue;
+            }
+
             if ($type === 'forward') {
                 $url = Template::render((string) ($action['url'] ?? ''), $context);
                 $method = strtoupper((string) ($action['method'] ?? 'POST'));
@@ -518,6 +558,8 @@ final class WorkflowEngine
                     $payload = match ($payload) {
                         'body' => $context['body'] ?? [],
                         'transformed' => $context['transformed'] ?? [],
+                        'extracted' => $context['extracted'] ?? [],
+                        'response' => $context['response'] ?? [],
                         'raw' => (string) ($context['raw'] ?? ''),
                         default => Template::render($payload, $context),
                     };
@@ -667,6 +709,15 @@ final class WorkflowEngine
             'headers' => $request['headers'] ?? [],
             'query' => $request['query'] ?? [],
             'transformed' => [],
+            // Filled by `extract` actions, and read by later steps as
+            // `{{ extracted.order_id }}` — that is how a value travels from one
+            // action to the next without a script.
+            'extracted' => [],
+            // The decoded body of the last successful forward. Seeded on a retry
+            // from the journal (see `lastResponse()`), so an `extract` that reads an
+            // API answer still sees it on the second attempt, when the forward
+            // itself is skipped as already done.
+            'response' => [],
             'meta' => [
                 'id' => $request['id'] ?? null,
                 'method' => $request['method'] ?? null,
@@ -698,6 +749,8 @@ final class WorkflowEngine
             'headers' => [],
             'query' => [],
             'transformed' => [],
+            'extracted' => [],
+            'response' => [],
             'meta' => [
                 'id' => null,
                 'method' => 'SCHEDULE',
@@ -780,6 +833,14 @@ final class WorkflowEngine
         // `array_is_list` distinguishes `[...]` from `{"mode": ...}`.
         if (array_is_list($conditions)) {
             return ['mode' => 'all', 'rules' => array_values(array_filter($conditions, 'is_array'))];
+        }
+
+        // A lone condition — `{"path": …, "operator": …}` — is a group of one, not a
+        // group with no rules. Without this a per-action `when` written as a single
+        // condition would read as "no conditions" and pass every time, which is the
+        // worst possible way for a branch to be wrong.
+        if (isset($conditions['path']) && !isset($conditions['rules'])) {
+            return ['mode' => 'all', 'rules' => [$conditions]];
         }
 
         $mode = strtolower((string) ($conditions['mode'] ?? 'all'));
@@ -912,18 +973,30 @@ final class WorkflowEngine
         foreach ($actions as $index => $action) {
             $type = (string) ($action['type'] ?? '');
 
-            if (isset($done[$index]) && $type !== 'transform') {
+            if (isset($done[$index]) && $type !== 'transform' && $type !== 'extract') {
                 // Already performed by an earlier attempt: never repeat a side effect.
-                // `transform` is excluded on purpose: it has no side effect, and a
-                // retry has to rebuild `context['transformed']` — otherwise a later
-                // `forward` with `payload: "transformed"` would send an empty body.
+                // `transform` and `extract` are excluded on purpose: they have no side
+                // effect, and a retry has to rebuild `context['transformed']` /
+                // `context['extracted']` — otherwise a later `forward` with
+                // `payload: "transformed"` would send an empty body.
                 // `delay` is skipped like any other side effect: a resumed run had
                 // its pause already, and repeating it would restart the clock.
                 $messages[] = 'повтор пропущен: ' . $type;
                 continue;
             }
 
+            // Per-action condition: `when` turns a flat list into a branch without a
+            // second kind of control flow. `false` records a `skipped` step, so the
+            // journal explains why the action did not run, and the rest of the list
+            // continues — a skipped action is a decision, not a failure.
             $started = microtime(true);
+            $when = $action['when'] ?? null;
+            if (is_array($when) && $when !== [] && !self::conditionsPass(self::normalizeTree($when), $context)) {
+                $message = 'пропущено: условие действия не выполнено';
+                $messages[] = $message;
+                self::recordStep($runId, $attempt, $index, $type, 'skipped', $message, null, null, $started);
+                continue;
+            }
 
             try {
                 if ($type === 'log') {
@@ -967,6 +1040,42 @@ final class WorkflowEngine
 
                     $context['transformed'] = $result;
                     $message = 'трансформация: ' . count($result) . ' пол.';
+                    $messages[] = $message;
+                    self::recordStep($runId, $attempt, $index, $type, 'success', $message, null, null, $started);
+                    continue;
+                }
+
+                // `extract` reads one source and publishes its fields as
+                // `{{ extracted.… }}` for the actions after it. Different from
+                // `transform` in the two ways that matter for a chain of calls: the
+                // paths are resolved **inside** the chosen source (so `event.type` is
+                // that field of the API answer, not "the first place in the context
+                // where it appears"), and the result survives the step that reads it
+                // — `forward` can send `extracted` or a single `{{ extracted.id }}`.
+                if ($type === 'extract') {
+                    $sourceName = (string) ($action['source'] ?? 'body');
+                    $source = $sourceName === 'response'
+                        ? ($context['response'] ?? [])
+                        : ($context[$sourceName] ?? null);
+
+                    $mapping = is_array($action['mapping'] ?? null) ? $action['mapping'] : [];
+                    $result = [];
+
+                    foreach ($mapping as $key => $path) {
+                        $resolved = JsonPath::resolveWithin($source, (string) $path);
+                        if ($resolved['found']) {
+                            $result[$key] = $resolved['value'];
+                        }
+                    }
+
+                    // Merged, not replaced: two extracts in one rule usually take
+                    // different fields of different answers, and the second one
+                    // silently dropping the first one's value would look like a
+                    // template that stopped working.
+                    $existing = is_array($context['extracted'] ?? null) ? $context['extracted'] : [];
+                    $context['extracted'] = array_merge($existing, $result);
+
+                    $message = 'извлечено из ' . $sourceName . ': ' . count($result) . ' пол.';
                     $messages[] = $message;
                     self::recordStep($runId, $attempt, $index, $type, 'success', $message, null, null, $started);
                     continue;
@@ -1021,6 +1130,8 @@ final class WorkflowEngine
                         $payload = match ($payload) {
                             'body' => $context['body'] ?? [],
                             'transformed' => $context['transformed'] ?? [],
+                            'extracted' => $context['extracted'] ?? [],
+                            'response' => $context['response'] ?? [],
                             'raw' => (string) ($context['raw'] ?? ''),
                             // Anything else is a hand-written body from the editor.
                             // It is a template, so `{"id": "{{ body.id }}"}` works
@@ -1097,6 +1208,11 @@ final class WorkflowEngine
                     $message = sprintf('пересылка %s %s → %d', $method, $url, $result['status']);
                     $messages[] = $message;
                     self::recordStep($runId, $attempt, $index, $type, 'success', $message, $result['status'], $result['body'], $started);
+
+                    // The answer becomes `{{ response.… }}` for the steps after this
+                    // one, and it is persisted so a retry can still read it after the
+                    // forward itself is skipped (see `lastResponse()`).
+                    $context['response'] = self::decodeAnswer((string) ($result['body'] ?? ''));
                     $breakerOutcomes[] = [$url, true, $result['status'], null];
                     continue;
                 }
@@ -1143,6 +1259,56 @@ final class WorkflowEngine
         }
 
         return $value;
+    }
+
+    /**
+     * The body of the last successful forward of this run, decoded.
+     *
+     * A retry skips a forward that already succeeded — which is the whole point —
+     * but a later `extract` reading `response.order_id` then has nothing to read,
+     * because the answer only lived in the previous attempt's memory. The step log
+     * already stores that body, so the retry seeds the context from it instead of
+     * producing an `extract: 0 fields` that looks like a broken template.
+     *
+     * @return array<mixed>
+     */
+    private static function lastResponse(int $runId): array
+    {
+        $stmt = Database::pdo()->prepare(
+            "SELECT response_body FROM workflow_run_steps
+              WHERE run_id = :run_id AND type = 'forward' AND status = 'success'
+                AND response_body IS NOT NULL AND response_body <> ''
+              ORDER BY id DESC
+              LIMIT 1"
+        );
+        $stmt->execute(['run_id' => $runId]);
+
+        $body = $stmt->fetchColumn();
+
+        return $body === false ? [] : self::decodeAnswer((string) $body);
+    }
+
+    /**
+     * Decodes an HTTP answer into an addressable structure.
+     *
+     * A JSON object or array is returned as is; anything else (an empty body, an
+     * HTML error page, a bare string) lands under `text`, so `{{ response.text }}`
+     * is always defined and a scalar answer does not silently resolve to nothing.
+     *
+     * @return array<mixed>
+     */
+    private static function decodeAnswer(string $body): array
+    {
+        if (trim($body) === '') {
+            return [];
+        }
+
+        $decoded = json_decode($body, true);
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        return ['text' => $body];
     }
 
     /**

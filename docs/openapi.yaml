@@ -1635,8 +1635,22 @@ paths:
                         operator: equals
                         value: payment
                   actions:
+                    - type: extract
+                      source: body
+                      mapping:
+                        customer_id: data.customer.id
+                        amount: data.amount
                     - type: log
                       message: 'paid by {{ body.customer.name }}'
+                    - type: forward
+                      url: 'https://hooks.example.com/large'
+                      payload: extracted
+                      when:
+                        mode: all
+                        rules:
+                          - path: extracted.amount
+                            operator: gt
+                            value: 1000
               room:
                 summary: Every enabled rule of the room
                 value: {}
@@ -1681,7 +1695,13 @@ paths:
                                   `breaker`/`breaker_retry_in` from the
                                   per-address circuit breaker: describing a
                                   request the worker would skip right now would
-                                  be worse than describing nothing.
+                                  be worse than describing nothing. An `extract`
+                                  step carries `source` and the `extracted` fields
+                                  it would publish — empty when the source is
+                                  `response`, because a dry run sends nothing and
+                                  there is no answer to read yet. An action whose
+                                  `when` is false carries `skipped: true` and
+                                  `reason` instead of being omitted.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -3238,22 +3258,41 @@ components:
     Action:
       type: object
       description: |
-        One of four action types, discriminated by `type`. Executed in order.
+        One of five action types, discriminated by `type`. Executed in order.
 
-        * `forward` — HTTP call. `payload` is `body`, `transformed`, `raw` or a
-          template string / JSON object. `secret` signs the outgoing body
-          (`X-Hookdock-Signature`) and is never returned.
+        * `forward` — HTTP call. `payload` is `body`, `transformed`, `extracted`,
+          `response`, `raw` or a template string / JSON object. `secret` signs the
+          outgoing body (`X-Hookdock-Signature`) and is never returned.
         * `transform` — maps result keys to context paths, feeding a later
           `payload: transformed`.
+        * `extract` — reads one `source` and publishes the mapped fields as
+          `extracted.*`, so a value from an API answer can be sent on by a later
+          step. Unlike `transform`, paths are resolved **inside** the chosen
+          source, so `event.type` means that field of the answer rather than the
+          first place in the whole context where it appears. Results are merged
+          into `extracted`, so two extracts can take different fields.
         * `delay` — pauses 1–86400 seconds, then continues. The pause belongs to
           the run, not the sender; it does not consume a retry, and a resumed run
           does not wait again.
         * `log` — records a message rendered from `{{ body.field }}` templates.
+
+        Any action may carry `when`. A false condition records a `skipped` step
+        and continues with the next action — a skipped branch is a decision, not a
+        failure, so `when` is how one rule does "send to Slack only if the amount
+        is large" without a second rule and duplicated conditions.
       required: [type]
       properties:
         type:
           type: string
-          enum: [forward, log, transform, delay]
+          enum: [forward, log, transform, delay, extract]
+        when:
+          allOf:
+            - $ref: '#/components/schemas/ConditionTree'
+          description: |
+            Optional branch for this action. Omitted means "always run"; an empty
+            tree is not stored. Evaluated against the same context as the rule —
+            including `extracted` and `response`, which is what makes a chain of
+            actions expressible.
         url:
           type: string
           format: uri
@@ -3266,7 +3305,7 @@ components:
           description: '`forward` only.'
           oneOf:
             - type: string
-              enum: [body, transformed, raw]
+              enum: [body, transformed, extracted, response, raw]
             - type: object
               additionalProperties: true
         headers:
@@ -3304,7 +3343,17 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: '`transform` only: result key → context path.'
+          description: |
+            `transform` / `extract`: result key → path. For `extract` the path is
+            relative to `source`, and an empty string takes the whole source.
+        source:
+          type: string
+          enum: [body, query, headers, meta, transformed, extracted, response]
+          default: body
+          description: |
+            `extract` only. `raw` is absent on purpose: a non-JSON body has
+            nothing to address by path, and `response.text` covers the "match a
+            substring of the answer" case through `contains`.
         seconds:
           type: integer
           minimum: 1

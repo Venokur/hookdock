@@ -389,7 +389,14 @@ async function copyCurl() {
             >
               <p class="font-medium text-ink-soft">{{ step.index + 1 }}. {{ step.type }}</p>
 
-              <p v-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
+              <p
+                v-if="step.skipped"
+                class="mt-1 rounded-lg border border-line bg-surface-2 px-2 py-1 text-ink-mute"
+              >
+                пропущено: {{ step.reason || 'условие действия не выполнено' }}
+              </p>
+
+              <p v-else-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
 
               <p v-else-if="step.type === 'delay'" class="mt-1 text-ink-mute">
                 пауза {{ step.seconds }} с, затем остальные действия
@@ -399,6 +406,13 @@ async function copyCurl() {
                 v-else-if="step.type === 'transform'"
                 class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute"
               >{{ JSON.stringify(step.mapping, null, 2) }}</pre>
+
+              <template v-else-if="step.type === 'extract'">
+                <p class="mt-1 text-ink-mute">источник: {{ step.source }}</p>
+                <pre
+                  class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute"
+                >{{ JSON.stringify(step.extracted, null, 2) }}</pre>
+              </template>
 
               <template v-else-if="step.type === 'forward'">
                 <p class="mt-1 break-all font-mono text-ink-mute">{{ step.method }} {{ step.url }}</p>

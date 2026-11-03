@@ -348,18 +348,62 @@ function fieldsLabel(count) {
 }
 
 function actionSummary(action) {
+  let text
+
   if (action.type === 'forward') {
     const signed = action.signed ? ' · подпись' : ''
-    return `Переслать ${action.method || 'POST'} → ${action.url}${signed}`
-  }
-  if (action.type === 'log') {
-    return `Лог: ${action.message || 'совпадение'}`
-  }
-  if (action.type === 'delay') {
-    return `Пауза ${action.seconds} с`
+    text = `Переслать ${action.method || 'POST'} → ${action.url}${signed}`
+  } else if (action.type === 'log') {
+    text = `Лог: ${action.message || 'совпадение'}`
+  } else if (action.type === 'delay') {
+    text = `Пауза ${action.seconds} с`
+  } else if (action.type === 'extract') {
+    const count = Object.keys(action.mapping || {}).length
+    text = `Извлечь ${fieldsLabel(count)} из «${sourceLabel(action.source)}»`
+  } else {
+    text = `Трансформация: ${fieldsLabel(Object.keys(action.mapping || {}).length)}`
   }
 
-  return `Трансформация: ${fieldsLabel(Object.keys(action.mapping || {}).length)}`
+  // A branch is part of what the action is: "переслать в Slack" reads very
+  // differently when it only happens for a large amount, and the card has no room
+  // for the condition itself.
+  const leaves = conditionLeaves(action.when)
+  if (leaves > 0) {
+    text += ` · если ${leaves === 1 ? 'условие' : `${leaves} усл.`}`
+  }
+
+  return text
+}
+
+/** Leaf count of a stored `when` tree (groups do not count). */
+function conditionLeaves(node) {
+  if (!node) {
+    return 0
+  }
+
+  const rules = Array.isArray(node.rules) ? node.rules : []
+  if (rules.length === 0) {
+    return 0
+  }
+
+  return rules.reduce(
+    (total, rule) => total + (Array.isArray(rule.rules) ? conditionLeaves(rule) : 1),
+    0,
+  )
+}
+
+const SOURCE_LABELS = {
+  body: 'тело запроса',
+  query: 'параметры URL',
+  headers: 'заголовки',
+  meta: 'служебные поля',
+  transformed: 'трансформация',
+  extracted: 'извлечённые поля',
+  response: 'ответ пересылки',
+}
+
+function sourceLabel(source) {
+  return SOURCE_LABELS[source] || source || 'тело запроса'
 }
 
 async function copyUrl(workflow) {

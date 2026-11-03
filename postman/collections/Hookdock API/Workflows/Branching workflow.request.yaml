@@ -1,0 +1,113 @@
+$kind: http-request
+name: Branching workflow
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 2300
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman branching rule",
+      "endpoint": "*",
+      "enabled": false,
+      "actions": [
+        {
+          "type": "extract",
+          "source": "body",
+          "mapping": { "amount": "event.amount", "kind": "event.type" }
+        },
+        {
+          "type": "log",
+          "message": "big payment {{ extracted.amount }}",
+          "when": {
+            "mode": "all",
+            "rules": [{ "path": "extracted.amount", "operator": "gt", "value": 1000 }]
+          }
+        },
+        { "type": "log", "message": "always" }
+      ]
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // `extract` publishes fields for later actions, and `when` gates one action
+      // without a second rule. Both are stored verbatim, so a read returns exactly
+      // the tree the editor wrote — the branch is the rule's own shape.
+      pm.test('extract and a branch are stored', function () {
+        pm.response.to.have.status(201);
+        const rule = pm.response.json().data;
+        const [extract, gated, plain] = rule.actions;
+
+        pm.expect(extract.type).to.eql('extract');
+        pm.expect(extract.source).to.eql('body');
+        pm.expect(extract.mapping.amount).to.eql('event.amount');
+
+        pm.expect(gated.when.mode).to.eql('all');
+        pm.expect(gated.when.rules[0].path).to.eql('extracted.amount');
+        pm.expect(plain).to.not.have.property('when');
+
+        // A separate variable: `workflow_id` is the rule the version tests
+        // below own, and overwriting it here would make them assert against this
+        // one — a disabled rule with a different action list.
+        pm.collectionVariables.set('branching_workflow_id', String(rule.id));
+      });
+
+      // Two refusals that matter: a source the engine cannot read would extract
+      // nothing forever, and a branch with a typo would evaluate to "no
+      // conditions" and run every time — the worst way for a branch to be wrong.
+      const base = {
+        room: pm.collectionVariables.get('room_slug'),
+        name: 'Postman branching refusal',
+        enabled: false
+      };
+
+      pm.sendRequest({
+        url: pm.variables.replaceIn('{{base_url}}/api/workflows'),
+        method: 'POST',
+        header: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + pm.collectionVariables.get('token')
+        },
+        body: {
+          mode: 'raw',
+          raw: JSON.stringify(
+            Object.assign({}, base, {
+              actions: [{ type: 'extract', source: 'raw', mapping: { a: 'b' } }]
+            })
+          )
+        }
+      }, function (err, res) {
+        pm.test('an unreadable extract source is refused', function () {
+          pm.expect(err).to.eql(null);
+          pm.expect(res.code).to.eql(422);
+        });
+      });
+
+      pm.sendRequest({
+        url: pm.variables.replaceIn('{{base_url}}/api/workflows'),
+        method: 'POST',
+        header: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + pm.collectionVariables.get('token')
+        },
+        body: {
+          mode: 'raw',
+          raw: JSON.stringify(
+            Object.assign({}, base, {
+              actions: [
+                { type: 'log', message: 'x', when: { rules: [{ path: 'body.a', operator: 'nope' }] } }
+              ]
+            })
+          )
+        }
+      }, function (err, res) {
+        pm.test('an unknown operator in a branch is refused', function () {
+          pm.expect(err).to.eql(null);
+          pm.expect(res.code).to.eql(422);
+        });
+      });

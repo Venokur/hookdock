@@ -25,7 +25,14 @@ final class WorkflowsController
         'exists', 'not_exists', 'gt', 'gte', 'lt', 'lte', 'regex',
     ];
 
-    private const ACTION_TYPES = ['forward', 'log', 'transform', 'delay'];
+    private const ACTION_TYPES = ['forward', 'log', 'transform', 'delay', 'extract'];
+
+    /**
+     * Sources an `extract` action may read. `raw` is deliberately absent: a
+     * non-JSON body has nothing to address by path, and `response.text` covers the
+     * "match a substring of the answer" case through `contains`.
+     */
+    private const EXTRACT_SOURCES = ['body', 'query', 'headers', 'meta', 'transformed', 'extracted', 'response'];
 
     /** Nesting depth of a condition tree. Deep trees are hard to reason about. */
     private const MAX_DEPTH = 5;
@@ -1109,6 +1116,14 @@ final class WorkflowsController
             return ['mode' => 'all', 'rules' => $this->validRules($input, $depth)];
         }
 
+        // A lone condition — `{"path": …, "operator": …}` — is a group of one.
+        // Without this it would read as a group with no rules, pass validation as
+        // "no conditions" and store a branch that always runs: the worst possible
+        // way for a branch to be wrong, and it looks saved.
+        if (isset($input['path']) && !isset($input['rules'])) {
+            return ['mode' => 'all', 'rules' => $this->validRules([$input], $depth)];
+        }
+
         $mode = strtolower((string) ($input['mode'] ?? 'all'));
         if (!in_array($mode, ['all', 'any'], true)) {
             Response::error('Режим группы условий: all или any', 422);
@@ -1332,6 +1347,12 @@ final class WorkflowsController
         }
 
         $normalizedActions = [];
+        // `when` is collected during the loop and attached at the end: every branch
+        // below appends exactly one action and `continue`s, so the input index is
+        // the output index, and re-attaching once keeps each normalizer free of a
+        // repeated "and also the branch condition" line that a new action type
+        // would forget.
+        $whens = [];
 
         foreach ($actions as $index => $action) {
             if (!is_array($action)) {
@@ -1342,6 +1363,19 @@ final class WorkflowsController
             if (!in_array($type, self::ACTION_TYPES, true)) {
                 Response::error('Неподдерживаемый тип действия: ' . $type, 422);
             }
+
+            // A per-action `when` is a condition tree like any other, so it goes
+            // through the same validator. Validation here matters more than on the
+            // rule itself: a branch with a typo would otherwise evaluate to "no
+            // conditions" and run unconditionally.
+            $when = null;
+            if (array_key_exists('when', $action) && $action['when'] !== null && $action['when'] !== []) {
+                $when = $this->validTree($action['when']);
+                if (WorkflowEngine::conditionCount($when) > self::MAX_CONDITIONS) {
+                    Response::error('У действия слишком много условий (максимум ' . self::MAX_CONDITIONS . ')', 422);
+                }
+            }
+            $whens[$index] = $when;
 
             if ($type === 'forward') {
                 $url = trim((string) ($action['url'] ?? ''));
@@ -1452,10 +1486,61 @@ final class WorkflowsController
                 continue;
             }
 
+            if ($type === 'extract') {
+                $source = (string) ($action['source'] ?? 'body');
+                if (!in_array($source, self::EXTRACT_SOURCES, true)) {
+                    Response::error('Извлечение: неизвестный источник ' . $source, 422);
+                }
+
+                $mapping = $action['mapping'] ?? [];
+                if (!is_array($mapping)) {
+                    Response::error('Маппинг извлечения должен быть объектом', 422);
+                }
+
+                // Values are paths, not values: a mapping of `{"id": "42"}` would be a
+                // constant that looks like a field, so a number is refused instead of
+                // silently reading a key named "42".
+                $paths = [];
+                foreach ($mapping as $key => $path) {
+                    $key = trim((string) $key);
+                    if ($key === '') {
+                        continue;
+                    }
+                    if (!is_string($path) && !is_numeric($path)) {
+                        Response::error('Извлечение: значение для «' . $key . '» должно быть путём', 422);
+                    }
+                    // An empty path is allowed and means "the whole source", which is
+                    // how a response body is passed on as one object.
+                    $paths[$key] = trim((string) $path);
+                }
+
+                if ($paths === []) {
+                    Response::error('Извлечение: укажите хотя бы одно поле', 422);
+                }
+
+                if (count($paths) > 30) {
+                    Response::error('Извлечение: не более 30 полей', 422);
+                }
+
+                $normalizedActions[] = ['type' => 'extract', 'source' => $source, 'mapping' => $paths];
+                continue;
+            }
+
             $normalizedActions[] = [
                 'type' => 'log',
                 'message' => (string) ($action['message'] ?? 'Webhook matched workflow conditions'),
             ];
+        }
+
+        // Attach the branch conditions collected above. `when` sits first in the
+        // stored object so a reader of the raw jsonb sees the gate before the
+        // action it guards.
+        foreach ($whens as $index => $when) {
+            if ($when === null || !isset($normalizedActions[$index])) {
+                continue;
+            }
+
+            $normalizedActions[$index] = ['when' => $when] + $normalizedActions[$index];
         }
 
         return $normalizedActions;

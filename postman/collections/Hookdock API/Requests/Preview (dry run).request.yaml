@@ -10,20 +10,21 @@ body:
   type: json
   content: |-
     {
-      "conditions": {
-        "mode": "all",
-        "rules": [
-          { "path": "body.event.type", "operator": "equals", "value": "payment" },
-          {
-            "mode": "any",
-            "rules": [
-              { "path": "body.customer.name", "operator": "equals", "value": "Ada" },
-              { "path": "body.customer.name", "operator": "equals", "value": "Bob" }
-            ]
-          }
-        ]
-      },
+      "conditions": [],
       "actions": [
+        {
+          "type": "extract",
+          "source": "body",
+          "mapping": { "amount": "event.amount" }
+        },
+        {
+          "type": "log",
+          "message": "big payment {{ extracted.amount }}",
+          "when": {
+            "mode": "all",
+            "rules": [{ "path": "extracted.amount", "operator": "gt", "value": 1000 }]
+          }
+        },
         { "type": "log", "message": "paid by {{ body.customer.name }}" }
       ]
     }
@@ -33,10 +34,37 @@ scripts:
     code: |-
       // A dry run describes what would happen; it never queues a run or sends a
       // packet. Send `{}` instead to evaluate every enabled rule of the room.
+      //
+      // The conditions are deliberately empty: the sample is whichever delivery is
+      // newest in the room, and a filter written against one specific row would
+      // make this request report "не совпало" — and then assert on an empty step
+      // list, passing for the wrong reason. The tree itself is covered by
+      // `Create workflow`; here the subject is the described steps.
       pm.test('a draft preview reports a match and its steps', function () {
         pm.response.to.have.status(200);
         const data = pm.response.json().data;
         pm.expect(data.mode).to.eql('draft');
         pm.expect(data.workflows[0]).to.have.property('matched');
         pm.expect(data.workflows[0].steps).to.be.an('array');
+      });
+
+      // A branch is described, not omitted: "this action would be skipped because
+      // its condition is false" is exactly what the operator opened the preview to
+      // check. Whatever the sample delivery contains, `extracted.amount` is absent
+      // or small, so the `gt 1000` gate must describe itself as skipped — and the
+      // assertions below say nothing about a value that depends on which delivery
+      // happened to be newest.
+      const steps = pm.response.json().data.workflows[0].steps;
+      const extracted = steps.find((step) => step.type === 'extract');
+      const gated = steps.find((step) => step.type === 'log' && step.skipped);
+
+      pm.test('an extract step reports the fields it would publish', function () {
+        pm.expect(extracted).to.be.an('object');
+        pm.expect(extracted.source).to.eql('body');
+        pm.expect(extracted.extracted).to.be.an('object');
+      });
+
+      pm.test('a false branch is described as skipped', function () {
+        pm.expect(gated).to.be.an('object');
+        pm.expect(gated.reason).to.be.a('string');
       });

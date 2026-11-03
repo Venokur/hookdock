@@ -20,7 +20,7 @@ const emit = defineEmits(['close', 'saved'])
 /** Mirrors `WorkflowsController::MAX_DEPTH`; the API refuses anything deeper. */
 const MAX_DEPTH = 5
 
-const KNOWN_PAYLOADS = ['body', 'transformed', 'raw']
+const KNOWN_PAYLOADS = ['body', 'transformed', 'extracted', 'response', 'raw']
 
 function blankAction(type = 'forward') {
   return {
@@ -33,6 +33,12 @@ function blankAction(type = 'forward') {
     message: '',
     mappingText: '{\n  "email": "body.user.email"\n}',
     seconds: 5,
+    // `extract` reads one source and publishes its fields as `extracted.*`.
+    source: 'body',
+    extractText: '{\n  "order_id": "data.order.id"\n}',
+    // A per-action branch. Empty means "always run", which is why the editor does
+    // not send an empty tree at all.
+    when: { mode: 'all', rules: [] },
     // 0 = "use the global FORWARD_TIMEOUT". Sent as no `timeout` key at all, so
     // the API does not have to special-case a zero.
     timeout: 0,
@@ -121,6 +127,10 @@ function toForm(workflow) {
         message: action.message ?? '',
         mappingText:
           action.type === 'transform' ? JSON.stringify(action.mapping ?? {}, null, 2) : base.mappingText,
+        source: action.source ?? 'body',
+        extractText:
+          action.type === 'extract' ? JSON.stringify(action.mapping ?? {}, null, 2) : base.extractText,
+        when: toTree(action.when),
         seconds: Number(action.seconds ?? base.seconds),
         timeout: Number(action.timeout ?? 0),
         signed: Boolean(action.signed),
@@ -157,6 +167,7 @@ const actionTypes = [
   ['forward', 'Переслать на URL'],
   ['log', 'Записать в лог'],
   ['transform', 'Трансформировать поля'],
+  ['extract', 'Извлечь поля из ответа'],
   ['delay', 'Подождать и продолжить'],
 ]
 
@@ -166,8 +177,20 @@ const methodOptions = ['POST', 'PUT', 'PATCH', 'GET', 'DELETE'].map((value) => (
 const payloadOptions = [
   { value: 'body', label: 'Исходное JSON-тело' },
   { value: 'transformed', label: 'Трансформированные поля' },
+  { value: 'extracted', label: 'Извлечённые поля' },
+  { value: 'response', label: 'Ответ прошлой пересылки' },
   { value: 'raw', label: 'Сырое тело' },
   { value: 'custom', label: 'Свой JSON' },
+]
+
+const extractSources = [
+  { value: 'body', label: 'Тело запроса' },
+  { value: 'query', label: 'Параметры URL' },
+  { value: 'headers', label: 'Заголовки' },
+  { value: 'meta', label: 'Служебные поля' },
+  { value: 'transformed', label: 'Трансформированные поля' },
+  { value: 'extracted', label: 'Уже извлечённые поля' },
+  { value: 'response', label: 'Ответ прошлой пересылки' },
 ]
 
 const conditionCount = computed(() => countLeaves(form.conditions))
@@ -377,6 +400,24 @@ function buildPayload() {
       continue
     }
 
+    if (action.type === 'extract') {
+      let mapping = {}
+      try {
+        mapping = action.extractText.trim() ? JSON.parse(action.extractText) : {}
+      } catch {
+        error.value = 'Маппинг извлечения должен быть корректным JSON.'
+        return null
+      }
+
+      if (Object.keys(mapping).length === 0) {
+        error.value = 'Для извлечения укажите хотя бы одно поле.'
+        return null
+      }
+
+      actions.push({ type: 'extract', source: action.source || 'body', mapping })
+      continue
+    }
+
     let mapping = {}
     try {
       mapping = action.mappingText.trim() ? JSON.parse(action.mappingText) : {}
@@ -386,6 +427,20 @@ function buildPayload() {
     }
     actions.push({ type: 'transform', mapping })
   }
+
+  // Attach the per-action branch condition. An empty tree is "always run" and is
+  // not sent at all: the API stores `when` only when there is something to check,
+  // so a rule that predates branches keeps its exact shape.
+  form.actions.forEach((action, index) => {
+    if (!actions[index]) {
+      return
+    }
+
+    const when = pruneTree(action.when, true)
+    if (countLeaves(when) > 0) {
+      actions[index].when = when
+    }
+  })
 
   return {
     id: form.id,
@@ -813,6 +868,34 @@ async function check() {
                 </p>
               </div>
 
+              <div v-else-if="action.type === 'extract'" class="mt-3 space-y-2">
+                <label class="block">
+                  <span class="mb-1.5 block text-[11px] text-ink-mute">Откуда взять поля</span>
+                  <AppSelect v-model="action.source" :options="extractSources" size="sm" class="w-64" />
+                </label>
+
+                <AppTextarea
+                  v-model="action.extractText"
+                  :rows="4"
+                  size="sm"
+                  class="font-mono"
+                  aria-label="Маппинг извлечения"
+                />
+
+                <p class="text-[11px] text-ink-mute">
+                  Ключ результата → путь внутри источника, например
+                  <code class="font-mono text-ink-soft">{ "order_id": "data.order.id" }</code>.
+                  Путь <code class="font-mono text-ink-soft">""</code> берёт источник целиком.
+                  Извлечённые поля доступны дальше как
+                  <code class="font-mono text-ink-soft" v-pre>{{ extracted.order_id }}</code>
+                  или как готовое тело — «Извлечённые поля» в пересылке.
+                </p>
+                <p class="text-[11px] text-ink-mute">
+                  Порядок важен: пересылка кладёт свой ответ в источник «Ответ прошлой пересылки», поэтому
+                  извлекать из него можно только действиями ниже.
+                </p>
+              </div>
+
               <div v-else class="mt-3">
                 <AppTextarea
                   v-model="action.mappingText"
@@ -824,6 +907,34 @@ async function check() {
                   Сопоставьте ключи результата с путями источника, например
                   <code class="font-mono text-ink-soft">{ "email": "body.user.email" }</code>.
                 </p>
+              </div>
+
+              <!-- A branch on a single action: the same tree the rule itself uses,
+                   so "send to Slack only if the amount is big" needs no second rule
+                   and no duplicated conditions. -->
+              <div class="mt-3 rounded-lg border border-dashed border-line bg-surface p-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <span class="text-[11px] font-medium text-ink-soft">
+                    Выполнять, только если
+                    <span v-if="countLeaves(action.when) === 0" class="font-normal text-ink-mute">— всегда</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="btn px-2 py-0.5 text-[11px]"
+                    @click="action.when.rules.push({ path: '', operator: 'equals', value: '' })"
+                  >
+                    + Условие
+                  </button>
+                </div>
+
+                <ConditionGroup
+                  v-if="countLeaves(action.when) > 0"
+                  :group="action.when"
+                  :operators="operatorOptions"
+                  :max-depth="MAX_DEPTH"
+                  class="mt-2"
+                  @pick="openPicker"
+                />
               </div>
             </div>
           </div>
@@ -908,7 +1019,14 @@ async function check() {
                 {{ step.index + 1 }}. {{ step.type }}
               </p>
 
-              <p v-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
+              <p
+                v-if="step.skipped"
+                class="mt-1 rounded-lg border border-line bg-surface px-2 py-1 text-ink-mute"
+              >
+                пропущено: {{ step.reason || 'условие действия не выполнено' }}
+              </p>
+
+              <p v-else-if="step.type === 'log'" class="mt-1 text-ink-mute">{{ step.message || 'совпадение' }}</p>
 
               <p v-else-if="step.type === 'delay'" class="mt-1 text-ink-mute">
                 пауза {{ step.seconds }} с, затем остальные действия
@@ -916,6 +1034,11 @@ async function check() {
 
               <template v-else-if="step.type === 'transform'">
                 <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ JSON.stringify(step.mapping, null, 2) }}</pre>
+              </template>
+
+              <template v-else-if="step.type === 'extract'">
+                <p class="mt-1 text-ink-mute">источник: {{ step.source }}</p>
+                <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ JSON.stringify(step.extracted, null, 2) }}</pre>
               </template>
 
               <template v-else-if="step.type === 'forward'">
