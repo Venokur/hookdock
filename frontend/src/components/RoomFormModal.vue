@@ -342,6 +342,7 @@ function close() {
                   placeholder="785e9e9c1b10-9a7be406d763"
                   aria-label="Slug в адресе"
                   class="font-mono"
+                  disabled
                 />
                 <button
                   type="button"
