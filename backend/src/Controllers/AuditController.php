@@ -36,6 +36,7 @@ final class AuditController
         'request.deleted', 'request.replayed', 'run.retried',
         'request.redelivered', 'request.bulk_deleted', 'request.bulk_replayed',
         'breaker.reset',
+        'channel.created', 'channel.updated', 'channel.deleted', 'channel.tested',
         'user.created', 'user.updated', 'user.deleted', 'user.password_changed',
     ];
 

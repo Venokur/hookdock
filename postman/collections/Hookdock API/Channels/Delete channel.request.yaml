@@ -1,0 +1,54 @@
+$kind: http-request
+name: Delete channel
+method: DELETE
+url: '{{base_url}}/api/channels/{{channel_id}}'
+order: 1500
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('channel_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('the channel is gone', function () {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().deleted).to.eql(true);
+      });
+
+      // The rule created by "Notify action" keeps a dangling id on purpose: the
+      // alternative — silently skipping the notification — would hide that the rule
+      // lost its destination, and the operator would only notice by its absence.
+      const id = pm.collectionVariables.get('channel_id');
+
+      pm.test('the deleted channel is no longer listed', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/rooms/{{room_id}}/channels'),
+            method: 'GET',
+            header: { Authorization: 'Bearer ' + pm.collectionVariables.get('token') },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            const found = res.json().data.find((c) => String(c.id) === String(id));
+            pm.expect(found).to.be.undefined;
+          },
+        );
+      });
+
+      // A second delete has nothing to delete; 404 says so instead of pretending.
+      pm.test('a second delete answers 404', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/channels/{{channel_id}}'),
+            method: 'DELETE',
+            header: { Authorization: 'Bearer ' + pm.collectionVariables.get('token') },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(404);
+          },
+        );
+      });

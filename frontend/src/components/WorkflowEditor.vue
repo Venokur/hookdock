@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import AppCheckbox from './ui/AppCheckbox.vue'
 import AppInput from './ui/AppInput.vue'
 import AppSelect from './ui/AppSelect.vue'
@@ -49,6 +49,11 @@ function blankAction(type = 'forward') {
     clearSignature: false,
     // Opt-in: a recipient that verifies a body-only HMAC rejects `"<ts>.<body>"`.
     signTimestamp: false,
+    // `notify` points at a channel of the room instead of carrying an address:
+    // the credential and the shape of the message live on the channel, so rotating
+    // a token is one edit rather than a hunt through every action list.
+    channelId: '',
+    notifyText: 'Hookdock: пришло событие {{ body.type }}',
   }
 }
 
@@ -135,6 +140,8 @@ function toForm(workflow) {
         timeout: Number(action.timeout ?? 0),
         signed: Boolean(action.signed),
         signTimestamp: Boolean(action.sign_timestamp),
+        channelId: action.channel_id ?? '',
+        notifyText: action.type === 'notify' ? (action.message ?? '') : base.notifyText,
       }
     }),
   }
@@ -169,6 +176,7 @@ const actionTypes = [
   ['transform', 'Трансформировать поля'],
   ['extract', 'Извлечь поля из ответа'],
   ['delay', 'Подождать и продолжить'],
+  ['notify', 'Уведомить в чат'],
 ]
 
 const operatorOptions = operators.map(([value, label]) => ({ value, label }))
@@ -182,6 +190,44 @@ const payloadOptions = [
   { value: 'raw', label: 'Сырое тело' },
   { value: 'custom', label: 'Свой JSON' },
 ]
+
+/**
+ * The room's chat channels, for the `notify` action's dropdown.
+ *
+ * Loaded once, when the editor opens, rather than on every action type change:
+ * the picker needs a name for an id that is already stored, and a stale list would
+ * show a channel that was just deleted as a blank option.
+ */
+const channels = ref([])
+const channelsLoading = ref(false)
+
+const channelOptions = computed(() =>
+  channels.value.map((channel) => ({
+    value: channel.id,
+    label: `${channel.name} · ${channel.kind === 'telegram' ? 'Telegram' : 'Slack'}${channel.enabled ? '' : ' (выключен)'}`,
+  })),
+)
+
+async function loadChannels() {
+  if (!props.room?.id) {
+    return
+  }
+
+  channelsLoading.value = true
+
+  try {
+    const data = await api.channels(props.room.id)
+    channels.value = data.data
+  } catch {
+    // The editor stays usable: a missing list means the picker says "нет каналов",
+    // which is the same answer an empty room gives.
+    channels.value = []
+  } finally {
+    channelsLoading.value = false
+  }
+}
+
+onMounted(loadChannels)
 
 const extractSources = [
   { value: 'body', label: 'Тело запроса' },
@@ -382,6 +428,24 @@ function buildPayload() {
       }
 
       actions.push(body)
+      continue
+    }
+
+    if (action.type === 'notify') {
+      if (!action.channelId) {
+        error.value = 'Для уведомления выберите канал: он задаёт и адрес, и секрет.'
+        return null
+      }
+      if (!String(action.notifyText ?? '').trim()) {
+        error.value = 'Для уведомления укажите текст сообщения.'
+        return null
+      }
+
+      actions.push({
+        type: 'notify',
+        channel_id: Number(action.channelId),
+        message: String(action.notifyText).trim(),
+      })
       continue
     }
 
@@ -849,6 +913,42 @@ async function check() {
                 </p>
               </div>
 
+              <div v-else-if="action.type === 'notify'" class="mt-3 space-y-2">
+                <label class="block">
+                  <span class="mb-1.5 block text-[11px] text-ink-mute">Канал</span>
+                  <AppSelect
+                    v-model="action.channelId"
+                    :options="channelOptions"
+                    :loading="channelsLoading"
+                    size="sm"
+                    placeholder="Выберите канал комнаты"
+                    class="sm:max-w-xs"
+                  />
+                </label>
+
+                <p v-if="!channelsLoading && channelOptions.length === 0" class="text-[11px] text-ink-mute">
+                  В комнате нет каналов. Создайте их на странице «Уведомления» — адрес и секрет
+                  хранятся там, а не в сценарии.
+                </p>
+
+                <label class="block">
+                  <span class="mb-1.5 block text-[11px] text-ink-mute">Сообщение</span>
+                  <AppTextarea
+                    v-model="action.notifyText"
+                    :rows="3"
+                    placeholder="Оплата {{ body.amount }} от {{ body.customer.name }}"
+                  />
+                </label>
+
+                <p class="text-[11px] text-ink-mute">
+                  Поддерживаются шаблоны вида
+                  <code class="font-mono text-ink-soft" v-pre>{{ body.amount }}</code>, а также
+                  <code class="font-mono text-ink-soft" v-pre>{{ extracted.order_id }}</code> —
+                  так в сообщение попадают поля, полученные действием «Извлечь».
+                  Канал другой комнаты выбрать нельзя.
+                </p>
+              </div>
+
               <div v-else-if="action.type === 'log'" class="mt-3">
                 <AppInput v-model="action.message" size="sm" placeholder="Оплата от клиента" />
                 <p class="mt-1 text-[11px] text-ink-mute">
@@ -1039,6 +1139,18 @@ async function check() {
               <template v-else-if="step.type === 'extract'">
                 <p class="mt-1 text-ink-mute">источник: {{ step.source }}</p>
                 <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ JSON.stringify(step.extracted, null, 2) }}</pre>
+              </template>
+
+              <template v-else-if="step.type === 'notify'">
+                <p class="mt-1 text-ink-mute">
+                  {{ step.target || 'канал' }}
+                  <span v-if="!step.enabled" class="text-amber-600 dark:text-amber-300">· канал выключен</span>
+                  <span v-if="step.breaker && step.breaker !== 'closed'" class="text-rose-600 dark:text-rose-300">
+                    · адрес не отвечает, повтор через {{ step.breaker_retry_in }} с
+                  </span>
+                </p>
+                <p v-if="step.error" class="mt-1 text-rose-600 dark:text-rose-300">{{ step.error }}</p>
+                <pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-ink-mute">{{ step.message }}</pre>
               </template>
 
               <template v-else-if="step.type === 'forward'">

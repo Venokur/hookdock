@@ -414,6 +414,18 @@ async function copyCurl() {
                 >{{ JSON.stringify(step.extracted, null, 2) }}</pre>
               </template>
 
+              <template v-else-if="step.type === 'notify'">
+                <p class="mt-1 text-ink-mute">
+                  {{ step.target || 'канал' }}
+                  <span v-if="!step.enabled" class="text-amber-600 dark:text-amber-300">· канал выключен</span>
+                  <span v-if="step.breaker && step.breaker !== 'closed'" class="text-rose-600 dark:text-rose-300">
+                    · адрес не отвечает, повтор через {{ step.breaker_retry_in }} с
+                  </span>
+                </p>
+                <p v-if="step.error" class="mt-1 text-rose-600 dark:text-rose-300">{{ step.error }}</p>
+                <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-ink-mute">{{ step.message }}</pre>
+              </template>
+
               <template v-else-if="step.type === 'forward'">
                 <p class="mt-1 break-all font-mono text-ink-mute">{{ step.method }} {{ step.url }}</p>
                 <p v-if="step.timeout" class="mt-1 text-ink-mute">таймаут {{ step.timeout }} с</p>

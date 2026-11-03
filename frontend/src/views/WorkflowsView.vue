@@ -360,6 +360,8 @@ function actionSummary(action) {
   } else if (action.type === 'extract') {
     const count = Object.keys(action.mapping || {}).length
     text = `Извлечь ${fieldsLabel(count)} из «${sourceLabel(action.source)}»`
+  } else if (action.type === 'notify') {
+    text = 'Уведомить в чат'
   } else {
     text = `Трансформация: ${fieldsLabel(Object.keys(action.mapping || {}).length)}`
   }

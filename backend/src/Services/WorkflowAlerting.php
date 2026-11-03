@@ -99,6 +99,84 @@ final class WorkflowAlerting
         }
 
         self::notify($row, $run, $request, $failures, $threshold, $paused);
+
+        // A room's own chat is a different audience from the installation's alert
+        // webhook: the operator of one integration wants to hear about *their*
+        // rules. Sent only on a terminal outcome (the caller guarantees that),
+        // because a retry that later succeeds is normal operation.
+        self::notifyRoomChannels($row, $run, $failures, $paused);
+    }
+
+    /**
+     * Posts to every channel of the room that asked to hear about failures.
+     *
+     * Best effort like the rest: a chat that is down must not turn a failed run
+     * into an exception in the worker. There is no cooldown here — the per-channel
+     * channel is meant to be the chat of the team that owns the rule, and they
+     * asked for it; `ALERT_COOLDOWN_SECONDS` throttles the installation-wide feed,
+     * which is a different (and shared) destination.
+     *
+     * @param array<string, mixed> $workflow
+     * @param array<string, mixed> $run
+     */
+    private static function notifyRoomChannels(array $workflow, array $run, int $failures, bool $paused): void
+    {
+        $roomId = (int) ($workflow['room_id'] ?? 0);
+        if ($roomId <= 0) {
+            return;
+        }
+
+        try {
+            $channels = NotificationChannel::failureTargets($roomId);
+        } catch (Throwable $e) {
+            error_log('channel lookup failed: ' . $e->getMessage());
+
+            return;
+        }
+
+        if ($channels === []) {
+            return;
+        }
+
+        $name = (string) ($workflow['name'] ?? '');
+        $endpoint = (string) ($workflow['endpoint'] ?? '*');
+        $message = self::shorten((string) ($run['message'] ?? ''));
+
+        $text = $paused
+            ? sprintf(
+                'Hookdock: сценарий «%s» (эндпоинт %s) выключен после %s подряд. Последняя ошибка: %s',
+                $name,
+                $endpoint,
+                self::failureCountGenitive($failures),
+                $message,
+            )
+            : sprintf(
+                'Hookdock: сценарий «%s» (эндпоинт %s) упал — %s подряд. %s',
+                $name,
+                $endpoint,
+                self::failureCount($failures),
+                $message,
+            );
+
+        foreach ($channels as $channel) {
+            try {
+                $result = NotificationChannel::send($channel, $text);
+                NotificationChannel::touch((int) $channel['id'], $result);
+
+                if (!$result['ok']) {
+                    error_log(sprintf(
+                        'channel notification failed (channel #%d, status %d%s)',
+                        (int) $channel['id'],
+                        (int) $result['status'],
+                        $result['error'] !== null ? ', ' . $result['error'] : '',
+                    ));
+                }
+            } catch (Throwable $e) {
+                // One broken channel must not prevent the next one from getting the
+                // message: they are independent destinations.
+                error_log('channel notification threw: ' . $e->getMessage());
+            }
+        }
     }
 
     /**

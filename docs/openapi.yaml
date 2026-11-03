@@ -58,6 +58,11 @@ tags:
     description: |
       Forward targets the circuit breaker is skipping, and moving a room's rule
       set between installations.
+  - name: Notifications
+    description: |
+      Chat destinations of a room. A channel is an operational fact of the room —
+      "our ops chat" — rather than a property of one rule, so two scenarios post
+      to one chat through one row and rotating a leaked token is one edit.
   - name: Ingest
 
 security:
@@ -2203,6 +2208,202 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/rooms/{id}/channels:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [Notifications]
+      summary: A room's notification channels
+      description: |
+        Slack incoming webhooks and Telegram bots of one room. The list is what the
+        editor's "notify" picker shows, so it is a plain array rather than a page:
+        a room has a handful of chats, not hundreds.
+
+        Neither credential is ever returned. `has_url`, `url_hint` and `has_token`
+        answer "is it configured" and "which webhook is it" without handing a
+        caller a value that can post to the chat.
+      responses:
+        '200':
+          description: Channels of the room, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotificationChannel'
+                  meta:
+                    type: object
+                    properties:
+                      room_id:
+                        type: integer
+                      room_slug:
+                        type: string
+                      kinds:
+                        type: array
+                        items:
+                          type: string
+                          enum: [slack, telegram]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Notifications]
+      summary: Create a channel
+      description: |
+        The name is unique per room, case-insensitively: the editor picks a channel
+        from a dropdown, and two entries called "Ops" make that dropdown unable to
+        say which one is meant.
+
+        `slack` needs `url`; `telegram` needs a `bot_token` (`<id>:<key>` from
+        @BotFather) and a `chat_id` (a number or `@username`). Neither is echoed
+        back, so the created channel reports `has_url` / `has_token` instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationChannelInput'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/NotificationChannel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+
+  /api/channels/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    put:
+      tags: [Notifications]
+      summary: Update a channel
+      description: |
+        An **empty** `url` / `bot_token` means "keep the stored value": the client
+        never receives the secret, so sending an empty field on a rename must not
+        clear a working channel. Rotating is sending a new value, and a channel
+        cannot be left without one — a row that looks configured and posts nothing
+        is worse than no row.
+
+        `kind` cannot change: Slack keeps a webhook URL and Telegram keeps a bot
+        token, so switching would leave the other field behind as a stale
+        credential that no read ever shows.
+
+        An omitted `enabled`, `notify_on_failure` or `chat_id` keeps the current
+        value, like every other delivery setting: a form that does not show the
+        switch must not re-enable a channel someone muted, and a rename through a
+        script must not have to repeat a value it never asked for.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationChannelInput'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/NotificationChannel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Invalid'
+    delete:
+      tags: [Notifications]
+      summary: Delete a channel
+      description: |
+        Scenarios that referenced it keep the id and start failing with "channel
+        not found" on their next run, which is deliberate: silently skipping the
+        notification would hide that a rule lost its destination.
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/channels/{id}/test:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    post:
+      tags: [Notifications]
+      summary: Send a probe message
+      description: |
+        Really posts to the chat: "does this token work" has no other answer, and
+        the moment an operator should find out is not the moment a rule fails.
+
+        A failed send is a **`200`** with `ok: false`, not a `502`: the request to
+        Hookdock succeeded, the channel did not, and a gateway error code would
+        hide the message the operator needs to read. The outcome is remembered on
+        the channel (`last_sent_at` / `last_error`) either way.
+      responses:
+        '200':
+          description: The probe was attempted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  status:
+                    type: integer
+                    description: HTTP status of the send, `0` for a refused or unreachable address.
+                  error:
+                    type: string
+                    nullable: true
+                  duration_ms:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnly'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/breakers:
     get:
       tags: [Delivery]
@@ -3258,7 +3459,7 @@ components:
     Action:
       type: object
       description: |
-        One of five action types, discriminated by `type`. Executed in order.
+        One of six action types, discriminated by `type`. Executed in order.
 
         * `forward` — HTTP call. `payload` is `body`, `transformed`, `extracted`,
           `response`, `raw` or a template string / JSON object. `secret` signs the
@@ -3275,6 +3476,11 @@ components:
           the run, not the sender; it does not consume a retry, and a resumed run
           does not wait again.
         * `log` — records a message rendered from `{{ body.field }}` templates.
+        * `notify` — posts to a chat channel of the room. The channel holds the
+          credential and the wire shape (Slack takes `{"text": …}`, Telegram takes
+          `{chat_id, text}` at a derived address), so the action carries only the
+          id and the text. A disabled channel records a `skipped` step; a channel
+          of another room or a missing id fails the run.
 
         Any action may carry `when`. A false condition records a `skipped` step
         and continues with the next action — a skipped branch is a decision, not a
@@ -3284,7 +3490,7 @@ components:
       properties:
         type:
           type: string
-          enum: [forward, log, transform, delay, extract]
+          enum: [forward, log, transform, delay, extract, notify]
         when:
           allOf:
             - $ref: '#/components/schemas/ConditionTree'
@@ -3361,7 +3567,17 @@ components:
           description: '`delay` only.'
         message:
           type: string
-          description: '`log` only. Supports `{{ body.field }}`.'
+          maxLength: 2000
+          description: |
+            `log` / `notify`. Supports `{{ body.field }}`, `{{ extracted.field }}`
+            and `{{ response.field }}` templates.
+        channel_id:
+          type: integer
+          description: |
+            `notify` only. Id of a channel of the **same room**: a rule that could
+            post into another room's chat would turn a typo in an id into a
+            cross-room leak of payload text, so it is refused at save time and
+            again when the run executes.
 
     Analytics:
       type: object
@@ -3485,6 +3701,89 @@ components:
               skipped:
                 type: integer
 
+    NotificationChannel:
+      type: object
+      description: |
+        A room's chat destination. `url` and `bot_token` are write-only, like a
+        room's HMAC secret: a Slack webhook URL *is* the authorization, so a value
+        the API could read back is a value that leaks with a database dump.
+      properties:
+        id:
+          type: integer
+        room_id:
+          type: integer
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [slack, telegram]
+        has_url:
+          type: boolean
+          description: A Slack webhook URL is stored.
+        url_hint:
+          type: string
+          description: |
+            Host and first path segment, e.g. `hooks.slack.com/services` — enough
+            to tell two webhooks apart, useless as a credential.
+        has_token:
+          type: boolean
+          description: A Telegram bot token is stored.
+        chat_id:
+          type: string
+          nullable: true
+        notify_on_failure:
+          type: boolean
+          description: |
+            Also receive this room's terminal rule failures. Sent once per incident,
+            not per attempt: a retry that later succeeded is normal operation.
+        enabled:
+          type: boolean
+        last_sent_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    NotificationChannelInput:
+      type: object
+      required: [name, kind]
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        kind:
+          type: string
+          enum: [slack, telegram]
+        url:
+          type: string
+          format: uri
+          writeOnly: true
+          description: '`slack`. Empty on update keeps the stored value.'
+        bot_token:
+          type: string
+          writeOnly: true
+          description: |
+            `telegram`. `<numeric id>:<key>` from @BotFather. Empty on update keeps
+            the stored value.
+        chat_id:
+          type: string
+          description: |
+            `telegram`. A number (`-1001234567890`) or `@username`. Omitted on
+            update keeps the stored one, like the switches and the secret.
+        notify_on_failure:
+          type: boolean
+          description: Omitted keeps the stored value; a new channel starts `false`.
+        enabled:
+          type: boolean
+          description: Omitted keeps the stored value; a new channel starts enabled.
     ForwardTarget:
       type: object
       description: |

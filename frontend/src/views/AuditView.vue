@@ -48,6 +48,10 @@ const actionLabels = {
   'request.replayed': 'Запрос маршрутизирован повторно',
   'run.retried': 'Запуск повторён',
   'breaker.reset': 'Сброшен предохранитель',
+  'channel.created': 'Канал уведомлений создан',
+  'channel.updated': 'Канал уведомлений изменён',
+  'channel.deleted': 'Канал уведомлений удалён',
+  'channel.tested': 'Канал уведомлений проверен',
   'user.created': 'Пользователь создан',
   'user.updated': 'Пользователь изменён',
   'user.deleted': 'Пользователь удалён',
@@ -226,6 +230,11 @@ const fieldLabels = {
   created: 'создано',
   secrets_not_imported: 'подписей не перенесено',
   queued: 'в очереди',
+  kind: 'тип',
+  notify_on_failure: 'сообщать о падениях',
+  has_url: 'адрес задан',
+  has_token: 'токен задан',
+  chat_id: 'chat_id',
   replaces: 'заменяет запуск',
 }
 
@@ -260,6 +269,8 @@ const toneByAction = {
   'user.deleted': 'text-rose-600 dark:text-rose-300',
   'room.secret_issued': 'text-amber-700 dark:text-amber-300',
   'breaker.reset': 'text-amber-700 dark:text-amber-300',
+  'channel.deleted': 'text-rose-600 dark:text-rose-300',
+  'channel.tested': 'text-amber-700 dark:text-amber-300',
 }
 
 function actionTone(entry) {

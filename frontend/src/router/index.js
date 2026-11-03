@@ -27,6 +27,13 @@ const router = createRouter({
       component: () => import('../views/WorkflowsView.vue'),
     },
     {
+      // Chat destinations of the room: the editor picks from them, so they sit
+      // next to the rules rather than inside a rule.
+      path: '/rooms/:slug/notifications',
+      name: 'room-notifications',
+      component: () => import('../views/ChannelsView.vue'),
+    },
+    {
       path: '/rooms/:slug/runs',
       name: 'room-runs',
       component: () => import('../views/RunsView.vue'),

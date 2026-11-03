@@ -149,6 +149,11 @@ export const api = {
   exportRoomWorkflows: (id) => download(`/api/rooms/${id}/workflows/export`),
   importRoomWorkflows: (id, document) =>
     request(`/api/rooms/${id}/workflows/import`, { method: 'POST', body: document }),
+  channels: (roomId) => request(`/api/rooms/${roomId}/channels`),
+  createChannel: (roomId, body) => request(`/api/rooms/${roomId}/channels`, { method: 'POST', body }),
+  updateChannel: (id, body) => request(`/api/channels/${id}`, { method: 'PUT', body }),
+  deleteChannel: (id) => request(`/api/channels/${id}`, { method: 'DELETE' }),
+  testChannel: (id) => request(`/api/channels/${id}/test`, { method: 'POST' }),
   breakers: () => request('/api/breakers'),
   resetBreaker: (address) => request('/api/breakers/reset', { method: 'POST', body: { address } }),
   readToken: () => request('/api/auth/read-token', { method: 'POST' }),

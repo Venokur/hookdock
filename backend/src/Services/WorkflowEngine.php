@@ -346,7 +346,7 @@ final class WorkflowEngine
             $context['response'] = self::lastResponse($runId);
         }
 
-        [$status, $message, $retry, $delay, $defer, $breakerOutcomes] = self::runActions($actions, $context, $runId, $attempt, $done);
+        [$status, $message, $retry, $delay, $defer, $breakerOutcomes] = self::runActions($actions, $context, $runId, $attempt, $done, (int) ($run['room_id'] ?? 0));
 
         // The breaker learns an outcome only once the run has no retry left. While
         // one is still coming the address has not been proven broken — counting
@@ -546,6 +546,39 @@ final class WorkflowEngine
                 $existing = is_array($context['extracted'] ?? null) ? $context['extracted'] : [];
                 $context['extracted'] = array_merge($existing, $result);
                 $steps[] = $step + ['source' => $sourceName, 'extracted' => $result];
+                continue;
+            }
+
+            if ($type === 'notify') {
+                $channelId = (int) ($action['channel_id'] ?? 0);
+                $channel = $channelId > 0 ? NotificationChannel::find($channelId) : null;
+
+                if ($channel === null) {
+                    $steps[] = $step + ['error' => 'канал не найден', 'channel_id' => $channelId];
+                    continue;
+                }
+
+                $address = NotificationChannel::address($channel);
+                // `peek`, never `tryAcquire`: a preview that consumed the single
+                // half-open probe would push the real attempt back by a whole
+                // cooldown and the dashboard would start lying about the channel.
+                $breaker = $address === ''
+                    ? ['state' => 'closed', 'retry_in' => 0]
+                    : CircuitBreaker::peek($address);
+
+                $steps[] = $step + [
+                    'channel_id' => $channelId,
+                    'channel' => (string) $channel['name'],
+                    'kind' => (string) $channel['kind'],
+                    // A Slack webhook URL is a credential, so the address is
+                    // described rather than printed: the preview is rendered in a
+                    // browser and read over someone's shoulder.
+                    'target' => NotificationChannel::describe($channel),
+                    'enabled' => self::isTrue($channel['enabled'] ?? false),
+                    'message' => Template::render((string) ($action['message'] ?? ''), $context),
+                    'breaker' => $breaker['state'],
+                    'breaker_retry_in' => (int) $breaker['retry_in'],
+                ];
                 continue;
             }
 
@@ -956,7 +989,7 @@ final class WorkflowEngine
      * @param array<int, true> $done action indexes that already succeeded in an earlier attempt
      * @return array{0: string, 1: string, 2: bool, 3: int} status, message, retry, delay in seconds
      */
-    private static function runActions(array $actions, array &$context, int $runId, int $attempt, array $done): array
+    private static function runActions(array $actions, array &$context, int $runId, int $attempt, array $done, int $roomId = 0): array
     {
         $messages = [];
         $failed = false;
@@ -1078,6 +1111,96 @@ final class WorkflowEngine
                     $message = 'извлечено из ' . $sourceName . ': ' . count($result) . ' пол.';
                     $messages[] = $message;
                     self::recordStep($runId, $attempt, $index, $type, 'success', $message, null, null, $started);
+                    continue;
+                }
+
+                // `notify` posts to a room's chat channel. It is not a `forward` with
+                // a nicer form: the channel holds the credential and the shape (Slack
+                // wants `{text}`, Telegram wants `{chat_id, text}` at a derived
+                // address), so a rule references a channel by id and rotating a leaked
+                // token stays one edit instead of a hunt through every action list.
+                if ($type === 'notify') {
+                    $channelId = (int) ($action['channel_id'] ?? 0);
+                    $channel = $channelId > 0 ? NotificationChannel::find($channelId) : null;
+
+                    if ($channel === null) {
+                        $failed = true;
+                        $message = 'уведомление: канал не найден (id ' . $channelId . ')';
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
+                        continue;
+                    }
+
+                    // The channel belongs to a room, and a rule belongs to a room: a
+                    // rule that could post into another room's chat would turn a
+                    // typo in an id into a cross-room leak. Refused as terminal,
+                    // because no retry can change which room the channel is in.
+                    if ((int) $channel['room_id'] !== $roomId) {
+                        $failed = true;
+                        $message = 'уведомление: канал принадлежит другой комнате';
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, null, null, $started);
+                        continue;
+                    }
+
+                    if (!self::isTrue($channel['enabled'] ?? false)) {
+                        // A muted channel is a decision, not a failure: the operator
+                        // switched it off, and failing the run would make a paused
+                        // chat look like a broken scenario.
+                        $message = 'уведомление пропущено: канал «' . (string) $channel['name'] . '» выключен';
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'skipped', $message, null, null, $started);
+                        continue;
+                    }
+
+                    $text = Template::render((string) ($action['message'] ?? ''), $context);
+
+                    // Same breaker as a forward, keyed by the address a message goes
+                    // to: a chat that is down is down for every rule, and the refusal
+                    // is a skip with a deferral rather than a failure of this rule.
+                    $address = NotificationChannel::address($channel);
+                    $breaker = $address === ''
+                        ? ['allowed' => true, 'state' => 'closed', 'retry_in' => 0]
+                        : CircuitBreaker::tryAcquire($address);
+
+                    if (!$breaker['allowed']) {
+                        $defer = max($defer, (int) $breaker['retry_in']);
+                        $message = sprintf(
+                            'уведомление отложено: адрес %s не отвечает (повтор через %d с)',
+                            CircuitBreaker::address($address),
+                            $breaker['retry_in'],
+                        );
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'skipped', $message, null, null, $started);
+                        continue;
+                    }
+
+                    $result = NotificationChannel::send($channel, $text);
+                    NotificationChannel::touch($channelId, $result);
+
+                    if (!$result['ok']) {
+                        $failed = true;
+                        $retry = $retry || HttpClient::retryable($result);
+                        $message = sprintf(
+                            'уведомление в %s → %s%s',
+                            NotificationChannel::describe($channel),
+                            $result['status'] !== 0 ? (string) $result['status'] : 'ошибка',
+                            $result['error'] !== null ? ' (' . $result['error'] . ')' : '',
+                        );
+                        $messages[] = $message;
+                        self::recordStep($runId, $attempt, $index, $type, 'failed', $message, $result['status'], $result['body'], $started);
+                        $breakerOutcomes[] = [$address, false, $result['status'], $result['error']];
+                        continue;
+                    }
+
+                    $message = sprintf(
+                        'уведомление в %s → %d',
+                        NotificationChannel::describe($channel),
+                        $result['status'],
+                    );
+                    $messages[] = $message;
+                    self::recordStep($runId, $attempt, $index, $type, 'success', $message, $result['status'], $result['body'], $started);
+                    $breakerOutcomes[] = [$address, true, $result['status'], null];
                     continue;
                 }
 

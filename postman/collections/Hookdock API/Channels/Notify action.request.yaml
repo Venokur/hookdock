@@ -1,0 +1,112 @@
+$kind: http-request
+name: Notify action
+method: POST
+url: '{{base_url}}/api/workflows'
+order: 1400
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "room": "{{room_slug}}",
+      "name": "Postman notify rule",
+      "endpoint": "*",
+      "enabled": false,
+      "actions": [
+        {
+          "type": "notify",
+          "channel_id": {{channel_id}},
+          "message": "Postman: {{ body.event }}"
+        }
+      ]
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('channel_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The action stores the id and the text, not an address: the channel owns the
+      // credential and the wire shape, so rotating a token is one edit instead of a
+      // hunt through every action list.
+      pm.test('a notify action is stored by channel id', function () {
+        pm.response.to.have.status(201);
+        const rule = pm.response.json().data;
+
+        pm.expect(rule.actions[0].type).to.eql('notify');
+        pm.expect(String(rule.actions[0].channel_id)).to.eql(pm.collectionVariables.get('channel_id'));
+        pm.expect(rule.actions[0].message).to.include('Postman');
+
+        pm.collectionVariables.set('notify_workflow_id', String(rule.id));
+      });
+
+      // Two refusals that matter: an id that does not exist would fail on the first
+      // delivery, and a channel of another room would be a cross-room leak of the
+      // payload text.
+      const base = {
+        room: pm.collectionVariables.get('room_slug'),
+        name: 'Postman notify refusal',
+        enabled: false,
+      };
+
+      pm.test('a missing channel id is refused', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/workflows'),
+            method: 'POST',
+            header: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + pm.collectionVariables.get('token'),
+            },
+            body: {
+              mode: 'raw',
+              raw: JSON.stringify(
+                Object.assign({}, base, {
+                  actions: [{ type: 'notify', channel_id: 99999999, message: 'x' }],
+                }),
+              ),
+            },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+          },
+        );
+      });
+
+      pm.test('an empty message is refused', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/workflows'),
+            method: 'POST',
+            header: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + pm.collectionVariables.get('token'),
+            },
+            body: {
+              mode: 'raw',
+              raw: JSON.stringify(
+                Object.assign({}, base, {
+                  actions: [
+                    {
+                      type: 'notify',
+                      channel_id: Number(pm.collectionVariables.get('channel_id')),
+                      message: '   ',
+                    },
+                  ],
+                }),
+              ),
+            },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+          },
+        );
+      });

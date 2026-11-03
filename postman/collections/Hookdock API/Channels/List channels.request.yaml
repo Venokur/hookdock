@@ -1,0 +1,36 @@
+$kind: http-request
+name: List channels
+method: GET
+url: '{{base_url}}/api/rooms/{{room_id}}/channels'
+order: 1100
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('room_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('the room lists its channels with the supported kinds', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+
+        pm.expect(body.data).to.be.an('array').and.not.empty;
+        pm.expect(body.meta.kinds).to.include('slack');
+        pm.expect(body.meta.kinds).to.include('telegram');
+
+        const created = body.data.find((c) => String(c.id) === pm.collectionVariables.get('channel_id'));
+        pm.expect(created, 'the channel from "Create channel"').to.not.be.undefined;
+      });
+
+      // The list is what the editor's picker renders, so it must stay a plain
+      // array: paging it would make a rule reference a channel the picker never
+      // showed.
+      pm.test('no channel in the list carries a credential', function () {
+        for (const channel of pm.response.json().data) {
+          pm.expect(channel, channel.name).to.not.have.property('url');
+          pm.expect(channel, channel.name).to.not.have.property('bot_token');
+        }
+      });

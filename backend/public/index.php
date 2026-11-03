@@ -9,6 +9,7 @@ use App\Controllers\AuditController;
 use App\Controllers\BreakersController;
 use App\Controllers\HealthController;
 use App\Controllers\MetricsController;
+use App\Controllers\NotificationChannelsController;
 use App\Controllers\RequestsController;
 use App\Controllers\RoomsController;
 use App\Controllers\RunsController;
@@ -30,6 +31,7 @@ $audit = new AuditController();
 $breakers = new BreakersController();
 $health = new HealthController();
 $metrics = new MetricsController();
+$channels = new NotificationChannelsController();
 $requests = new RequestsController();
 $rooms = new RoomsController();
 $runs = new RunsController();
@@ -135,6 +137,16 @@ $router->add('POST', '/api/rooms/{id}/workflows/import', fn (Request $r, array $
 
 // Forward targets the breaker is skipping. Read is open to a read token; clearing
 // one is a mutating action, so it demands a full token.
+// A room's chat destinations. Scoped to the room, not to a rule: two scenarios
+// that post to one chat share a channel, and rotating a leaked Slack URL is one
+// edit instead of a hunt through every action list. `test` is a real send — that
+// is the only way "does this token work" has an answer before an incident.
+$router->add('GET', '/api/rooms/{id}/channels', fn (Request $r, array $p) => $channels->index($r, $p));
+$router->add('POST', '/api/rooms/{id}/channels', fn (Request $r, array $p) => $channels->store($r, $p));
+$router->add('PUT', '/api/channels/{id}', fn (Request $r, array $p) => $channels->update($r, $p));
+$router->add('DELETE', '/api/channels/{id}', fn (Request $r, array $p) => $channels->destroy($r, $p));
+$router->add('POST', '/api/channels/{id}/test', fn (Request $r, array $p) => $channels->test($r, $p));
+
 $router->add('GET', '/api/breakers', fn (Request $r) => $breakers->index($r));
 $router->add('POST', '/api/breakers/reset', fn (Request $r) => $breakers->reset($r));
 

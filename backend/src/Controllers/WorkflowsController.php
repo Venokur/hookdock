@@ -9,6 +9,7 @@ use App\Database;
 use App\Http\Request;
 use App\Http\Response;
 use App\Services\Audit;
+use App\Services\NotificationChannel;
 use App\Services\Realtime;
 use App\Services\RoomResolver;
 use App\Services\WorkflowEngine;
@@ -25,7 +26,7 @@ final class WorkflowsController
         'exists', 'not_exists', 'gt', 'gte', 'lt', 'lte', 'regex',
     ];
 
-    private const ACTION_TYPES = ['forward', 'log', 'transform', 'delay', 'extract'];
+    private const ACTION_TYPES = ['forward', 'log', 'transform', 'delay', 'extract', 'notify'];
 
     /**
      * Sources an `extract` action may read. `raw` is deliberately absent: a
@@ -1290,7 +1291,7 @@ final class WorkflowsController
             $previous = is_array($decodedExisting) ? array_values($decodedExisting) : [];
         }
 
-        $normalizedActions = $this->validActions($actions, $previous);
+        $normalizedActions = $this->validActions($actions, $previous, $roomId);
 
         if ($storedVersion !== null && $sentVersion !== null && $sentVersion !== $storedVersion) {
             Response::error(
@@ -1337,7 +1338,7 @@ final class WorkflowsController
      *        signature secret the client cannot see" rule
      * @return list<array<string, mixed>>
      */
-    private function validActions(array $actions, array $previous): array
+    private function validActions(array $actions, array $previous, int $roomId): array
     {
         if ($actions === []) {
             Response::error('Нужно хотя бы одно действие', 422);
@@ -1376,6 +1377,44 @@ final class WorkflowsController
                 }
             }
             $whens[$index] = $when;
+
+            // A chat message. The channel holds the credential and the shape, so the
+            // action carries only the id and the text: copying a bot token into every
+            // rule would make rotating one a hunt through the action lists.
+            if ($type === 'notify') {
+                $channelId = (int) ($action['channel_id'] ?? 0);
+                if ($channelId <= 0) {
+                    Response::error('Уведомление: выберите канал', 422);
+                }
+
+                // Checked here, not only in the worker: a rule saved with an id that
+                // does not exist would fail on the first delivery, and the operator
+                // would find out from a failed run instead of from the form.
+                $channel = NotificationChannel::find($channelId);
+                if ($channel === null) {
+                    Response::error('Уведомление: канал не найден', 422);
+                }
+                if ((int) $channel['room_id'] !== $roomId) {
+                    // A rule cannot post into another room's chat: a typo in an id
+                    // would otherwise become a cross-room leak of payload text.
+                    Response::error('Уведомление: канал принадлежит другой комнате', 422);
+                }
+
+                $message = (string) ($action['message'] ?? '');
+                if (trim($message) === '') {
+                    Response::error('Уведомление: укажите текст сообщения', 422);
+                }
+                if (mb_strlen($message) > 2000) {
+                    Response::error('Уведомление: текст не длиннее 2000 символов', 422);
+                }
+
+                $normalizedActions[] = [
+                    'type' => 'notify',
+                    'channel_id' => $channelId,
+                    'message' => $message,
+                ];
+                continue;
+            }
 
             if ($type === 'forward') {
                 $url = trim((string) ($action['url'] ?? ''));

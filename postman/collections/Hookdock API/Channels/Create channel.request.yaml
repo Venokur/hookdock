@@ -1,0 +1,52 @@
+$kind: http-request
+name: Create channel
+method: POST
+url: '{{base_url}}/api/rooms/{{room_id}}/channels'
+order: 1000
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "Postman ops",
+      "kind": "slack",
+      "url": "http://web/hook/{{room_slug}}/postman-probe",
+      "notify_on_failure": true
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // The channel points at the stack's own catcher, not at Slack: a collection
+      // run must not post into a real chat, and `test` below really sends. The
+      // catcher answers any method with `202`, so the probe is a real send without
+      // a real chat. `http://web` is the compose service name, which `UrlGuard`
+      // allows because it is an internal target on this installation.
+      if (!pm.collectionVariables.get('room_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // Neither credential is echoed back: `url` is the authorization for a Slack
+      // webhook, so a value the API can read back is a value that leaks with a
+      // database dump. `has_url` and `url_hint` answer "is it set" and "which one".
+      pm.test('a channel is created without leaking its secret', function () {
+        pm.response.to.have.status(201);
+        const channel = pm.response.json().data;
+
+        pm.expect(channel.kind).to.eql('slack');
+        pm.expect(channel.has_url).to.eql(true);
+        pm.expect(channel.url_hint).to.be.a('string').and.not.empty;
+        pm.expect(channel).to.not.have.property('url');
+        pm.expect(channel.notify_on_failure).to.eql(true);
+        pm.expect(channel.enabled).to.eql(true);
+        pm.expect(channel.last_sent_at).to.be.null;
+      });
+
+      const channel = pm.response.json().data;
+      if (channel) {
+        pm.collectionVariables.set('channel_id', String(channel.id));
+      }

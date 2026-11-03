@@ -1,0 +1,54 @@
+$kind: http-request
+name: Test channel
+method: POST
+url: '{{base_url}}/api/channels/{{channel_id}}/test'
+order: 1200
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      // Real send, deliberately: "does this token work" has no other answer. The
+      // target is the stack's own `/api/health`, so the probe stays inside the
+      // compose network.
+      if (!pm.collectionVariables.get('channel_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // A failed probe is a 200 with `ok: false`, not a 502: Hookdock answered, the
+      // chat did not, and a gateway code would hide the message the operator needs.
+      pm.test('a probe is attempted and answers 200', function () {
+        pm.response.to.have.status(200);
+        const body = pm.response.json();
+        pm.expect(body).to.have.property('ok');
+        pm.expect(body).to.have.property('status');
+        pm.expect(body).to.have.property('duration_ms');
+      });
+
+      pm.test('the probe reaches the stack catcher', function () {
+        const body = pm.response.json();
+        pm.expect(body.ok).to.eql(true);
+        pm.expect(body.status).to.eql(202);
+      });
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The outcome is remembered on the channel, which is what the card shows:
+      // a channel that has never been used and one whose token is wrong look
+      // identical without it.
+      pm.sendRequest(
+        {
+          url: pm.variables.replaceIn('{{base_url}}/api/rooms/{{room_id}}/channels'),
+          method: 'GET',
+          header: { Authorization: 'Bearer ' + pm.collectionVariables.get('token') },
+        },
+        function (err, res) {
+          pm.expect(err).to.be.null;
+          const channel = res.json().data.find(
+            (c) => String(c.id) === pm.collectionVariables.get('channel_id'),
+          );
+          pm.expect(channel.last_sent_at, 'last_sent_at after a successful probe').to.not.be.null;
+          pm.expect(channel.last_error).to.be.null;
+        },
+      );

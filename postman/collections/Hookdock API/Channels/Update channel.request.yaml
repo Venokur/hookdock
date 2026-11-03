@@ -1,0 +1,94 @@
+$kind: http-request
+name: Update channel
+method: PUT
+url: '{{base_url}}/api/channels/{{channel_id}}'
+order: 1300
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "Postman ops renamed",
+      "kind": "slack"
+    }
+scripts:
+  - type: beforeRequest
+    language: text/javascript
+    code: |-
+      if (!pm.collectionVariables.get('channel_id')) {
+        pm.execution.skipRequest();
+      }
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      // The body deliberately carries no `url`: the client never receives the
+      // stored one, so an empty field must mean "keep it". A rename that silently
+      // cleared it would leave a channel that looks configured and sends nothing.
+      pm.test('renaming keeps the stored secret and the switches', function () {
+        pm.response.to.have.status(200);
+        const channel = pm.response.json().data;
+
+        pm.expect(channel.name).to.eql('Postman ops renamed');
+        pm.expect(channel.has_url).to.eql(true);
+        pm.expect(channel.notify_on_failure).to.eql(true);
+        pm.expect(channel.enabled).to.eql(true);
+        pm.expect(channel).to.not.have.property('url');
+      });
+
+      // A name is unique per room, and a duplicate is refused rather than merged:
+      // the editor picks by name from a dropdown, so two "Ops" entries make the
+      // picker unable to answer which one is meant.
+      pm.test('a duplicate name is refused', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/rooms/{{room_id}}/channels'),
+            method: 'POST',
+            header: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + pm.collectionVariables.get('token'),
+            },
+            body: {
+              mode: 'raw',
+              raw: JSON.stringify({
+                name: 'postman ops renamed',
+                kind: 'slack',
+                url: 'http://web/hook/{{room_slug}}/postman-probe',
+              }),
+            },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+          },
+        );
+      });
+
+      // A bot token is validated on save, not on the first incident: the shape is
+      // `<id>:<key>` from @BotFather, and a typo is cheaper to refuse here.
+      pm.test('an obviously wrong bot token is refused', function () {
+        pm.sendRequest(
+          {
+            url: pm.variables.replaceIn('{{base_url}}/api/rooms/{{room_id}}/channels'),
+            method: 'POST',
+            header: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + pm.collectionVariables.get('token'),
+            },
+            body: {
+              mode: 'raw',
+              raw: JSON.stringify({
+                name: 'Postman broken bot',
+                kind: 'telegram',
+                bot_token: 'not-a-token',
+                chat_id: '-1001234567890',
+              }),
+            },
+          },
+          function (err, res) {
+            pm.expect(err).to.be.null;
+            pm.expect(res.code).to.eql(422);
+          },
+        );
+      });
