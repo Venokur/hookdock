@@ -401,6 +401,21 @@ watch(optionKey, () => {
   }
 })
 
+/**
+ * The panel is measured when it opens, but its contents can arrive afterwards: the
+ * caller fetches the list, the hint line appears once the answer is in, and a search
+ * swaps the rows. Without re-measuring, a panel opened over an empty list stayed at
+ * one row's height while sixteen rows waited behind a scrollbar.
+ */
+watch(
+  [() => props.options.length, () => props.hint],
+  () => {
+    if (open.value) {
+      nextTick(updatePosition)
+    }
+  },
+)
+
 watch(open, (isOpen) => {
   checkOpenListeners(isOpen)
 })

@@ -69,7 +69,10 @@ export function useEndpointSearch(getSlug) {
     const known = source.map((item) => ({ value: item.endpoint, label: item.endpoint }))
     const selected = String(current ?? '').trim()
 
-    if (selected !== '' && !known.some((option) => option.value === selected)) {
+    // Without case, for the same reason as the custom row below: the value came
+    // back from a rule written as `HOOK-1`, and listing it next to the stored
+    // `hook-1` would offer two rows that route to one endpoint.
+    if (selected !== '' && !known.some((option) => String(option.value).toLowerCase() === selected.toLowerCase())) {
       known.unshift({ value: selected, label: selected })
     }
 
@@ -184,5 +187,8 @@ export function useEndpointSearch(getSlug) {
     Object.assign(meta, { total: 0, returned: 0, has_more: false })
   }
 
-  return { term, hits, searching, failed, meta, options, hint, search, reset }
+  // `term`/`hits`/`failed`/`meta` stay internal: both callers describe the panel
+  // through `options`/`hint`, and a second, partial view of the same state would
+  // eventually disagree with them.
+  return { options, hint, search, searching, reset }
 }

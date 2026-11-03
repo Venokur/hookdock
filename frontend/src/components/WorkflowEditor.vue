@@ -303,6 +303,13 @@ const endpointHint = computed(() => {
   }
 
   if (total === 0) {
+    // `null` means the list was never asked for (the editor only loads it once it
+    // has a room): claiming the room has no endpoints would be a fact nobody
+    // established.
+    if (endpointTop.value === null) {
+      return ''
+    }
+
     // Nothing to pick from, but the control still works: a rule is routinely
     // written before the first delivery, and the endpoint appears in the list
     // after it.
